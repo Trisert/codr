@@ -7,7 +7,7 @@ mod tui_components;
 mod tools;
 
 use error::AgentError;
-use model::Model;
+use model::{Model, ModelType};
 use parser::{parse_action, Action, format_available_tools};
 use config::Config;
 use tools::{ToolRegistry, create_coding_tools};
@@ -23,7 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config = Config::load();
     let model_type = config.to_model_type();
-    let model = Model::new(model_type);
+    let model = Model::new(model_type.clone());
+
+    // Get model name for display
+    let model_name = match &model_type {
+        ModelType::LlamaServer { model, .. } => model.clone(),
+        ModelType::Anthropic => "claude".to_string(),
+    };
 
     // Create tool registry
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -32,14 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if use_tui || args.len() == 1 {
         // TUI mode (interactive)
-        let mut app = tui::App::new(model, tool_registry);
+        let mut app = tui::App::new(model, tool_registry, model_name);
         app.set_system_prompt(&get_system_prompt(&tools_description));
 
         // If task provided as argument after flags, use it as initial message
         if let Some(pos) = args.iter().position(|a| a == "--") {
             if pos + 1 < args.len() {
                 let initial_task = args[pos + 1..].join(" ");
-                app.messages.push(tui::ChatMessage::user(&initial_task));
+                app.messages.push(tui_components::ChatMessage::user(&initial_task));
                 app.process_message().await?;
             }
         }
@@ -79,7 +85,7 @@ async fn run_direct(
     loop {
         // Query the LM
         let lm_output = model.query(&messages).await?;
-        println!("🤖 LM output:\n{}", lm_output);
+        println!("LM output:\n{}", lm_output);
         println!("\n{}", "─".repeat(60));
 
         // Remember what the LM said
@@ -89,17 +95,17 @@ async fn run_direct(
         let action = match parse_action(&lm_output) {
             Ok(a) => a,
             Err(AgentError::FormatError(msg)) => {
-                println!("⚠️ Format error, telling LM to correct...\n");
+                println!("Format error, telling LM to correct...\n");
                 let enhanced_msg = format!("{}\n\n{}", msg, format_available_tools(&tools_description));
                 messages = model.add_user_message(messages, &enhanced_msg);
                 continue;
             }
             Err(AgentError::TerminatingError(msg)) => {
-                println!("✅ {}", msg);
+                println!("{}", msg);
                 break;
             }
             Err(AgentError::TimeoutError(msg)) => {
-                println!("⚠️ Timeout: {}", msg);
+                println!("Timeout: {}", msg);
                 messages = model.add_user_message(messages, &msg);
                 continue;
             }
@@ -109,14 +115,14 @@ async fn run_direct(
         let output = match execute_action(&action, tool_registry) {
             Ok(o) => o,
             Err(AgentError::TerminatingError(msg)) => {
-                println!("✅ {}", msg);
+                println!("{}", msg);
                 break;
             }
             Err(AgentError::TimeoutError(msg)) => msg,
             Err(AgentError::FormatError(msg)) => msg,
         };
 
-        println!("📤 Output:\n{}", output);
+        println!("Output:\n{}", output);
         println!("\n{}", "═".repeat(60));
         println!();
 

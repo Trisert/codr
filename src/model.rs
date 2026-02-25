@@ -1,10 +1,15 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
-// ============================================================
-// Model Configuration
-// ============================================================
+#[derive(Debug, Clone)]
+pub struct Usage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub cost_in_currency: Option<f64>,
+}
 
+#[derive(Debug, Clone)]
 pub enum ModelType {
     Anthropic,
     LlamaServer { base_url: String, model: String },
@@ -13,6 +18,7 @@ pub enum ModelType {
 pub struct Model {
     client: Client,
     config: ModelConfig,
+    usage: Arc<Mutex<Usage>>,
 }
 
 struct ModelConfig {
@@ -52,6 +58,13 @@ struct AnthropicMessage {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +92,14 @@ struct OpenAIMessage {
 #[derive(Debug, Deserialize)]
 struct OpenAIResponse {
     choices: Vec<Choice>,
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +121,17 @@ impl Model {
         Self {
             client: Client::new(),
             config: ModelConfig { model_type },
+            usage: Arc::new(Mutex::new(Usage {
+                prompt_tokens: None,
+                completion_tokens: None,
+                cost_in_currency: None,
+            })),
         }
+    }
+
+    pub fn get_usage(&self) -> Result<Usage, Box<dyn std::error::Error>> {
+        let usage = self.usage.lock().unwrap();
+        Ok(usage.clone())
     }
 
     pub fn create_messages(&self, items: Vec<(&str, &str)>) -> Vec<Message> {
@@ -187,6 +218,17 @@ impl Model {
         }
 
         let anthropic_response: AnthropicResponse = response.json().await?;
+        
+        if let Some(usage_data) = anthropic_response.usage {
+            let mut usage = self.usage.lock().unwrap();
+            usage.prompt_tokens = Some(usage_data.input_tokens);
+            usage.completion_tokens = Some(usage_data.output_tokens);
+            usage.cost_in_currency = Some(
+                (usage_data.input_tokens as f64 * 0.000003) + 
+                (usage_data.output_tokens as f64 * 0.000015)
+            );
+        }
+        
         Ok(anthropic_response
             .content
             .get(0)
@@ -239,6 +281,14 @@ impl Model {
         }
 
         let openai_response: OpenAIResponse = response.json().await?;
+        
+        if let Some(usage_data) = openai_response.usage {
+            let mut usage = self.usage.lock().unwrap();
+            usage.prompt_tokens = Some(usage_data.prompt_tokens);
+            usage.completion_tokens = Some(usage_data.completion_tokens);
+            usage.cost_in_currency = Some(usage_data.total_tokens as f64 * 0.000001);
+        }
+        
         Ok(openai_response
             .choices
             .get(0)
