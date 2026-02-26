@@ -242,10 +242,46 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
             ]));
         }
         "assistant" => {
-            lines.push(Line::from(vec![
-                Span::styled("codr".to_string(), t.assistant),
-                Span::styled(format!(" {}", msg.timestamp), t.dim),
-            ]));
+            // Thinking content (if present) - displayed in italic
+            if let Some(ref thinking) = msg.thinking {
+                lines.push(Line::from("")); // newline before thinking
+
+                let italic_style = Style::default().add_modifier(Modifier::ITALIC);
+                let thinking_label = Style::default()
+                    .fg(Color::Rgb(150, 150, 170))
+                    .add_modifier(Modifier::ITALIC);
+
+                let mut thinking_lines = thinking.lines().collect::<Vec<_>>();
+                if !thinking_lines.is_empty() {
+                    let first_line = thinking_lines.remove(0);
+                    let wrapped = wrap_to_width(first_line, width.saturating_sub(14));
+                    for (i, wrapped_line) in wrapped.into_iter().enumerate() {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled("Thinking: ", thinking_label),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("    ".to_string()),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        }
+                    }
+
+                    for line in thinking_lines {
+                        let wrapped = wrap_to_width(line, width.saturating_sub(4));
+                        for wrapped_line in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::raw("    ".to_string()),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        }
+                    }
+                }
+                lines.push(Line::from("")); // newline after thinking
+            }
         }
         "action" => {
             lines.push(Line::from(vec![

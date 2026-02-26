@@ -601,16 +601,6 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
         all_lines.extend(rendered);
     }
 
-    // Spinner line if processing
-    if app.is_processing {
-        let spinner_text = "* thinking...";
-        all_lines.push(Line::from(vec![
-            Span::styled("  * ", Style::default().fg(Color::Cyan)),
-            Span::styled("thinking...", t.dim),
-        ]));
-        rendered_text.push(spinner_text.to_string());
-    }
-
     // Store rendered text for click handling
     app.rendered_lines = rendered_text;
 
