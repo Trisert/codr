@@ -235,11 +235,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     // Role header line (with timestamp for user / assistant)
     match msg.role.as_str() {
         "user" => {
-            lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), t.prompt),
-                Span::styled("You".to_string(), t.user),
-                Span::styled(format!("  {}", msg.timestamp), t.dim),
-            ]));
+            // User messages don't have a header, content is rendered below
         }
         "assistant" => {
             // Thinking content (if present) - displayed in italic
@@ -314,12 +310,13 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     }
 
     // Content lines with bullet
+    let prefix = role_prefix(&msg.role);
     for line in msg.content.lines() {
         let wrapped = wrap_to_width(line, width.saturating_sub(2));
         for (i, wrapped_line) in wrapped.into_iter().enumerate() {
-            let prefix = if i == 0 { "  ◎ " } else { "    " };
+            let line_prefix = if i == 0 { prefix } else { "  " };
             lines.push(Line::from(vec![
-                Span::raw(prefix.to_string()),
+                Span::raw(line_prefix.to_string()),
                 Span::styled(wrapped_line, style),
             ]));
         }
