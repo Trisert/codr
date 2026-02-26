@@ -228,9 +228,10 @@ pub fn get_role_label(role: &str) -> &str {
 
 pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     let t = &*THEME;
-    let style = style_role(&msg.role);
+    let _style = style_role(&msg.role);
     let prefix = role_prefix(&msg.role);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let markdown = MarkdownRenderer::new();
 
     // Role header line (with timestamp for user / assistant)
     match msg.role.as_str() {
@@ -309,15 +310,23 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         _ => {}
     }
 
-    // Content lines with bullet
-    let prefix = role_prefix(&msg.role);
-    for line in msg.content.lines() {
-        let wrapped = wrap_to_width(line, width.saturating_sub(2));
-        for (i, wrapped_line) in wrapped.into_iter().enumerate() {
-            let line_prefix = if i == 0 { prefix } else { "  " };
+    // Content lines - use markdown rendering for assistant
+    let content_lines = if msg.role == "assistant" {
+        markdown.render(&msg.content)
+    } else {
+        vec![Line::from(Span::raw(msg.content.to_string()))]
+    };
+
+    for (i, md_line) in content_lines.into_iter().enumerate() {
+        let line_prefix = if i == 0 { prefix } else { "  " };
+        // Wrap each line to fit width
+        let line_text = md_line.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let wrapped = wrap_to_width(&line_text, width.saturating_sub(2));
+        for (j, wrapped_line) in wrapped.into_iter().enumerate() {
+            let prefix = if i == 0 && j == 0 { line_prefix } else { "  " };
             lines.push(Line::from(vec![
-                Span::raw(line_prefix.to_string()),
-                Span::styled(wrapped_line, style),
+                Span::raw(prefix.to_string()),
+                Span::raw(wrapped_line),
             ]));
         }
     }
