@@ -7,7 +7,7 @@ use crate::tui_components::{
     render_message, render_hint_line, THEME,
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -533,6 +533,10 @@ pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
+                // Only handle Press events (not Release/Repeat which WSL sends)
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 match key.code {
                     // ── Approval keys ────────────────────
                     KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
