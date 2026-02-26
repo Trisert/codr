@@ -533,6 +533,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // header bar
+            Constraint::Length(1),  // spacer
             Constraint::Min(1),    // conversation
             Constraint::Length(3), // input + hint
         ])
@@ -542,10 +543,10 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     draw_header(f, app, zones[0]);
 
     // ── Conversation area ────────────────────────────────────
-    draw_conversation(f, app, zones[1]);
+    draw_conversation(f, app, zones[2]);
 
     // ── Input area ───────────────────────────────────────────
-    draw_input(f, app, zones[2]);
+    draw_input(f, app, zones[3]);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -862,7 +863,6 @@ async fn run_event_loop(
                             let now = Instant::now();
                             if app.is_processing {
                                 app.cancel_processing();
-                                app.messages.push(ChatMessage::system("interrupted"));
                                 app.last_ctrl_c = Some(now);
                             } else if let Some(last) = app.last_ctrl_c {
                                 if now.duration_since(last) < Duration::from_secs(2) {
@@ -906,10 +906,10 @@ async fn run_event_loop(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                        app.scroll_offset = app.scroll_offset.saturating_add(3);
                     }
                     MouseEventKind::ScrollUp => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(3);
+                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                         app.handle_click(mouse.column, mouse.row);
