@@ -13,6 +13,7 @@ pub struct Usage {
 pub enum ModelType {
     Anthropic,
     LlamaServer { base_url: String, model: String },
+    Nim { base_url: String, model: String, api_key: String },
 }
 
 pub struct Model {
@@ -164,7 +165,10 @@ impl Model {
         match &self.config.model_type {
             ModelType::Anthropic => self.query_anthropic(messages).await,
             ModelType::LlamaServer { base_url, model } => {
-                self.query_llama_server(messages, base_url, model).await
+                self.query_openai_compat(messages, base_url, model, None).await
+            }
+            ModelType::Nim { base_url, model, api_key } => {
+                self.query_openai_compat(messages, base_url, model, Some(api_key)).await
             }
         }
     }
@@ -231,32 +235,29 @@ impl Model {
         
         Ok(anthropic_response
             .content
-            .get(0)
+            .first()
             .map(|c| c.text.clone())
             .unwrap_or_default())
     }
 
     // ============================================================
-    // llama-server (OpenAI-compatible API)
+    // OpenAI-compatible API (llama-server, NVIDIA NIM, etc.)
     // ============================================================
 
-    async fn query_llama_server(
+    async fn query_openai_compat(
         &self,
         messages: &[Message],
         base_url: &str,
         model: &str,
+        api_key: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/v1/chat/completions", base_url);
 
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
-            .filter_map(|msg| {
-                // llama-server (OpenAI-compatible) doesn't have a separate system field
-                // We include system messages as role="system"
-                Some(OpenAIMessage {
-                    role: msg.role.clone(),
-                    content: msg.content.clone(),
-                })
+            .map(|msg| OpenAIMessage {
+                role: msg.role.clone(),
+                content: msg.content.clone(),
             })
             .collect();
 
@@ -266,32 +267,35 @@ impl Model {
             max_tokens: Some(4096),
         };
 
-        let response = self
+        let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = req.json(&request_body).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await?;
-            return Err(format!("llama-server API error: {} - {}", status, error_text).into());
+            return Err(format!("API error: {} - {}", status, error_text).into());
         }
 
         let openai_response: OpenAIResponse = response.json().await?;
-        
+
         if let Some(usage_data) = openai_response.usage {
             let mut usage = self.usage.lock().unwrap();
             usage.prompt_tokens = Some(usage_data.prompt_tokens);
             usage.completion_tokens = Some(usage_data.completion_tokens);
             usage.cost_in_currency = Some(usage_data.total_tokens as f64 * 0.000001);
         }
-        
+
         Ok(openai_response
             .choices
-            .get(0)
+            .first()
             .map(|c| c.message.content.clone())
             .unwrap_or_default())
     }

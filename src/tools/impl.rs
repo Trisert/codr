@@ -10,6 +10,7 @@ use std::process::Command;
 // Read Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct ReadTool {
     schema: ToolSchema,
 }
@@ -120,6 +121,7 @@ impl Tool for ReadTool {
 // Bash Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct BashTool {
     schema: ToolSchema,
 }
@@ -189,6 +191,7 @@ impl Tool for BashTool {
 // Edit Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct EditTool {
     schema: ToolSchema,
 }
@@ -257,6 +260,7 @@ impl Tool for EditTool {
 // Write Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct WriteTool {
     schema: ToolSchema,
 }
@@ -318,6 +322,7 @@ impl Tool for WriteTool {
 // Grep Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct GrepTool {
     schema: ToolSchema,
 }
@@ -395,6 +400,7 @@ impl Tool for GrepTool {
 // Find Tool
 // ============================================================
 
+#[allow(dead_code)]
 pub struct FindTool {
     schema: ToolSchema,
 }

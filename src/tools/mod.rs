@@ -13,6 +13,7 @@ use schema::ToolSchema;
 // Tool Trait
 // ============================================================
 
+#[allow(dead_code)]
 pub trait Tool: Send + Sync {
     /// Name of the tool (used for invocation)
     fn name(&self) -> &str;
@@ -34,6 +35,7 @@ pub trait Tool: Send + Sync {
 // Tool Context
 // ============================================================
 
+#[allow(dead_code)]
 pub struct ToolContext {
     /// Current working directory
     pub cwd: std::path::PathBuf,
@@ -58,6 +60,7 @@ impl ToolContext {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_limits(mut self, token_limit: usize, line_limit: usize) -> Self {
         self.token_limit = token_limit;
         self.line_limit = line_limit;
@@ -92,6 +95,7 @@ pub struct ToolOutput {
     pub metadata: OutputMetadata,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Attachment {
     pub name: String,
@@ -99,6 +103,7 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct OutputMetadata {
     pub file_path: Option<String>,
@@ -135,6 +140,7 @@ impl ToolOutput {
 // Tool Error
 // ============================================================
 
+#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("IO error: {0}")]
@@ -206,6 +212,7 @@ impl ToolRegistry {
         self.tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
     }
 
+    #[allow(dead_code)]
     pub fn list(&self) -> Vec<&dyn Tool> {
         self.tools.iter().map(|t| t.as_ref()).collect()
     }
@@ -254,6 +261,7 @@ pub fn create_coding_tools(cwd: std::path::PathBuf) -> ToolRegistry {
     registry
 }
 
+#[allow(dead_code)]
 pub fn create_read_only_tools(cwd: std::path::PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new(cwd);
     registry
@@ -263,8 +271,3 @@ pub fn create_read_only_tools(cwd: std::path::PathBuf) -> ToolRegistry {
     registry
 }
 
-// ============================================================
-// Re-exports
-// ============================================================
-
-pub use r#impl::{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool};

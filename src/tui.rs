@@ -16,12 +16,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 pub struct App {
@@ -34,6 +34,7 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub tools_description: String,
     pub system_messages: Vec<Message>,
+    #[allow(dead_code)]
     pub markdown_renderer: MarkdownRenderer,
     pub pending_action: Option<PendingAction>,
     pub approval_state: ApprovalState,
@@ -41,7 +42,8 @@ pub struct App {
     pub session_tokens: u32,
     pub session_cost: f64,
     pub model_name: String,
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
+    pub last_ctrl_c: Option<Instant>,
 }
 
 impl App {
@@ -65,6 +67,7 @@ impl App {
             session_cost: 0.0,
             model_name,
             scroll_offset: 0,
+            last_ctrl_c: None,
         }
     }
 
@@ -91,11 +94,6 @@ impl App {
         messages
     }
 
-    /// Scroll to the bottom of the chat (reset offset)
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
-    }
-
     pub async fn process_message(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.input.trim().is_empty() {
             return Ok(());
@@ -107,20 +105,20 @@ impl App {
         self.cursor_position = 0;
         self.is_processing = true;
         self.streaming_content.clear();
-        self.scroll_to_bottom();
+        // Auto-scroll to bottom on new message
+        self.scroll_offset = 0;
 
         let mut conversation = self.get_conversation_history();
 
         loop {
             let lm_output = self.model.query(&conversation).await?;
-
+            
             if let Ok(usage) = self.model.get_usage() {
                 self.session_tokens += usage.completion_tokens.unwrap_or(0);
                 self.session_cost += usage.cost_in_currency.unwrap_or(0.0);
             }
 
             self.messages.push(ChatMessage::assistant(&lm_output));
-            self.scroll_to_bottom();
 
             let action = match parse_action(&lm_output) {
                 Ok(a) => a,
@@ -152,7 +150,6 @@ impl App {
                 Action::Tool { name, params } => format!("tool: {} | {}", name, params),
             };
             self.messages.push(ChatMessage::action(&action_display));
-            self.scroll_to_bottom();
 
             match &action {
                 Action::Bash(cmd) => {
@@ -177,13 +174,11 @@ impl App {
                                 result.push_str(" [truncated]");
                             }
                             self.messages.push(ChatMessage::output(&result));
-                            self.scroll_to_bottom();
                             conversation.push(Message { role: "assistant".to_string(), content: lm_output });
                             conversation.push(Message { role: "user".to_string(), content: result });
                         }
                         Err(e) => {
                             self.messages.push(ChatMessage::output(&format!("Tool error: {}", e)));
-                            self.scroll_to_bottom();
                             conversation.push(Message { role: "assistant".to_string(), content: lm_output });
                             conversation.push(Message { role: "user".to_string(), content: format!("Tool error: {}", e) });
                         }
@@ -210,7 +205,7 @@ impl App {
         self.approval_state = ApprovalState::None;
 
         let mut conversation = self.get_conversation_history();
-
+        
         if let Some(last_msg) = self.messages.last() {
             if last_msg.role == "action" {
                 conversation.push(Message {
@@ -225,13 +220,11 @@ impl App {
                 if let Some(PendingAction { content: cmd, .. }) = pending {
                     let output = execute_bash_action(&cmd)?;
                     self.messages.push(ChatMessage::output(&output));
-                    self.scroll_to_bottom();
                     conversation.push(Message { role: "user".to_string(), content: output });
                 }
             }
             ApprovalState::Rejected => {
                 self.messages.push(ChatMessage::output("Action rejected by user"));
-                self.scroll_to_bottom();
                 conversation.push(Message { role: "user".to_string(), content: "Action rejected".to_string() });
             }
             _ => {}
@@ -239,14 +232,13 @@ impl App {
 
         loop {
             let lm_output = self.model.query(&conversation).await?;
-
+            
             if let Ok(usage) = self.model.get_usage() {
                 self.session_tokens += usage.completion_tokens.unwrap_or(0);
                 self.session_cost += usage.cost_in_currency.unwrap_or(0.0);
             }
 
             self.messages.push(ChatMessage::assistant(&lm_output));
-            self.scroll_to_bottom();
 
             let action = match parse_action(&lm_output) {
                 Ok(a) => a,
@@ -278,7 +270,6 @@ impl App {
                 Action::Tool { name, params } => format!("tool: {} | {}", name, params),
             };
             self.messages.push(ChatMessage::action(&action_display));
-            self.scroll_to_bottom();
 
             match &action {
                 Action::Bash(cmd) => {
@@ -303,13 +294,11 @@ impl App {
                                 result.push_str(" [truncated]");
                             }
                             self.messages.push(ChatMessage::output(&result));
-                            self.scroll_to_bottom();
                             conversation.push(Message { role: "assistant".to_string(), content: lm_output });
                             conversation.push(Message { role: "user".to_string(), content: result });
                         }
                         Err(e) => {
                             self.messages.push(ChatMessage::output(&format!("Tool error: {}", e)));
-                            self.scroll_to_bottom();
                             conversation.push(Message { role: "assistant".to_string(), content: lm_output });
                             conversation.push(Message { role: "user".to_string(), content: format!("Tool error: {}", e) });
                         }
@@ -324,8 +313,6 @@ impl App {
         Ok(())
     }
 }
-
-// ── Bash execution ───────────────────────────────────────────
 
 fn execute_bash_action(command: &str) -> Result<String, AgentError> {
     use std::process::Command;
@@ -354,157 +341,173 @@ fn execute_bash_action(command: &str) -> Result<String, AgentError> {
     }
 }
 
-// ── Drawing ──────────────────────────────────────────────────
+// ── UI Drawing ───────────────────────────────────────────────
 
 fn draw_ui(f: &mut Frame, app: &App) {
     let area = f.area();
-    let t = &*THEME;
 
-    // Layout: header (1) | messages (flex) | separator (1) | status (1) | hint (1) | input (1)
-    let chunks = Layout::default()
+    // Three-zone vertical layout: header | conversation | input area
+    let zones = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // header
-            Constraint::Min(1),    // messages
-            Constraint::Length(1), // separator
-            Constraint::Length(1), // status
-            Constraint::Length(1), // hint line
-            Constraint::Length(1), // input
+            Constraint::Length(1),  // header bar
+            Constraint::Min(1),    // conversation
+            Constraint::Length(4), // input + hint
         ])
         .split(area);
 
-    draw_header(f, app, chunks[0]);
-    draw_messages(f, app, chunks[1]);
-    draw_separator(f, chunks[2]);
-    draw_status(f, app, chunks[3]);
-    draw_hints(f, app, chunks[4]);
-    draw_input(f, app, chunks[5]);
+    // ── Header bar ───────────────────────────────────────────
+    draw_header(f, app, zones[0]);
+
+    // ── Conversation area ────────────────────────────────────
+    draw_conversation(f, app, zones[1]);
+
+    // ── Input area ───────────────────────────────────────────
+    draw_input(f, app, zones[2]);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let t = &*THEME;
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let header = Line::from(vec![
-        Span::styled("  codr", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}  ", app.model_name), t.dim),
-        Span::styled(cwd, Style::default().fg(Color::Rgb(80, 80, 100))),
-    ]);
-
-    f.render_widget(Paragraph::new(header), area);
-}
-
-fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
 
-    // Build all display lines from messages
+    let left_text = "  codr";
+    let right_text = format!("{}  {}tok  ${:.4}  ", app.model_name, app.session_tokens, app.session_cost);
+    let padding = width.saturating_sub(left_text.len() + right_text.len());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("  codr", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" ".repeat(padding), t.dim),
+        Span::styled(right_text, t.status),
+    ]))
+    .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+
+    f.render_widget(header, area);
+}
+
+fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
+    let t = &*THEME;
+    let width = area.width.saturating_sub(2) as usize; // account for borders
+
+    // Render all messages into lines
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
+    // Welcome message if no messages yet
     if app.messages.is_empty() {
-        // Welcome message
         all_lines.push(Line::from(""));
         all_lines.push(Line::from(vec![
-            Span::styled("  Welcome to ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Welcome to ", t.dim),
             Span::styled("codr", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(". Type a message below to get started.", Style::default().fg(Color::DarkGray)),
+            Span::styled(". Type a message to get started.", t.dim),
         ]));
         all_lines.push(Line::from(""));
-    } else {
-        for msg in &app.messages {
-            let rendered = render_message(msg, width);
-            all_lines.extend(rendered);
-        }
     }
 
-    // Show spinner if processing
+    for msg in &app.messages {
+        let rendered = render_message(msg, width);
+        all_lines.extend(rendered);
+    }
+
+    // Spinner line if processing
     if app.is_processing {
         all_lines.push(Line::from(vec![
-            Span::styled("  ● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled("thinking...", Style::default().fg(Color::DarkGray)),
+            Span::styled("  * ", Style::default().fg(Color::Cyan)),
+            Span::styled("thinking...", t.dim),
         ]));
     }
 
-    let total_lines = all_lines.len() as u16;
-    let visible_height = area.height;
+    let visible_height = area.height.saturating_sub(2) as usize; // borders
+    let total_lines = all_lines.len();
 
-    // Calculate scroll: we show the bottom of the chat by default (scroll_offset=0 means bottom)
+    // Clamp scroll offset
     let max_scroll = total_lines.saturating_sub(visible_height);
-    let scroll = max_scroll.saturating_sub(app.scroll_offset);
+    let scroll = app.scroll_offset.min(max_scroll);
 
-    let paragraph = Paragraph::new(all_lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    // Scroll from bottom: when scroll_offset == 0, show the last lines
+    let bottom_scroll = max_scroll.saturating_sub(scroll);
 
-    f.render_widget(paragraph, area);
-}
+    let conversation = Paragraph::new(all_lines)
+        .scroll((bottom_scroll as u16, 0))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Rgb(40, 40, 55)))
+        )
+        .style(Style::default().bg(Color::Rgb(15, 15, 20)));
 
-fn draw_separator(f: &mut Frame, area: Rect) {
-    let t = &*THEME;
-    let sep = "─".repeat(area.width as usize);
-    let line = Paragraph::new(Line::from(Span::styled(sep, t.separator)));
-    f.render_widget(line, area);
-}
+    f.render_widget(conversation, area);
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let t = &*THEME;
-    let tokens_str = if app.session_tokens > 0 {
-        format!("  {}tok", app.session_tokens)
-    } else {
-        String::new()
-    };
-    let cost_str = if app.session_cost > 0.0 {
-        format!("  ${:.4}", app.session_cost)
-    } else {
-        String::new()
-    };
-
-    let status = Line::from(vec![
-        Span::styled(format!("  {}", app.model_name), t.status),
-        Span::styled(tokens_str, t.dim),
-        Span::styled(cost_str, t.dim),
-    ]);
-
-    f.render_widget(Paragraph::new(status), area);
-}
-
-fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
-    let hint = render_hint_line(matches!(app.approval_state, ApprovalState::Pending));
-    f.render_widget(Paragraph::new(hint), area);
+    // Scroll indicator
+    if scroll > 0 {
+        let indicator = Paragraph::new(Line::from(vec![
+            Span::styled(format!("  ^ {} more lines ", scroll), t.dim),
+        ]));
+        let indicator_area = Rect::new(area.x, area.y, area.width, 1);
+        f.render_widget(indicator, indicator_area);
+    }
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let t = &*THEME;
+    let _t = &*THEME;
+    let is_pending = matches!(app.approval_state, ApprovalState::Pending);
 
+    // Split: input line + hint line
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // input box (with borders)
+            Constraint::Length(1), // hint line
+        ])
+        .split(area);
+
+    // Input box
     let input_style = if app.is_processing {
-        t.dim
-    } else if matches!(app.approval_state, ApprovalState::Pending) {
-        THEME.action
+        Style::default().fg(Color::DarkGray)
+    } else if is_pending {
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::White)
     };
 
-    let prompt_char = if matches!(app.approval_state, ApprovalState::Pending) {
-        "? "
+    let prompt_label = if is_pending {
+        "approve (a) / reject (r)"
+    } else if app.is_processing {
+        "processing..."
     } else {
-        "> "
+        ">"
     };
 
-    let input_line = Line::from(vec![
-        Span::styled(format!("  {}", prompt_char), t.prompt),
-        Span::styled(app.input.as_str(), input_style),
-    ]);
+    let input = Paragraph::new(app.input.as_str())
+        .style(input_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+                .title(Span::styled(
+                    format!(" {} ", prompt_label),
+                    if is_pending {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    },
+                ))
+        );
+    f.render_widget(input, chunks[0]);
 
-    f.render_widget(Paragraph::new(input_line), area);
+    // Cursor
+    if !app.is_processing && !is_pending {
+        f.set_cursor_position((
+            chunks[0].x + app.input.width().min(chunks[0].width as usize - 2) as u16 + 1,
+            chunks[0].y + 1,
+        ));
+    }
 
-    // Position cursor after the prompt prefix ("  > " = 4 chars) plus input text
-    let cursor_x = area.x + 4 + app.input[..app.cursor_position].width() as u16;
-    let cursor_x = cursor_x.min(area.x + area.width.saturating_sub(1));
-    f.set_cursor_position((cursor_x, area.y));
+    // Hint line
+    let hint = Paragraph::new(render_hint_line(is_pending))
+        .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+    f.render_widget(hint, chunks[1]);
 }
 
-// ── Main event loop ──────────────────────────────────────────
+// ── Main TUI loop ────────────────────────────────────────────
 
 pub async fn run_tui(app: App) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
@@ -514,17 +517,6 @@ pub async fn run_tui(app: App) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let app_arc = Arc::new(Mutex::new(app));
-    let app_clone = app_arc.clone();
-
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let app = app_clone.lock().unwrap();
-            if app.should_quit {
-                break;
-            }
-        }
-    });
 
     let tick_rate = Duration::from_millis(100);
 
@@ -548,90 +540,137 @@ pub async fn run_tui(app: App) -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                let mut app = app_arc.lock().unwrap();
+                // Determine what action to take while holding the lock briefly
+                enum Action {
+                    Approve,
+                    Reject,
+                    Send,
+                    None,
+                }
 
-                match key.code {
-                    // ── Approval keys ────────────────────
-                    KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
-                        let mut app = app_arc.lock().unwrap();
-                        app.approval_state = ApprovalState::Approved;
-                        drop(app);
-                        let mut app = app_arc.lock().unwrap();
-                        app.continue_after_approval().await?;
-                    }
-                    KeyCode::Char('r') if matches!(app.approval_state, ApprovalState::Pending) => {
-                        let mut app = app_arc.lock().unwrap();
-                        app.approval_state = ApprovalState::Rejected;
-                        drop(app);
-                        let mut app = app_arc.lock().unwrap();
-                        app.continue_after_approval().await?;
-                    }
+                let action = {
+                    let mut app = app_arc.lock().unwrap();
 
-                    // ── Quit ──────────────────────────────
-                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let mut app = app_arc.lock().unwrap();
-                        app.should_quit = true;
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let mut app = app_arc.lock().unwrap();
-                        app.should_quit = true;
-                    }
+                    match key.code {
+                        // ── Approval keys ────────────────────
+                        KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
+                            app.approval_state = ApprovalState::Approved;
+                            Action::Approve
+                        }
+                        KeyCode::Char('r') if matches!(app.approval_state, ApprovalState::Pending) => {
+                            app.approval_state = ApprovalState::Rejected;
+                            Action::Reject
+                        }
 
-                    // ── Scroll ────────────────────────────
-                    KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(3);
-                    }
-                    KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                    }
-                    KeyCode::PageUp => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(10);
-                    }
-                    KeyCode::PageDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                    }
+                        // ── Scroll ────────────────────────────
+                        KeyCode::PageUp => {
+                            app.scroll_offset = app.scroll_offset.saturating_add(10);
+                            Action::None
+                        }
+                        KeyCode::PageDown => {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                            Action::None
+                        }
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.scroll_offset = app.scroll_offset.saturating_add(3);
+                            Action::None
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                            Action::None
+                        }
 
-                    // ── Send message (Enter) ─────────────
-                    KeyCode::Enter => {
-                        if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
-                            let has_input = !app.input.trim().is_empty();
-                            drop(app);
-                            if has_input {
-                                let mut app = app_arc.lock().unwrap();
-                                app.process_message().await?;
+                        // ── Send (Ctrl+S or Enter) ───────────
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.is_processing
+                                && !matches!(app.approval_state, ApprovalState::Pending)
+                                && !app.input.trim().is_empty()
+                            {
+                                Action::Send
+                            } else {
+                                Action::None
                             }
                         }
-                    }
-
-                    // ── Text input ───────────────────────
-                    KeyCode::Char(c) => {
-                        if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
-                            let cursor = app.cursor_position;
-                            app.input.insert(cursor, c);
-                            app.cursor_position += 1;
+                        KeyCode::Enter => {
+                            if !app.is_processing
+                                && !matches!(app.approval_state, ApprovalState::Pending)
+                                && !app.input.trim().is_empty()
+                            {
+                                Action::Send
+                            } else {
+                                Action::None
+                            }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
+
+                        // ── Ctrl+C: stop agent / double = quit ──
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let now = Instant::now();
+                            if app.is_processing {
+                                app.is_processing = false;
+                                app.streaming_content.clear();
+                                app.messages.push(ChatMessage::system("interrupted"));
+                                app.last_ctrl_c = Some(now);
+                                Action::None
+                            } else if let Some(last) = app.last_ctrl_c {
+                                if now.duration_since(last) < Duration::from_secs(2) {
+                                    app.should_quit = true;
+                                    Action::None
+                                } else {
+                                    app.last_ctrl_c = Some(now);
+                                    Action::None
+                                }
+                            } else {
+                                app.last_ctrl_c = Some(now);
+                                Action::None
+                            }
+                        }
+
+                        // ── Text input ────────────────────────
+                        KeyCode::Char(c) => {
+                            if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
+                                let cursor = app.cursor_position;
+                                app.input.insert(cursor, c);
+                                app.cursor_position += 1;
+                            }
+                            Action::None
+                        }
+                        KeyCode::Backspace => {
+                            if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
+                                if app.cursor_position > 0 {
+                                    let cursor = app.cursor_position - 1;
+                                    app.input.remove(cursor);
+                                    app.cursor_position = cursor;
+                                }
+                            }
+                            Action::None
+                        }
+                        KeyCode::Left => {
                             if app.cursor_position > 0 {
-                                let cursor = app.cursor_position - 1;
-                                app.input.remove(cursor);
-                                app.cursor_position = cursor;
+                                app.cursor_position -= 1;
                             }
+                            Action::None
                         }
-                    }
-                    KeyCode::Left => {
-                        if app.cursor_position > 0 {
-                            app.cursor_position -= 1;
+                        KeyCode::Right => {
+                            if app.cursor_position < app.input.len() {
+                                app.cursor_position += 1;
+                            }
+                            Action::None
                         }
+                        _ => Action::None,
                     }
-                    KeyCode::Right => {
-                        if app.cursor_position < app.input.len() {
-                            app.cursor_position += 1;
-                        }
-                    }
+                }; // lock is dropped here
 
-                    _ => {}
+                // Perform async actions outside the lock
+                match action {
+                    Action::Approve | Action::Reject => {
+                        let mut app = app_arc.lock().unwrap();
+                        app.continue_after_approval().await?;
+                    }
+                    Action::Send => {
+                        let mut app = app_arc.lock().unwrap();
+                        app.process_message().await?;
+                    }
+                    Action::None => {}
                 }
             }
         }

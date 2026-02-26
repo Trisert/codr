@@ -12,6 +12,7 @@ use std::path::PathBuf;
 enum ModelTypeConfig {
     Llama,
     Anthropic,
+    Nim,
 }
 
 impl Default for ModelTypeConfig {
@@ -50,10 +51,29 @@ impl Default for AnthropicConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
+struct NimConfig {
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+impl Default for NimConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://integrate.api.nvidia.com".to_string(),
+            model: "meta/llama-3.1-70b-instruct".to_string(),
+            api_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Config {
     model: ModelTypeConfig,
     llama: LlamaConfig,
     anthropic: AnthropicConfig,
+    nim: NimConfig,
 }
 
 impl Default for Config {
@@ -62,6 +82,7 @@ impl Default for Config {
             model: ModelTypeConfig::default(),
             llama: LlamaConfig::default(),
             anthropic: AnthropicConfig::default(),
+            nim: NimConfig::default(),
         }
     }
 }
@@ -120,7 +141,6 @@ impl Config {
                 model: self.llama.model.clone(),
             },
             ModelTypeConfig::Anthropic => {
-                // Check for API key in config first, then environment
                 let api_key = self.anthropic.api_key
                     .clone()
                     .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
@@ -130,6 +150,22 @@ impl Config {
                 }
 
                 ModelType::Anthropic
+            }
+            ModelTypeConfig::Nim => {
+                let api_key = self.nim.api_key
+                    .clone()
+                    .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
+                    .unwrap_or_default();
+
+                if api_key.is_empty() {
+                    eprintln!("Warning: NVIDIA_API_KEY not set in config or environment");
+                }
+
+                ModelType::Nim {
+                    base_url: self.nim.base_url.clone(),
+                    model: self.nim.model.clone(),
+                    api_key,
+                }
             }
         }
     }

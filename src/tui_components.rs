@@ -8,11 +8,11 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 // ── Theme ────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct Theme {
     pub user: Style,
     pub assistant: Style,
@@ -69,6 +69,7 @@ pub enum ApprovalState {
 
 #[derive(Clone, Debug)]
 pub struct PendingAction {
+    #[allow(dead_code)]
     pub action_type: String,
     pub content: String,
 }
@@ -127,15 +128,16 @@ pub fn style_role(role: &str) -> Style {
 
 pub fn role_prefix(role: &str) -> &'static str {
     match role {
-        "user" => "❯ ",
+        "user" => "> ",
         "assistant" => "",
-        "action" => "⚡ ",
+        "action" => "$ ",
         "output" => "  ",
-        "error" => "✗ ",
+        "error" => "! ",
         _ => "",
     }
 }
 
+#[allow(dead_code)]
 pub fn get_role_label(role: &str) -> &str {
     match role {
         "user" => "You",
@@ -159,21 +161,21 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     match msg.role.as_str() {
         "user" => {
             lines.push(Line::from(vec![
-                Span::styled(prefix, t.prompt),
-                Span::styled("You", t.user),
+                Span::styled(prefix.to_string(), t.prompt),
+                Span::styled("You".to_string(), t.user),
                 Span::styled(format!("  {}", msg.timestamp), t.dim),
             ]));
         }
         "assistant" => {
             lines.push(Line::from(vec![
-                Span::styled("codr", t.assistant),
+                Span::styled("codr".to_string(), t.assistant),
                 Span::styled(format!("  {}", msg.timestamp), t.dim),
             ]));
         }
         "action" => {
             lines.push(Line::from(vec![
-                Span::styled(prefix, t.action),
-                Span::styled(&msg.content, t.action),
+                Span::styled(prefix.to_string(), t.action),
+                Span::styled(msg.content.clone(), t.action),
             ]));
             return lines; // action is a single-line entry
         }
@@ -182,7 +184,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
             for line in msg.content.lines() {
                 let display = truncate_to_width(line, width.saturating_sub(4));
                 lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default()),
+                    Span::styled("    ".to_string(), Style::default()),
                     Span::styled(display, t.output),
                 ]));
             }
@@ -190,8 +192,8 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         }
         "error" => {
             lines.push(Line::from(vec![
-                Span::styled(prefix, t.error),
-                Span::styled("Error", t.error),
+                Span::styled(prefix.to_string(), t.error),
+                Span::styled("Error".to_string(), t.error),
             ]));
         }
         _ => {}
@@ -213,6 +215,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
 
 // ── StatusLine ───────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct StatusLine {
     pub model: String,
     pub tokens: u32,
@@ -220,6 +223,7 @@ pub struct StatusLine {
     pub cwd: String,
 }
 
+#[allow(dead_code)]
 impl StatusLine {
     pub fn new(model: &str) -> Self {
         let cwd = std::env::current_dir()
@@ -242,11 +246,13 @@ impl StatusLine {
 
 // ── Markdown Renderer ────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct MarkdownRenderer {
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
 }
 
+#[allow(dead_code)]
 impl MarkdownRenderer {
     pub fn new() -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -292,7 +298,7 @@ impl MarkdownRenderer {
 
         if line.starts_with("- ") || line.starts_with("* ") {
             return Line::from(vec![
-                Span::styled("  • ".to_string(), Style::default().fg(Color::Rgb(255, 180, 100))),
+                Span::styled("  * ".to_string(), Style::default().fg(Color::Rgb(255, 180, 100))),
                 Span::raw(line[2..].to_string()),
             ]);
         }
@@ -429,11 +435,13 @@ impl Default for MarkdownRenderer {
 
 // ── Text utilities ───────────────────────────────────────────
 
+#[allow(dead_code)]
 pub fn visible_width(text: &str) -> usize {
     let stripped = strip_ansi(text);
     stripped.width()
 }
 
+#[allow(dead_code)]
 pub fn strip_ansi(text: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
@@ -485,7 +493,9 @@ pub fn render_hint_line(approval_pending: bool) -> Line<'static> {
         Line::from(vec![
             Span::styled("  enter", t.dim),
             Span::styled(" send  ", t.dim),
-            Span::styled("ctrl+q", t.dim),
+            Span::styled("ctrl+c", t.dim),
+            Span::styled(" stop  ", t.dim),
+            Span::styled("ctrl+c x2", t.dim),
             Span::styled(" quit", t.dim),
         ])
     }

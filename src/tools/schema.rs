@@ -12,6 +12,7 @@ pub struct ToolSchema {
     pub required: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Property {
     pub name: String,
@@ -21,6 +22,7 @@ pub struct Property {
     pub default: Option<Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum PropertyType {
     String,
@@ -59,6 +61,7 @@ impl ToolSchema {
         self
     }
 
+    #[allow(dead_code)]
     pub fn number(mut self, name: &str, description: &str, required: bool) -> Self {
         self.properties.push(Property {
             name: name.to_string(),
@@ -101,6 +104,7 @@ impl ToolSchema {
         self
     }
 
+    #[allow(dead_code)]
     pub fn build(&self) -> String {
         let props: Vec<String> = self
             .properties
@@ -149,6 +153,7 @@ impl Default for ToolSchema {
 // Parameter Extraction Helpers
 // ============================================================
 
+#[allow(dead_code)]
 pub trait ExtractParams {
     fn get_str(&self, key: &str) -> Result<Option<String>, String>;
     fn get_required_str(&self, key: &str) -> Result<String, String>;

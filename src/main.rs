@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_name = match &model_type {
         ModelType::LlamaServer { model, .. } => model.clone(),
         ModelType::Anthropic => "claude".to_string(),
+        ModelType::Nim { model, .. } => model.clone(),
     };
 
     // Create tool registry

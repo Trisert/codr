@@ -57,6 +57,7 @@ pub fn truncate_file(
     })
 }
 
+#[allow(dead_code)]
 pub fn estimate_tokens(text: &str) -> usize {
     // Rough estimate: ~4 characters per token for English text
     text.chars().count() / 4
@@ -75,6 +76,7 @@ pub fn resolve_path(cwd: &Path, path: &str) -> std::path::PathBuf {
     }
 }
 
+#[allow(dead_code)]
 pub fn normalize_path(path: &Path) -> std::path::PathBuf {
     // Use dunce to normalize paths on Windows (remove \\?\ prefix)
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -104,6 +106,7 @@ pub fn build_walker(cwd: &Path, path: &str) -> ignore::Walk {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_ignored(cwd: &Path, path: &Path) -> bool {
     let walker = WalkBuilder::new(cwd)
         .hidden(false)
@@ -187,12 +190,14 @@ pub fn find_project_root(start: &Path) -> std::path::PathBuf {
 // Line/Range Parsing
 // ============================================================
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FileRange {
     pub offset: usize,
     pub limit: usize,
 }
 
+#[allow(dead_code)]
 impl FileRange {
     pub fn parse(offset: Option<&str>, limit: Option<&str>) -> Result<Option<Self>, String> {
         match (offset, limit) {
