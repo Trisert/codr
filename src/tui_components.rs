@@ -11,6 +11,54 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
+// ── Theme ────────────────────────────────────────────────────
+
+pub struct Theme {
+    pub user: Style,
+    pub assistant: Style,
+    pub action: Style,
+    pub output: Style,
+    pub error: Style,
+    pub system: Style,
+    pub dim: Style,
+    pub separator: Style,
+    pub header: Style,
+    pub prompt: Style,
+    pub status: Style,
+}
+
+pub static THEME: Lazy<Theme> = Lazy::new(|| Theme {
+    user: Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD),
+    assistant: Style::default()
+        .fg(Color::Rgb(180, 210, 255)),
+    action: Style::default()
+        .fg(Color::Rgb(255, 180, 100))
+        .add_modifier(Modifier::BOLD),
+    output: Style::default()
+        .fg(Color::Rgb(140, 140, 140)),
+    error: Style::default()
+        .fg(Color::Rgb(255, 100, 100))
+        .add_modifier(Modifier::BOLD),
+    system: Style::default()
+        .fg(Color::DarkGray),
+    dim: Style::default()
+        .fg(Color::DarkGray),
+    separator: Style::default()
+        .fg(Color::Rgb(60, 60, 60)),
+    header: Style::default()
+        .fg(Color::Rgb(100, 100, 120))
+        .add_modifier(Modifier::BOLD),
+    prompt: Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD),
+    status: Style::default()
+        .fg(Color::Rgb(80, 80, 100)),
+});
+
+// ── Approval / Pending ───────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ApprovalState {
     None,
@@ -24,6 +72,8 @@ pub struct PendingAction {
     pub action_type: String,
     pub content: String,
 }
+
+// ── ChatMessage ──────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
@@ -41,29 +91,12 @@ impl ChatMessage {
         }
     }
 
-    pub fn user(content: &str) -> Self {
-        Self::new("user", content)
-    }
-
-    pub fn assistant(content: &str) -> Self {
-        Self::new("assistant", content)
-    }
-
-    pub fn system(content: &str) -> Self {
-        Self::new("system", content)
-    }
-
-    pub fn action(content: &str) -> Self {
-        Self::new("action", content)
-    }
-
-    pub fn output(content: &str) -> Self {
-        Self::new("output", content)
-    }
-
-    pub fn error(content: &str) -> Self {
-        Self::new("error", content)
-    }
+    pub fn user(content: &str) -> Self { Self::new("user", content) }
+    pub fn assistant(content: &str) -> Self { Self::new("assistant", content) }
+    pub fn system(content: &str) -> Self { Self::new("system", content) }
+    pub fn action(content: &str) -> Self { Self::new("action", content) }
+    pub fn output(content: &str) -> Self { Self::new("output", content) }
+    pub fn error(content: &str) -> Self { Self::new("error", content) }
 }
 
 fn chrono_timestamp() -> String {
@@ -76,6 +109,109 @@ fn chrono_timestamp() -> String {
     let hours = (secs / 3600) % 24;
     format!("{:02}:{:02}", hours, mins)
 }
+
+// ── Role styling helpers ─────────────────────────────────────
+
+pub fn style_role(role: &str) -> Style {
+    let t = &*THEME;
+    match role {
+        "user" => t.user,
+        "assistant" => t.assistant,
+        "action" => t.action,
+        "output" => t.output,
+        "error" => t.error,
+        "system" => t.system,
+        _ => Style::default(),
+    }
+}
+
+pub fn role_prefix(role: &str) -> &'static str {
+    match role {
+        "user" => "❯ ",
+        "assistant" => "",
+        "action" => "⚡ ",
+        "output" => "  ",
+        "error" => "✗ ",
+        _ => "",
+    }
+}
+
+pub fn get_role_label(role: &str) -> &str {
+    match role {
+        "user" => "You",
+        "assistant" => "codr",
+        "action" => "Tool",
+        "output" => "Output",
+        "error" => "Error",
+        _ => role,
+    }
+}
+
+// ── Render a single ChatMessage into display Lines ───────────
+
+pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
+    let t = &*THEME;
+    let style = style_role(&msg.role);
+    let prefix = role_prefix(&msg.role);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Role header line (with timestamp for user / assistant)
+    match msg.role.as_str() {
+        "user" => {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, t.prompt),
+                Span::styled("You", t.user),
+                Span::styled(format!("  {}", msg.timestamp), t.dim),
+            ]));
+        }
+        "assistant" => {
+            lines.push(Line::from(vec![
+                Span::styled("codr", t.assistant),
+                Span::styled(format!("  {}", msg.timestamp), t.dim),
+            ]));
+        }
+        "action" => {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, t.action),
+                Span::styled(&msg.content, t.action),
+            ]));
+            return lines; // action is a single-line entry
+        }
+        "output" => {
+            // output: indented, dimmed, no header
+            for line in msg.content.lines() {
+                let display = truncate_to_width(line, width.saturating_sub(4));
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(display, t.output),
+                ]));
+            }
+            return lines;
+        }
+        "error" => {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, t.error),
+                Span::styled("Error", t.error),
+            ]));
+        }
+        _ => {}
+    }
+
+    // Content lines (indented by 2 spaces)
+    for line in msg.content.lines() {
+        let display = truncate_to_width(line, width.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::raw("  ".to_string()),
+            Span::styled(display, style),
+        ]));
+    }
+
+    // Blank line after each message block
+    lines.push(Line::from(""));
+    lines
+}
+
+// ── StatusLine ───────────────────────────────────────────────
 
 pub struct StatusLine {
     pub model: String,
@@ -104,6 +240,8 @@ impl StatusLine {
     }
 }
 
+// ── Markdown Renderer ────────────────────────────────────────
+
 pub struct MarkdownRenderer {
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
@@ -113,18 +251,15 @@ impl MarkdownRenderer {
     pub fn new() -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme = THEME_SET.themes["base16-ocean.dark"].clone();
-
         Self { syntax_set, theme }
     }
 
     pub fn render(&self, text: &str) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-
         for line in text.lines() {
             let processed = self.process_markdown_line(line);
             lines.push(processed);
         }
-
         lines
     }
 
@@ -142,7 +277,7 @@ impl MarkdownRenderer {
             return Line::from(vec![Span::styled(
                 line[3..].to_string(),
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::Rgb(180, 210, 255))
                     .add_modifier(Modifier::BOLD),
             )]);
         }
@@ -150,14 +285,14 @@ impl MarkdownRenderer {
             return Line::from(vec![Span::styled(
                 line[4..].to_string(),
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(Color::Rgb(200, 170, 255))
                     .add_modifier(Modifier::BOLD),
             )]);
         }
 
         if line.starts_with("- ") || line.starts_with("* ") {
             return Line::from(vec![
-                Span::styled("  - ".to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled("  • ".to_string(), Style::default().fg(Color::Rgb(255, 180, 100))),
                 Span::raw(line[2..].to_string()),
             ]);
         }
@@ -292,34 +427,7 @@ impl Default for MarkdownRenderer {
     }
 }
 
-pub fn style_role(role: &str) -> Style {
-    match role {
-        "user" => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        "assistant" => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        "action" => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        "output" => Style::default().fg(Color::Blue),
-        "error" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "system" => Style::default().fg(Color::Gray),
-        _ => Style::default(),
-    }
-}
-
-pub fn get_role_label(role: &str) -> &str {
-    match role {
-        "user" => "You",
-        "assistant" => "codr",
-        "action" => "Action",
-        "output" => "Output",
-        "error" => "Error",
-        _ => role,
-    }
-}
+// ── Text utilities ───────────────────────────────────────────
 
 pub fn visible_width(text: &str) -> usize {
     let stripped = strip_ansi(text);
@@ -362,130 +470,23 @@ pub fn truncate_to_width(text: &str, width: usize) -> String {
     result
 }
 
-pub struct StyledText {
-    spans: Vec<Span<'static>>,
-}
+// ── Keybindings ──────────────────────────────────────────────
 
-impl StyledText {
-    pub fn new() -> Self {
-        Self { spans: Vec::new() }
+pub fn render_hint_line(approval_pending: bool) -> Line<'static> {
+    let t = &*THEME;
+    if approval_pending {
+        Line::from(vec![
+            Span::styled("  a", Style::default().fg(Color::Rgb(120, 220, 120)).add_modifier(Modifier::BOLD)),
+            Span::styled(" approve  ", t.dim),
+            Span::styled("r", Style::default().fg(Color::Rgb(255, 100, 100)).add_modifier(Modifier::BOLD)),
+            Span::styled(" reject", t.dim),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  enter", t.dim),
+            Span::styled(" send  ", t.dim),
+            Span::styled("ctrl+q", t.dim),
+            Span::styled(" quit", t.dim),
+        ])
     }
-
-    pub fn plain(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::raw(text.into()));
-        self
-    }
-
-    pub fn bold(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::styled(
-            text.into(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        self
-    }
-
-    pub fn italic(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::styled(
-            text.into(),
-            Style::default().add_modifier(Modifier::ITALIC),
-        ));
-        self
-    }
-
-    pub fn cyan(mut self, text: impl Into<String>) -> Self {
-        self.spans
-            .push(Span::styled(text.into(), Style::default().fg(Color::Cyan)));
-        self
-    }
-
-    pub fn green(mut self, text: impl Into<String>) -> Self {
-        self.spans
-            .push(Span::styled(text.into(), Style::default().fg(Color::Green)));
-        self
-    }
-
-    pub fn yellow(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::styled(
-            text.into(),
-            Style::default().fg(Color::Yellow),
-        ));
-        self
-    }
-
-    pub fn red(mut self, text: impl Into<String>) -> Self {
-        self.spans
-            .push(Span::styled(text.into(), Style::default().fg(Color::Red)));
-        self
-    }
-
-    pub fn blue(mut self, text: impl Into<String>) -> Self {
-        self.spans
-            .push(Span::styled(text.into(), Style::default().fg(Color::Blue)));
-        self
-    }
-
-    pub fn gray(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::styled(
-            text.into(),
-            Style::default().fg(Color::DarkGray),
-        ));
-        self
-    }
-
-    pub fn dim(mut self, text: impl Into<String>) -> Self {
-        self.spans.push(Span::styled(
-            text.into(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        self
-    }
-
-    pub fn into_line(self) -> Line<'static> {
-        Line::from(self.spans)
-    }
-}
-
-impl Default for StyledText {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct Keybinding {
-    pub key: &'static str,
-    pub description: &'static str,
-}
-
-pub const DEFAULT_KEYBINDINGS: &[Keybinding] = &[
-    Keybinding {
-        key: "Enter",
-        description: "Send message",
-    },
-    Keybinding {
-        key: "Ctrl+Q",
-        description: "Quit",
-    },
-    Keybinding {
-        key: "Ctrl+C",
-        description: "Quit",
-    },
-    Keybinding {
-        key: "a",
-        description: "Approve action (when pending)",
-    },
-    Keybinding {
-        key: "r",
-        description: "Reject action (when pending)",
-    },
-    Keybinding {
-        key: "Arrows",
-        description: "Move cursor",
-    },
-];
-
-pub fn render_keybindings() -> Vec<Line<'static>> {
-    vec![StyledText::new()
-        .gray("Keybindings: ")
-        .dim("Enter: Send | Ctrl+Q: Quit | a: Approve | r: Reject")
-        .into_line()]
 }
