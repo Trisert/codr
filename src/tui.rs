@@ -74,6 +74,13 @@ async fn agent_loop(
             }
         };
 
+        // Check for cancellation after query
+        if cancel_token.is_cancelled() {
+            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".to_string()));
+            let _ = tx.send(AgentUpdate::Done);
+            return;
+        }
+
         // Send usage update if available
         if let Ok(usage) = model.get_usage() {
             let _ = tx.send(AgentUpdate::UsageUpdate {
@@ -100,6 +107,13 @@ async fn agent_loop(
                 continue;
             }
         };
+
+        // Check for cancellation after parsing
+        if cancel_token.is_cancelled() {
+            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".to_string()));
+            let _ = tx.send(AgentUpdate::Done);
+            return;
+        }
 
         let action_display = match &action {
             Action::Bash { command, workdir, timeout_ms, env } => {
