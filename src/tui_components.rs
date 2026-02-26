@@ -385,10 +385,43 @@ impl MarkdownRenderer {
 
     pub fn render(&self, text: &str) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let mut in_code_block = false;
+        
         for line in text.lines() {
-            let processed = self.process_markdown_line(line);
-            lines.push(processed);
+            // Check for fenced code block start/end
+            if line.starts_with("```") {
+                if in_code_block {
+                    // End of code block
+                    in_code_block = false;
+                    lines.push(Line::from(Span::styled(
+                        "└───────────────",
+                        Style::default().fg(Color::Rgb(100, 100, 120)).add_modifier(Modifier::BOLD)
+                    )));
+                    continue;
+                } else {
+                    // Start of code block
+                    in_code_block = true;
+                    let lang = line[3..].trim().to_string();
+                    lines.push(Line::from(Span::styled(
+                        format!("┌─ {} ─", lang),
+                        Style::default().fg(Color::Rgb(100, 100, 120)).add_modifier(Modifier::BOLD)
+                    )));
+                    continue;
+                }
+            }
+            
+            if in_code_block {
+                // Render code block line
+                lines.push(Line::from(vec![
+                    Span::styled("│ ".to_string(), Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled(line.to_string(), Style::default().fg(Color::Rgb(200, 180, 150))),
+                ]));
+            } else {
+                let processed = self.process_markdown_line(line);
+                lines.push(processed);
+            }
         }
+        
         lines
     }
 
