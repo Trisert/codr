@@ -20,7 +20,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -509,20 +508,16 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 
 // ── Main TUI loop ────────────────────────────────────────────
 
-pub async fn run_tui(app: App) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_arc = Arc::new(Mutex::new(app));
-
     let tick_rate = Duration::from_millis(100);
 
     loop {
-        let app = app_arc.lock().unwrap();
-
         terminal.draw(|f| draw_ui(f, &app))?;
 
         if app.should_quit {
@@ -536,141 +531,98 @@ pub async fn run_tui(app: App) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        drop(app);
-
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                // Determine what action to take while holding the lock briefly
-                enum Action {
-                    Approve,
-                    Reject,
-                    Send,
-                    None,
-                }
-
-                let action = {
-                    let mut app = app_arc.lock().unwrap();
-
-                    match key.code {
-                        // ── Approval keys ────────────────────
-                        KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
-                            app.approval_state = ApprovalState::Approved;
-                            Action::Approve
-                        }
-                        KeyCode::Char('r') if matches!(app.approval_state, ApprovalState::Pending) => {
-                            app.approval_state = ApprovalState::Rejected;
-                            Action::Reject
-                        }
-
-                        // ── Scroll ────────────────────────────
-                        KeyCode::PageUp => {
-                            app.scroll_offset = app.scroll_offset.saturating_add(10);
-                            Action::None
-                        }
-                        KeyCode::PageDown => {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                            Action::None
-                        }
-                        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.scroll_offset = app.scroll_offset.saturating_add(3);
-                            Action::None
-                        }
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                            Action::None
-                        }
-
-                        // ── Send (Ctrl+S or Enter) ───────────
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !app.is_processing
-                                && !matches!(app.approval_state, ApprovalState::Pending)
-                                && !app.input.trim().is_empty()
-                            {
-                                Action::Send
-                            } else {
-                                Action::None
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if !app.is_processing
-                                && !matches!(app.approval_state, ApprovalState::Pending)
-                                && !app.input.trim().is_empty()
-                            {
-                                Action::Send
-                            } else {
-                                Action::None
-                            }
-                        }
-
-                        // ── Ctrl+C: stop agent / double = quit ──
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let now = Instant::now();
-                            if app.is_processing {
-                                app.is_processing = false;
-                                app.streaming_content.clear();
-                                app.messages.push(ChatMessage::system("interrupted"));
-                                app.last_ctrl_c = Some(now);
-                                Action::None
-                            } else if let Some(last) = app.last_ctrl_c {
-                                if now.duration_since(last) < Duration::from_secs(2) {
-                                    app.should_quit = true;
-                                    Action::None
-                                } else {
-                                    app.last_ctrl_c = Some(now);
-                                    Action::None
-                                }
-                            } else {
-                                app.last_ctrl_c = Some(now);
-                                Action::None
-                            }
-                        }
-
-                        // ── Text input ────────────────────────
-                        KeyCode::Char(c) => {
-                            if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
-                                let cursor = app.cursor_position;
-                                app.input.insert(cursor, c);
-                                app.cursor_position += 1;
-                            }
-                            Action::None
-                        }
-                        KeyCode::Backspace => {
-                            if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
-                                if app.cursor_position > 0 {
-                                    let cursor = app.cursor_position - 1;
-                                    app.input.remove(cursor);
-                                    app.cursor_position = cursor;
-                                }
-                            }
-                            Action::None
-                        }
-                        KeyCode::Left => {
-                            if app.cursor_position > 0 {
-                                app.cursor_position -= 1;
-                            }
-                            Action::None
-                        }
-                        KeyCode::Right => {
-                            if app.cursor_position < app.input.len() {
-                                app.cursor_position += 1;
-                            }
-                            Action::None
-                        }
-                        _ => Action::None,
-                    }
-                }; // lock is dropped here
-
-                // Perform async actions outside the lock
-                match action {
-                    Action::Approve | Action::Reject => {
-                        let mut app = app_arc.lock().unwrap();
+                match key.code {
+                    // ── Approval keys ────────────────────
+                    KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
+                        app.approval_state = ApprovalState::Approved;
                         app.continue_after_approval().await?;
                     }
-                    Action::Send => {
-                        let mut app = app_arc.lock().unwrap();
-                        app.process_message().await?;
+                    KeyCode::Char('r') if matches!(app.approval_state, ApprovalState::Pending) => {
+                        app.approval_state = ApprovalState::Rejected;
+                        app.continue_after_approval().await?;
                     }
-                    Action::None => {}
+
+                    // ── Scroll ────────────────────────────
+                    KeyCode::PageUp => {
+                        app.scroll_offset = app.scroll_offset.saturating_add(10);
+                    }
+                    KeyCode::PageDown => {
+                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.scroll_offset = app.scroll_offset.saturating_add(3);
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                    }
+
+                    // ── Send (Ctrl+S or Enter) ───────────
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if !app.is_processing
+                            && !matches!(app.approval_state, ApprovalState::Pending)
+                            && !app.input.trim().is_empty()
+                        {
+                            app.process_message().await?;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if !app.is_processing
+                            && !matches!(app.approval_state, ApprovalState::Pending)
+                            && !app.input.trim().is_empty()
+                        {
+                            app.process_message().await?;
+                        }
+                    }
+
+                    // ── Ctrl+C: stop agent / double = quit ──
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let now = Instant::now();
+                        if app.is_processing {
+                            app.is_processing = false;
+                            app.streaming_content.clear();
+                            app.messages.push(ChatMessage::system("interrupted"));
+                            app.last_ctrl_c = Some(now);
+                        } else if let Some(last) = app.last_ctrl_c {
+                            if now.duration_since(last) < Duration::from_secs(2) {
+                                app.should_quit = true;
+                            } else {
+                                app.last_ctrl_c = Some(now);
+                            }
+                        } else {
+                            app.last_ctrl_c = Some(now);
+                        }
+                    }
+
+                    // ── Text input ────────────────────────
+                    KeyCode::Char(c) => {
+                        if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
+                            let cursor = app.cursor_position;
+                            app.input.insert(cursor, c);
+                            app.cursor_position += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
+                            if app.cursor_position > 0 {
+                                let cursor = app.cursor_position - 1;
+                                app.input.remove(cursor);
+                                app.cursor_position = cursor;
+                            }
+                        }
+                    }
+                    KeyCode::Left => {
+                        if app.cursor_position > 0 {
+                            app.cursor_position -= 1;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if app.cursor_position < app.input.len() {
+                            app.cursor_position += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
