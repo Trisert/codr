@@ -331,8 +331,6 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         }
     }
 
-    // Blank line after each message block
-    lines.push(Line::from(""));
     lines
 }
 
