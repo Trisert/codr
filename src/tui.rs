@@ -906,10 +906,10 @@ async fn run_event_loop(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollDown => {
-                        app.scroll_offset = app.scroll_offset.saturating_add(3);
+                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
                     }
                     MouseEventKind::ScrollUp => {
-                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                        app.scroll_offset = app.scroll_offset.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                         app.handle_click(mouse.column, mouse.row);
