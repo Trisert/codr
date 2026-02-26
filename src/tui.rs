@@ -515,40 +515,57 @@ pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Run the event loop; capture result so we always clean up
+    let result = run_event_loop(&mut terminal, &mut app).await;
+
+    // Always restore terminal
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+    let _ = terminal.show_cursor();
+
+    result
+}
+
+async fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
     let tick_rate = Duration::from_millis(100);
 
     loop {
-        terminal.draw(|f| draw_ui(f, &app))?;
+        terminal.draw(|f| draw_ui(f, app))?;
 
         if app.should_quit {
-            disable_raw_mode()?;
-            execute!(
-                terminal.backend_mut(),
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
-            terminal.show_cursor()?;
             break;
         }
 
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                // Only handle Press events (not Release/Repeat which WSL sends)
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 match key.code {
-                    // ── Approval keys ────────────────────
+                    // -- Approval keys --
                     KeyCode::Char('a') if matches!(app.approval_state, ApprovalState::Pending) => {
                         app.approval_state = ApprovalState::Approved;
-                        app.continue_after_approval().await?;
+                        if let Err(e) = app.continue_after_approval().await {
+                            app.is_processing = false;
+                            app.messages.push(ChatMessage::error(&format!("Error: {}", e)));
+                        }
                     }
                     KeyCode::Char('r') if matches!(app.approval_state, ApprovalState::Pending) => {
                         app.approval_state = ApprovalState::Rejected;
-                        app.continue_after_approval().await?;
+                        if let Err(e) = app.continue_after_approval().await {
+                            app.is_processing = false;
+                            app.messages.push(ChatMessage::error(&format!("Error: {}", e)));
+                        }
                     }
 
-                    // ── Scroll ────────────────────────────
+                    // -- Scroll --
                     KeyCode::PageUp => {
                         app.scroll_offset = app.scroll_offset.saturating_add(10);
                     }
@@ -562,13 +579,16 @@ pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                         app.scroll_offset = app.scroll_offset.saturating_sub(3);
                     }
 
-                    // ── Send (Ctrl+S or Enter) ───────────
+                    // -- Send (Ctrl+S or Enter) --
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !app.is_processing
                             && !matches!(app.approval_state, ApprovalState::Pending)
                             && !app.input.trim().is_empty()
                         {
-                            app.process_message().await?;
+                            if let Err(e) = app.process_message().await {
+                                app.is_processing = false;
+                                app.messages.push(ChatMessage::error(&format!("Error: {}", e)));
+                            }
                         }
                     }
                     KeyCode::Enter => {
@@ -576,11 +596,14 @@ pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             && !matches!(app.approval_state, ApprovalState::Pending)
                             && !app.input.trim().is_empty()
                         {
-                            app.process_message().await?;
+                            if let Err(e) = app.process_message().await {
+                                app.is_processing = false;
+                                app.messages.push(ChatMessage::error(&format!("Error: {}", e)));
+                            }
                         }
                     }
 
-                    // ── Ctrl+C: stop agent / double = quit ──
+                    // -- Ctrl+C: stop agent / double = quit --
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let now = Instant::now();
                         if app.is_processing {
@@ -599,7 +622,7 @@ pub async fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // ── Text input ────────────────────────
+                    // -- Text input --
                     KeyCode::Char(c) => {
                         if !app.is_processing && !matches!(app.approval_state, ApprovalState::Pending) {
                             let cursor = app.cursor_position;
