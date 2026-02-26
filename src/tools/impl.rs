@@ -435,30 +435,97 @@ impl Tool for FindTool {
         let path = params.get_str("path")?.unwrap_or_else(|| ".".to_string());
 
         let search_path = ctx.resolve_path(&path);
-        let full_pattern = search_path.join(&pattern).to_string_lossy().to_string();
 
-        let mut matches = Vec::new();
+        // Try fd first (preferred), then find with gitignore, then glob fallback
+        let result = try_fd(&search_path, &pattern)
+            .or_else(|| try_find(&search_path, &pattern))
+            .or_else(|| try_glob(&search_path, &pattern, ctx));
 
-        for entry in glob::glob(&full_pattern)? {
-            match entry {
-                Ok(path) if path.is_file() => {
-                    if let Ok(rel_path) = path.strip_prefix(&ctx.cwd) {
-                        matches.push(rel_path.to_string_lossy().to_string());
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Glob error: {:?}", e);
-                }
-                _ => {}
+        match result {
+            Some(matches) if !matches.is_empty() => {
+                let mut sorted = matches;
+                sorted.sort();
+                Ok(ToolOutput::text(sorted.join("\n")))
             }
+            _ => Ok(ToolOutput::text("No files found".to_string())),
         }
+    }
+}
 
-        Ok(ToolOutput::text(if matches.is_empty() {
-            "No files found".to_string()
-        } else {
-            matches.sort();
-            matches.join("\n")
-        }))
+fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
+    let output = Command::new("fd")
+        .args(["--type", "f", "--", pattern])
+        .current_dir(search_path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<String> = stdout.lines().map(|s| s.to_string()).collect();
+        if !files.is_empty() {
+            return Some(files);
+        }
+    }
+    None
+}
+
+fn try_find(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
+    // Convert glob pattern to find-compatible pattern
+    let find_pattern = pattern
+        .replace("**/", "")
+        .replace("**", "*")
+        .replace("?", "[^/]");
+
+    let output = Command::new("find")
+        .args([
+            ".",
+            "-type", "f",
+            "-path", "*/.*",
+            "-prune",
+            "-o",
+            "-name", &find_pattern,
+            "-print"
+        ])
+        .current_dir(search_path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<String> = stdout
+            .lines()
+            .filter(|s| !s.starts_with("./"))
+            .map(|s| s.trim_start_matches("./").to_string())
+            .collect();
+        if !files.is_empty() {
+            return Some(files);
+        }
+    }
+    None
+}
+
+fn try_glob(search_path: &Path, pattern: &str, ctx: &ToolContext) -> Option<Vec<String>> {
+    let full_pattern = search_path.join(pattern).to_string_lossy().to_string();
+    let mut matches = Vec::new();
+
+    for entry in glob::glob(&full_pattern).ok()? {
+        match entry {
+            Ok(path) if path.is_file() => {
+                if let Ok(rel_path) = path.strip_prefix(&ctx.cwd) {
+                    matches.push(rel_path.to_string_lossy().to_string());
+                }
+            }
+            Err(e) => {
+                eprintln!("Glob error: {:?}", e);
+            }
+            _ => {}
+        }
+    }
+
+    if matches.is_empty() {
+        None
+    } else {
+        Some(matches)
     }
 }
 
