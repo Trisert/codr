@@ -239,11 +239,9 @@ impl Tool for EditTool {
         let content = fs::read_to_string(&path)?;
 
         if !content.contains(&old_text) {
-            return Ok(ToolOutput::text(format!(
-                "Edit failed: old_text not found in file.\n\
+            return Ok(ToolOutput::text("Edit failed: old_text not found in file.\n\
                 The specified text does not exist in the file. \
-                Use the read tool to check the current file contents."
-            )));
+                Use the read tool to check the current file contents.".to_string()));
         }
 
         let new_content = content.replace(&old_text, &new_text);
@@ -302,11 +300,10 @@ impl Tool for WriteTool {
         let path = ctx.resolve_path(&file_path);
 
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
-        }
 
         fs::write(&path, &content)?;
 

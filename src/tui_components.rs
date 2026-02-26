@@ -80,6 +80,7 @@ pub struct PendingAction {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    pub thinking: Option<String>,
     pub timestamp: String,
 }
 
@@ -88,16 +89,89 @@ impl ChatMessage {
         Self {
             role: role.to_string(),
             content: content.to_string(),
+            thinking: None,
             timestamp: chrono_timestamp(),
         }
     }
 
     pub fn user(content: &str) -> Self { Self::new("user", content) }
+    #[allow(dead_code)]
     pub fn assistant(content: &str) -> Self { Self::new("assistant", content) }
+
+    pub fn assistant_with_thinking(content: &str) -> Self {
+        let (clean_content, thinking) = extract_thinking(content);
+        Self {
+            role: "assistant".to_string(),
+            content: clean_content,
+            thinking,
+            timestamp: chrono_timestamp(),
+        }
+    }
+
     pub fn system(content: &str) -> Self { Self::new("system", content) }
     pub fn action(content: &str) -> Self { Self::new("action", content) }
     pub fn output(content: &str) -> Self { Self::new("output", content) }
     pub fn error(content: &str) -> Self { Self::new("error", content) }
+}
+
+// ── Thinking Extraction ───────────────────────────────────────
+
+fn extract_thinking(content: &str) -> (String, Option<String>) {
+    // Support multiple thinking tag formats:
+    // - Claude: <thinking>...</thinking>
+    // - Qwen and others:
+    let thinking_patterns = [
+        ("<thinking>", "</thinking>"),
+        ("
+", ""),
+    ];
+
+    let mut clean_content = content.to_string();
+    let mut thinking_content = None;
+
+    // Extract thinking
+    for (start_tag, end_tag) in thinking_patterns {
+        if let Some(start) = clean_content.find(start_tag)
+            && let Some(end) = clean_content.find(end_tag) {
+                thinking_content = Some(clean_content[start + start_tag.len()..end].to_string());
+                let before = clean_content[..start].to_string();
+                let after = clean_content[end + end_tag.len()..].to_string();
+                clean_content = format!("{}{}", before, after);
+                break;
+            }
+    }
+
+    // Remove tool-action blocks (```tool-action ... ```)
+    clean_content = remove_code_blocks(&clean_content, "tool-action");
+
+    // Remove bash-action blocks (```bash-action ... ```)
+    clean_content = remove_code_blocks(&clean_content, "bash-action");
+
+    (clean_content.trim().to_string(), thinking_content)
+}
+
+fn remove_code_blocks(content: &str, block_type: &str) -> String {
+    let start_pattern = format!("```{}", block_type);
+    let mut result = String::new();
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find(&start_pattern) {
+        // Keep everything before the block
+        result.push_str(&remaining[..start]);
+
+        // Find the end of the block
+        let block_content = &remaining[start + start_pattern.len()..];
+        if let Some(end) = block_content.find("```") {
+            remaining = &block_content[end + 3..];
+        } else {
+            // No end found, skip the rest
+            remaining = "";
+            break;
+        }
+    }
+
+    result.push_str(remaining);
+    result.trim().to_string()
 }
 
 fn chrono_timestamp() -> String {
@@ -130,7 +204,7 @@ pub fn role_prefix(role: &str) -> &'static str {
     match role {
         "user" => "> ",
         "assistant" => "",
-        "action" => "$ ",
+        "action" => "",
         "output" => "  ",
         "error" => "! ",
         _ => "",
@@ -169,8 +243,50 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         "assistant" => {
             lines.push(Line::from(vec![
                 Span::styled("codr".to_string(), t.assistant),
-                Span::styled(format!("  {}", msg.timestamp), t.dim),
+                Span::styled(format!(" {}", msg.timestamp), t.dim),
             ]));
+            lines.push(Line::from("")); // newline after codr header
+
+            // Thinking content (if present) - displayed in italic
+            if let Some(ref thinking) = msg.thinking {
+                lines.push(Line::from("")); // newline before thinking
+
+                let italic_style = Style::default().add_modifier(Modifier::ITALIC);
+                let thinking_label = Style::default()
+                    .fg(Color::Rgb(150, 150, 170))
+                    .add_modifier(Modifier::ITALIC);
+
+                let mut thinking_lines = thinking.lines().collect::<Vec<_>>();
+                if !thinking_lines.is_empty() {
+                    let first_line = thinking_lines.remove(0);
+                    let wrapped = wrap_to_width(first_line, width.saturating_sub(14));
+                    for (i, wrapped_line) in wrapped.into_iter().enumerate() {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled("Thinking: ", thinking_label),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw("    ".to_string()),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        }
+                    }
+
+                    for line in thinking_lines {
+                        let wrapped = wrap_to_width(line, width.saturating_sub(4));
+                        for wrapped_line in wrapped {
+                            lines.push(Line::from(vec![
+                                Span::raw("    ".to_string()),
+                                Span::styled(wrapped_line, italic_style),
+                            ]));
+                        }
+                    }
+                }
+                lines.push(Line::from("")); // newline after thinking
+            }
         }
         "action" => {
             lines.push(Line::from(vec![
@@ -182,12 +298,15 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         "output" => {
             // output: indented, dimmed, no header
             for line in msg.content.lines() {
-                let display = truncate_to_width(line, width.saturating_sub(4));
-                lines.push(Line::from(vec![
-                    Span::styled("    ".to_string(), Style::default()),
-                    Span::styled(display, t.output),
-                ]));
+                let wrapped = wrap_to_width(line, width.saturating_sub(4));
+                for wrapped_line in wrapped {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ".to_string(), Style::default()),
+                        Span::styled(wrapped_line, t.output),
+                    ]));
+                }
             }
+            lines.push(Line::from("")); // newline after output
             return lines;
         }
         "error" => {
@@ -199,13 +318,16 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
         _ => {}
     }
 
-    // Content lines (indented by 2 spaces)
+    // Content lines with bullet
     for line in msg.content.lines() {
-        let display = truncate_to_width(line, width.saturating_sub(2));
-        lines.push(Line::from(vec![
-            Span::raw("  ".to_string()),
-            Span::styled(display, style),
-        ]));
+        let wrapped = wrap_to_width(line, width.saturating_sub(2));
+        for (i, wrapped_line) in wrapped.into_iter().enumerate() {
+            let prefix = if i == 0 { "  ◎ " } else { "    " };
+            lines.push(Line::from(vec![
+                Span::raw(prefix.to_string()),
+                Span::styled(wrapped_line, style),
+            ]));
+        }
     }
 
     // Blank line after each message block
@@ -270,26 +392,26 @@ impl MarkdownRenderer {
     }
 
     fn process_markdown_line(&self, line: &str) -> Line<'static> {
-        if line.starts_with("# ") {
+        if let Some(stripped) = line.strip_prefix("# ") {
             return Line::from(vec![Span::styled(
-                line[2..].to_string(),
+                stripped.to_string(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
                     .add_modifier(Modifier::UNDERLINED),
             )]);
         }
-        if line.starts_with("## ") {
+        if let Some(stripped) = line.strip_prefix("## ") {
             return Line::from(vec![Span::styled(
-                line[3..].to_string(),
+                stripped.to_string(),
                 Style::default()
                     .fg(Color::Rgb(180, 210, 255))
                     .add_modifier(Modifier::BOLD),
             )]);
         }
-        if line.starts_with("### ") {
+        if let Some(stripped) = line.strip_prefix("### ") {
             return Line::from(vec![Span::styled(
-                line[4..].to_string(),
+                stripped.to_string(),
                 Style::default()
                     .fg(Color::Rgb(200, 170, 255))
                     .add_modifier(Modifier::BOLD),
@@ -460,22 +582,39 @@ pub fn strip_ansi(text: &str) -> String {
     result
 }
 
-pub fn truncate_to_width(text: &str, width: usize) -> String {
-    let mut result = String::new();
+pub fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+    
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
     let mut current_width = 0;
 
-    for c in text.chars() {
-        let char_width = c.width().unwrap_or(0);
-        if current_width + char_width > width {
-            if current_width + 3 <= width {
-                result.push_str("...");
-            }
-            break;
+    for word in text.split_whitespace() {
+        let word_width: usize = word.chars().map(|c| c.width().unwrap_or(0)).sum();
+        
+        if current_width + word_width + (if current_width > 0 { 1 } else { 0 }) > width
+            && !current_line.is_empty()
+        {
+            lines.push(current_line.clone());
+            current_line.clear();
+            current_width = 0;
         }
-        result.push(c);
-        current_width += char_width;
+        
+        if current_width > 0 {
+            current_line.push(' ');
+            current_width += 1;
+        }
+        current_line.push_str(word);
+        current_width += word_width;
     }
-    result
+    
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    
+    lines
 }
 
 // ── Keybindings ──────────────────────────────────────────────
@@ -484,19 +623,17 @@ pub fn render_hint_line(approval_pending: bool) -> Line<'static> {
     let t = &*THEME;
     if approval_pending {
         Line::from(vec![
-            Span::styled("  a", Style::default().fg(Color::Rgb(120, 220, 120)).add_modifier(Modifier::BOLD)),
-            Span::styled(" approve  ", t.dim),
+            Span::styled("a", Style::default().fg(Color::Rgb(120, 220, 120)).add_modifier(Modifier::BOLD)),
+            Span::styled(" approve ", t.dim),
             Span::styled("r", Style::default().fg(Color::Rgb(255, 100, 100)).add_modifier(Modifier::BOLD)),
             Span::styled(" reject", t.dim),
         ])
     } else {
         Line::from(vec![
-            Span::styled("  enter", t.dim),
-            Span::styled(" send  ", t.dim),
+            Span::styled("enter", t.dim),
+            Span::styled(" send ", t.dim),
             Span::styled("ctrl+c", t.dim),
-            Span::styled(" stop  ", t.dim),
-            Span::styled("ctrl+c x2", t.dim),
-            Span::styled(" quit", t.dim),
+            Span::styled(" quit ", t.dim),
         ])
     }
 }

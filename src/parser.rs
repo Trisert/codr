@@ -8,8 +8,17 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Bash(String),
-    Tool { name: String, params: Value },
+    Response(String),
+    Bash {
+        command: String,
+        workdir: Option<String>,
+        timeout_ms: Option<u64>,
+        env: Option<Value>,
+    },
+    Tool {
+        name: String,
+        params: Value,
+    },
 }
 
 // ============================================================
@@ -42,14 +51,45 @@ fn parse_tool_action(content: &str) -> Option<Action> {
     }
 }
 
-/// Parse bash-action format: ```bash-action\ncommand\n```
+/// Parse bash-action format:
+/// Simple: ```bash-action\n<command>\n```
+/// JSON: ```bash-action\n{"command": "...", "workdir": "...", "timeout": 30000, "env": {...}}\n```
 fn parse_bash_action(content: &str) -> Action {
-    Action::Bash(content.trim().to_string())
+    let mut trimmed = content.trim();
+
+    // Strip <command></command> tokens if present
+    if let Some(start) = trimmed.find("<command>")
+        && let Some(end) = trimmed.find("</command>") {
+            trimmed = trimmed[start + 9..end].trim();
+        }
+
+    // Try to parse as JSON first
+    if let Ok(params) = serde_json::from_str::<Value>(trimmed)
+        && params.get("command").is_some() {
+            return Action::Bash {
+                command: params["command"].as_str().unwrap_or("").to_string(),
+                workdir: params
+                    .get("workdir")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                timeout_ms: params.get("timeout").and_then(|v| v.as_u64()),
+                env: params.get("env").cloned(),
+            };
+        }
+
+    // Fall back to simple string format (backward compatibility)
+    Action::Bash {
+        command: trimmed.to_string(),
+        workdir: None,
+        timeout_ms: None,
+        env: None,
+    }
 }
 
 pub fn parse_action(lm_output: &str) -> Result<Action, AgentError> {
+    // Use (?s) dotall flag so . matches newlines
     // Try tool-action first
-    let tool_re = Regex::new(r"```tool-action\s*\n(.*?)\n```").unwrap();
+    let tool_re = Regex::new(r"(?s)```tool-action\s*\n(.*?)\n```").unwrap();
     if let Some(cap) = tool_re.captures(lm_output) {
         let content = cap.get(1).unwrap().as_str();
         if let Some(action) = parse_tool_action(content) {
@@ -58,23 +98,37 @@ pub fn parse_action(lm_output: &str) -> Result<Action, AgentError> {
     }
 
     // Fall back to bash-action
-    let bash_re = Regex::new(r"```bash-action\s*\n(.*?)\n```").unwrap();
+    let bash_re = Regex::new(r"(?s)```bash-action\s*\n(.*?)\n```").unwrap();
     if let Some(cap) = bash_re.captures(lm_output) {
         let content = cap.get(1).unwrap().as_str();
         return Ok(parse_bash_action(content));
     }
 
-    Err(AgentError::FormatError(
-        "No action found. Please use one of these formats:\n\
-        ```tool-action\n<tool_name>\n<json_params>\n```\n\
-        ```bash-action\n<command>\n```".to_string()
-    ))
+    // Also try generic fenced blocks with tool-action/bash-action as first line
+    // (some models wrap differently)
+    let generic_re = Regex::new(r"(?s)```\s*\n\s*tool-action\s*\n(.*?)\n```").unwrap();
+    if let Some(cap) = generic_re.captures(lm_output) {
+        let content = cap.get(1).unwrap().as_str();
+        if let Some(action) = parse_tool_action(content) {
+            return Ok(action);
+        }
+    }
+
+    let generic_bash_re = Regex::new(r"(?s)```\s*\n\s*bash-action\s*\n(.*?)\n```").unwrap();
+    if let Some(cap) = generic_bash_re.captures(lm_output) {
+        let content = cap.get(1).unwrap().as_str();
+        return Ok(parse_bash_action(content));
+    }
+
+    // No tool or bash action found - treat as plain text response
+    Ok(Action::Response(lm_output.to_string()))
 }
 
 // ============================================================
 // Format Error Messages
 // ============================================================
 
+#[allow(dead_code)]
 pub fn format_available_tools(tools: &str) -> String {
     format!(
         "Available tools:\n{}\n\

@@ -117,11 +117,10 @@ pub fn is_ignored(cwd: &Path, path: &Path) -> bool {
 
     // Check if the path would be ignored
     for entry in walker {
-        if let Ok(entry) = entry {
-            if entry.path() == path {
+        if let Ok(entry) = entry
+            && entry.path() == path {
                 return true;
             }
-        }
     }
     false
 }

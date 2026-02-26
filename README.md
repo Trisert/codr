@@ -98,6 +98,11 @@ Execute bash command:
 ```bash-action
 cargo test
 ```
+
+Execute bash with workdir, timeout, and env vars:
+```bash-action
+{"command": "npm run build", "workdir": "/project", "timeout": 60000, "env": {"DEBUG": "true"}}
+```
 ```
 
 ## Configuration

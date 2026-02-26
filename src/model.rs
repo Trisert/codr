@@ -16,12 +16,14 @@ pub enum ModelType {
     Nim { base_url: String, model: String, api_key: String },
 }
 
+#[derive(Clone)]
 pub struct Model {
     client: Client,
     config: ModelConfig,
     usage: Arc<Mutex<Usage>>,
 }
 
+#[derive(Clone)]
 struct ModelConfig {
     model_type: ModelType,
 }
@@ -48,6 +50,13 @@ struct AnthropicRequest {
     max_tokens: u32,
     messages: Vec<AnthropicMessage>,
     system: Option<String>,
+    thinking: AnthropicThinking,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -69,8 +78,12 @@ struct AnthropicUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentBlock {
-    text: String,
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, #[allow(dead_code)] id: String },
 }
 
 // ============================================================
@@ -111,6 +124,11 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct OpenAIMessageResponse {
     content: String,
+    // Support for thinking/reasoning content from various APIs
+    // DeepSeek: reasoning_content
+    // Qwen/Ollama: thinking_content or thinking
+    #[serde(alias = "reasoning_content", alias = "thinking_content", alias = "thinking")]
+    reasoning: Option<String>,
 }
 
 // ============================================================
@@ -203,6 +221,9 @@ impl Model {
             max_tokens: 4096,
             messages: anthropic_messages,
             system: system_prompt,
+            thinking: AnthropicThinking {
+                thinking_type: "enabled".to_string(),
+            },
         };
 
         let response = self
@@ -235,9 +256,15 @@ impl Model {
         
         Ok(anthropic_response
             .content
-            .first()
-            .map(|c| c.text.clone())
-            .unwrap_or_default())
+            .iter()
+            .map(|c| match c {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::Thinking { thinking, .. } => {
+                    format!("<thinking>{}</thinking>", thinking)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     // ============================================================
@@ -293,10 +320,17 @@ impl Model {
             usage.cost_in_currency = Some(usage_data.total_tokens as f64 * 0.000001);
         }
 
-        Ok(openai_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default())
+        // Combine reasoning + content if reasoning is present
+        if let Some(choice) = openai_response.choices.first() {
+            let message = &choice.message;
+            if let Some(ref reasoning) = message.reasoning {
+                // Wrap reasoning in <thinking> tags for consistent extraction
+                Ok(format!("<thinking>{}</thinking>\n\n{}", reasoning, message.content))
+            } else {
+                Ok(message.content.clone())
+            }
+        } else {
+            Ok(String::new())
+        }
     }
 }

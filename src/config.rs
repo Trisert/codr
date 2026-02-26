@@ -9,17 +9,14 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum ModelTypeConfig {
+    #[default]
     Llama,
     Anthropic,
     Nim,
 }
 
-impl Default for ModelTypeConfig {
-    fn default() -> Self {
-        ModelTypeConfig::Llama
-    }
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -39,15 +36,11 @@ impl Default for LlamaConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 struct AnthropicConfig {
     api_key: Option<String>,
 }
 
-impl Default for AnthropicConfig {
-    fn default() -> Self {
-        Self { api_key: None }
-    }
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -69,6 +62,7 @@ impl Default for NimConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     model: ModelTypeConfig,
     llama: LlamaConfig,
@@ -76,16 +70,6 @@ pub struct Config {
     nim: NimConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            model: ModelTypeConfig::default(),
-            llama: LlamaConfig::default(),
-            anthropic: AnthropicConfig::default(),
-            nim: NimConfig::default(),
-        }
-    }
-}
 
 impl Config {
     /// Get the config file path
