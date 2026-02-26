@@ -461,7 +461,11 @@ fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let files: Vec<String> = stdout.lines().map(|s| s.to_string()).collect();
+        let files: Vec<String> = stdout
+            .lines()
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(|s| s.to_string())
+            .collect();
         if !files.is_empty() {
             return Some(files);
         }
@@ -473,18 +477,14 @@ fn try_find(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
     // Convert glob pattern to find-compatible pattern
     let find_pattern = pattern
         .replace("**/", "")
-        .replace("**", "*")
-        .replace("?", "[^/]");
+        .replace("**", "*");
 
     let output = Command::new("find")
         .args([
             ".",
             "-type", "f",
-            "-path", "*/.*",
-            "-prune",
-            "-o",
+            "!", "-path", "*/.*",
             "-name", &find_pattern,
-            "-print"
         ])
         .current_dir(search_path)
         .output()
