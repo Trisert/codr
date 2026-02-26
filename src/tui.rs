@@ -567,7 +567,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
-    let t = &*THEME;
+    let _t = &*THEME;
     let width = area.width.saturating_sub(2) as usize; // account for borders
 
     // Store conversation area for click handling
@@ -576,21 +576,6 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
     // Render all messages into lines
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let mut rendered_text: Vec<String> = Vec::new(); // Store raw text for copying
-
-    // Welcome message if no messages yet
-    if app.messages.is_empty() {
-        all_lines.push(Line::from(""));
-        let welcome_text = "Welcome to codr. Type a message to get started.";
-        rendered_text.push(String::new());
-        all_lines.push(Line::from(vec![
-            Span::styled("  Welcome to ", t.dim),
-            Span::styled("codr", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(". Type a message to get started.", t.dim),
-        ]));
-        rendered_text.push(welcome_text.to_string());
-        all_lines.push(Line::from(""));
-        rendered_text.push(String::new());
-    }
 
     for msg in &app.messages {
         let rendered = render_message(msg, width);
