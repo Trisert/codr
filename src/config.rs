@@ -12,24 +12,25 @@ use std::path::PathBuf;
 #[derive(Default)]
 enum ModelTypeConfig {
     #[default]
-    Llama,
+    OpenAI,
     Anthropic,
     Nim,
 }
 
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
-struct LlamaConfig {
-    server_url: String,
+struct OpenAIConfig {
+    base_url: String,
     model: String,
+    api_key: Option<String>,
 }
 
-impl Default for LlamaConfig {
+impl Default for OpenAIConfig {
     fn default() -> Self {
         Self {
-            server_url: "http://localhost:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
             model: "default".to_string(),
+            api_key: None,
         }
     }
 }
@@ -40,7 +41,6 @@ impl Default for LlamaConfig {
 struct AnthropicConfig {
     api_key: Option<String>,
 }
-
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -65,11 +65,10 @@ impl Default for NimConfig {
 #[derive(Default)]
 pub struct Config {
     model: ModelTypeConfig,
-    llama: LlamaConfig,
+    openai: OpenAIConfig,
     anthropic: AnthropicConfig,
     nim: NimConfig,
 }
-
 
 impl Config {
     /// Get the config file path
@@ -98,15 +97,13 @@ impl Config {
     pub fn load() -> Self {
         if let Some(path) = Self::config_path() {
             match fs::read_to_string(&path) {
-                Ok(content) => {
-                    match toml::from_str(&content) {
-                        Ok(config) => return config,
-                        Err(e) => {
-                            eprintln!("Warning: Failed to parse config file {:?}: {}", path, e);
-                            eprintln!("Using default configuration.");
-                        }
+                Ok(content) => match toml::from_str(&content) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse config file {:?}: {}", path, e);
+                        eprintln!("Using default configuration.");
                     }
-                }
+                },
                 Err(e) => {
                     eprintln!("Warning: Failed to read config file {:?}: {}", path, e);
                     eprintln!("Using default configuration.");
@@ -120,12 +117,17 @@ impl Config {
     /// Convert to ModelType
     pub fn to_model_type(&self) -> ModelType {
         match &self.model {
-            ModelTypeConfig::Llama => ModelType::LlamaServer {
-                base_url: self.llama.server_url.clone(),
-                model: self.llama.model.clone(),
-            },
+            ModelTypeConfig::OpenAI => {
+                ModelType::OpenAI {
+                    base_url: self.openai.base_url.clone(),
+                    model: self.openai.model.clone(),
+                    api_key: self.openai.api_key.clone(),
+                }
+            }
             ModelTypeConfig::Anthropic => {
-                let api_key = self.anthropic.api_key
+                let api_key = self
+                    .anthropic
+                    .api_key
                     .clone()
                     .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
 
@@ -136,7 +138,9 @@ impl Config {
                 ModelType::Anthropic
             }
             ModelTypeConfig::Nim => {
-                let api_key = self.nim.api_key
+                let api_key = self
+                    .nim
+                    .api_key
                     .clone()
                     .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
                     .unwrap_or_default();

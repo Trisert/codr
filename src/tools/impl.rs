@@ -1,9 +1,11 @@
-use super::{Tool, ToolContext, ToolOutput, ToolError};
-use super::schema::ToolSchema;
+use super::context::{
+    build_walker, find_project_root, is_binary_file, is_image_file, truncate_file,
+};
 use super::schema::ExtractParams;
-use super::context::{truncate_file, build_walker, find_project_root, is_binary_file, is_image_file};
-use std::path::Path;
+use super::schema::ToolSchema;
+use super::{Tool, ToolContext, ToolError, ToolOutput};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 // ============================================================
@@ -44,11 +46,17 @@ impl Tool for ReadTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = params.get_required_str("file_path")?;
-        let offset = params.get_str("offset")?
+        let offset = params
+            .get_str("offset")?
             .and_then(|s| s.parse::<usize>().ok());
-        let limit = params.get_str("limit")?
+        let limit = params
+            .get_str("limit")?
             .and_then(|s| s.parse::<usize>().ok());
 
         let path = ctx.resolve_path(&file_path);
@@ -63,14 +71,9 @@ impl Tool for ReadTool {
             let data_len = data.len();
             return Ok(ToolOutput::text(format!(
                 "[Image file: {} - {} bytes]",
-                file_path,
-                data_len
+                file_path, data_len
             ))
-            .with_attachment(
-                file_path.clone(),
-                mime_type(&path),
-                data,
-            )
+            .with_attachment(file_path.clone(), mime_type(&path), data)
             .with_metadata(super::OutputMetadata {
                 file_path: Some(file_path),
                 byte_count: Some(data_len),
@@ -96,22 +99,20 @@ impl Tool for ReadTool {
             Some(max_lines),
         )?;
 
-        let mut output = ToolOutput::text(result.content)
-            .with_metadata(super::OutputMetadata {
-                file_path: Some(file_path.clone()),
-                line_count: Some(result.line_count),
-                byte_count: Some(result.byte_count),
-                truncated: result.truncated,
-            });
+        // Create display summary for TUI (minimal, clean)
+        let display_summary = format!("Reading {}", file_path);
 
-        if result.truncated {
-            output.content = format!(
-                "{}\n\n[File truncated: showing {} of {} lines]",
-                output.content,
-                output.content.lines().count(),
-                result.line_count
-            );
-        }
+        // Full content goes to LLM, but we mark it with metadata for clean TUI display
+        let mut output = ToolOutput::text(result.content).with_metadata(super::OutputMetadata {
+            file_path: Some(file_path.clone()),
+            line_count: Some(result.line_count),
+            byte_count: Some(result.byte_count),
+            truncated: result.truncated,
+            display_summary: Some(display_summary.clone()),
+        });
+
+        // For display purposes, override content with just the summary
+        output.content_for_display = Some(display_summary);
 
         Ok(output)
     }
@@ -130,7 +131,11 @@ impl BashTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
             .string("command", "Shell command to execute", true)
-            .string("cwd", "Working directory for the command (defaults to project root)", false);
+            .string(
+                "cwd",
+                "Working directory for the command (defaults to project root)",
+                false,
+            );
 
         Self { schema }
     }
@@ -154,8 +159,36 @@ impl Tool for BashTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let command = params.get_required_str("command")?;
+
+        // Validate command - reject obviously malformed commands
+        let trimmed = command.trim();
+
+        // Check for template syntax that shouldn't be executed
+        if trimmed.contains("{pattern}")
+            || trimmed.contains("{file}")
+            || trimmed.contains("{path}")
+            || trimmed.contains("{::")
+        {
+            return Ok(ToolOutput::text(format!(
+                "Invalid command: contains template placeholders. The command looks like:\n{}",
+                trimmed
+            )));
+        }
+
+        // Check for incomplete brace expansion
+        if trimmed.contains('{') && !trimmed.contains('}') {
+            return Ok(ToolOutput::text(format!(
+                "Invalid command: contains unmatched braces. The command looks like:\n{}",
+                trimmed
+            )));
+        }
+
         let cwd_str = params.get_str("cwd")?;
         let cwd = cwd_str
             .map(|p| ctx.resolve_path(&p))
@@ -183,6 +216,7 @@ impl Tool for BashTool {
             line_count: Some(line_count),
             byte_count: Some(byte_count),
             truncated: false,
+            display_summary: None,
         }))
     }
 }
@@ -225,7 +259,11 @@ impl Tool for EditTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = params.get_required_str("file_path")?;
         let old_text = params.get_required_str("old_text")?;
         let new_text = params.get_required_str("new_text")?;
@@ -239,18 +277,23 @@ impl Tool for EditTool {
         let content = fs::read_to_string(&path)?;
 
         if !content.contains(&old_text) {
-            return Ok(ToolOutput::text("Edit failed: old_text not found in file.\n\
+            return Ok(ToolOutput::text(
+                "Edit failed: old_text not found in file.\n\
                 The specified text does not exist in the file. \
-                Use the read tool to check the current file contents.".to_string()));
+                Use the read tool to check the current file contents."
+                    .to_string(),
+            ));
         }
 
         let new_content = content.replace(&old_text, &new_text);
         fs::write(&path, new_content)?;
 
+        let summary = format!("Edited {}", file_path);
         Ok(ToolOutput::text(format!(
             "Successfully edited {}",
             file_path
-        )))
+        ))
+        .with_summary_display(summary))
     }
 }
 
@@ -292,7 +335,11 @@ impl Tool for WriteTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = params.get_required_str("file_path")?;
         let content = params.get_required_str("content")?;
         let content_len = content.len();
@@ -301,17 +348,19 @@ impl Tool for WriteTool {
 
         // Create parent directories if needed
         if let Some(parent) = path.parent()
-            && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
 
         fs::write(&path, &content)?;
 
+        let summary = format!("Wrote {} ({} bytes)", file_path, content_len);
         Ok(ToolOutput::text(format!(
             "Successfully wrote {} ({} bytes)",
-            file_path,
-            content_len
-        )))
+            file_path, content_len
+        ))
+        .with_summary_display(summary))
     }
 }
 
@@ -328,7 +377,11 @@ impl GrepTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
             .string("pattern", "Regular expression pattern to search for", true)
-            .string("path", "Path to search (defaults to current directory)", false)
+            .string(
+                "path",
+                "Path to search (defaults to current directory)",
+                false,
+            )
             .boolean("case_insensitive", "Perform case-insensitive search", false);
 
         Self { schema }
@@ -353,13 +406,28 @@ impl Tool for GrepTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = params.get_required_str("pattern")?;
+
+        // Validate pattern - reject template syntax
+        if pattern.contains('{') || pattern.contains('}') || pattern.contains("$(") {
+            return Ok(ToolOutput::text(format!(
+                "Invalid pattern '{}': contains shell syntax or template placeholders",
+                pattern
+            )));
+        }
+
         let path = params.get_str("path")?.unwrap_or_else(|| ".".to_string());
         let case_insensitive = params.get_bool("case_insensitive")?.unwrap_or(false);
 
         let regex = if case_insensitive {
-            regex::RegexBuilder::new(&pattern).case_insensitive(true).build()?
+            regex::RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()?
         } else {
             regex::Regex::new(&pattern)?
         };
@@ -389,6 +457,14 @@ impl Tool for GrepTool {
             "No matches found".to_string()
         } else {
             matches.join("\n")
+        })
+        .with_metadata(super::OutputMetadata {
+            display_summary: Some(format!(
+                "Search found {} matches for '{}'",
+                matches.len(),
+                pattern
+            )),
+            ..Default::default()
         }))
     }
 }
@@ -405,8 +481,16 @@ pub struct FindTool {
 impl FindTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
-            .string("pattern", "Glob pattern to match files (e.g., '*.rs', 'src/**/*.ts')", true)
-            .string("path", "Path to search (defaults to current directory)", false);
+            .string(
+                "pattern",
+                "Glob pattern to match files (e.g., '*.rs', 'src/**/*.ts')",
+                true,
+            )
+            .string(
+                "path",
+                "Path to search (defaults to current directory)",
+                false,
+            );
 
         Self { schema }
     }
@@ -430,8 +514,29 @@ impl Tool for FindTool {
         &self.schema
     }
 
-    fn execute(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = params.get_required_str("pattern")?;
+
+        // Validate pattern - reject template syntax or obviously malformed patterns
+        if pattern.contains('{') || pattern.contains('}') || pattern.contains("$(") {
+            return Ok(ToolOutput::text(format!(
+                "Invalid pattern '{}': contains shell syntax or template placeholders",
+                pattern
+            )));
+        }
+
+        // Also reject patterns that look like JSON or incomplete
+        if pattern.starts_with('{') || pattern.ends_with('}') {
+            return Ok(ToolOutput::text(format!(
+                "Invalid pattern '{}': looks like JSON or incomplete syntax",
+                pattern
+            )));
+        }
+
         let path = params.get_str("path")?.unwrap_or_else(|| ".".to_string());
 
         let search_path = ctx.resolve_path(&path);
@@ -445,19 +550,54 @@ impl Tool for FindTool {
             Some(matches) if !matches.is_empty() => {
                 let mut sorted = matches;
                 sorted.sort();
-                Ok(ToolOutput::text(sorted.join("\n")))
+                let content = sorted.join("\n");
+                let summary = format!("Found {} files matching '{}'", sorted.len(), pattern);
+                Ok(ToolOutput::text(content)
+                    .with_metadata(super::OutputMetadata {
+                        display_summary: Some(summary.clone()),
+                        ..Default::default()
+                    })
+                    .with_summary_display(summary))
             }
-            _ => Ok(ToolOutput::text("No files found".to_string())),
+            _ => {
+                let summary = "No files found".to_string();
+                Ok(ToolOutput::text("No files found".to_string())
+                    .with_metadata(super::OutputMetadata {
+                        display_summary: Some(summary.clone()),
+                        ..Default::default()
+                    })
+                    .with_summary_display(summary))
+            }
         }
     }
 }
 
 fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
-    let output = Command::new("fd")
-        .args(["--type", "f", "--", pattern])
-        .current_dir(search_path)
-        .output()
-        .ok()?;
+    // Convert glob pattern to fd-compatible pattern
+    // **/* -> empty (match all)
+    // *.rs -> --glob *.rs
+    let (use_glob, fd_pattern) = if pattern == "**/*" || pattern == "*" || pattern.is_empty() {
+        (false, "")
+    } else if pattern.contains('*') {
+        (true, pattern)
+    } else {
+        (false, pattern)
+    };
+    
+    let mut cmd = Command::new("fd");
+    cmd.arg("--type").arg("f");
+    
+    if use_glob {
+        cmd.arg("--glob");
+    }
+    
+    if !fd_pattern.is_empty() {
+        cmd.arg("--").arg(fd_pattern);
+    }
+    
+    cmd.current_dir(search_path);
+    
+    let output = cmd.output().ok()?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -475,16 +615,18 @@ fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
 
 fn try_find(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
     // Convert glob pattern to find-compatible pattern
-    let find_pattern = pattern
-        .replace("**/", "")
-        .replace("**", "*");
+    let find_pattern = pattern.replace("**/", "").replace("**", "*");
 
     let output = Command::new("find")
         .args([
             ".",
-            "-type", "f",
-            "!", "-path", "*/.*",
-            "-name", &find_pattern,
+            "-type",
+            "f",
+            "!",
+            "-path",
+            "*/.*",
+            "-name",
+            &find_pattern,
         ])
         .current_dir(search_path)
         .output()

@@ -1,8 +1,8 @@
 use crate::tools::ToolError;
 use ignore::WalkBuilder;
-use std::path::Path;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 // ============================================================
 // Truncation Utilities
@@ -15,6 +15,7 @@ pub struct TruncatedFile {
     pub truncated: bool,
 }
 
+#[allow(clippy::result_large_err)]
 pub fn truncate_file(
     path: &Path,
     line_limit: usize,
@@ -118,9 +119,10 @@ pub fn is_ignored(cwd: &Path, path: &Path) -> bool {
     // Check if the path would be ignored
     for entry in walker {
         if let Ok(entry) = entry
-            && entry.path() == path {
-                return true;
-            }
+            && entry.path() == path
+        {
+            return true;
+        }
     }
     false
 }
@@ -134,11 +136,38 @@ pub fn is_binary_file(path: &Path) -> bool {
         let ext = ext.to_string_lossy().to_lowercase();
         matches!(
             ext.as_str(),
-            "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "a" | "lib"
-                | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp"
-                | "mp3" | "mp4" | "wav" | "ogg" | "flac"
-                | "zip" | "tar" | "gz" | "rar" | "7z"
-                | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            "exe"
+                | "dll"
+                | "so"
+                | "dylib"
+                | "bin"
+                | "o"
+                | "a"
+                | "lib"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "ico"
+                | "bmp"
+                | "mp3"
+                | "mp4"
+                | "wav"
+                | "ogg"
+                | "flac"
+                | "zip"
+                | "tar"
+                | "gz"
+                | "rar"
+                | "7z"
+                | "pdf"
+                | "doc"
+                | "docx"
+                | "xls"
+                | "xlsx"
+                | "ppt"
+                | "pptx"
         )
     } else {
         false
@@ -148,7 +177,10 @@ pub fn is_binary_file(path: &Path) -> bool {
 pub fn is_image_file(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
         let ext = ext.to_string_lossy().to_lowercase();
-        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp")
+        matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp"
+        )
     } else {
         false
     }
@@ -202,19 +234,26 @@ impl FileRange {
         match (offset, limit) {
             (None, None) => Ok(None),
             (Some(o), Some(l)) => {
-                let offset = o.parse::<usize>()
+                let offset = o
+                    .parse::<usize>()
                     .map_err(|_| format!("Invalid offset: {}", o))?;
-                let limit = l.parse::<usize>()
+                let limit = l
+                    .parse::<usize>()
                     .map_err(|_| format!("Invalid limit: {}", l))?;
                 Ok(Some(Self { offset, limit }))
             }
             (Some(o), None) => {
-                let offset = o.parse::<usize>()
+                let offset = o
+                    .parse::<usize>()
                     .map_err(|_| format!("Invalid offset: {}", o))?;
-                Ok(Some(Self { offset, limit: 5000 }))
+                Ok(Some(Self {
+                    offset,
+                    limit: 5000,
+                }))
             }
             (None, Some(l)) => {
-                let limit = l.parse::<usize>()
+                let limit = l
+                    .parse::<usize>()
                     .map_err(|_| format!("Invalid limit: {}", l))?;
                 Ok(Some(Self { offset: 0, limit }))
             }

@@ -1,32 +1,32 @@
-mod model;
-mod error;
-mod parser;
 mod config;
+mod error;
+mod model;
+mod parser;
+mod tools;
 mod tui;
 mod tui_components;
-mod tools;
 
+use clap::Parser;
+use config::Config;
 use error::AgentError;
 use model::{Model, ModelType};
-use parser::{parse_action, Action};
-use config::Config;
+use parser::{Action, parse_actions};
 use tools::{ToolRegistry, create_coding_tools};
-use clap::Parser;
 
 /// codr - AI coding agent harness
 #[derive(Parser, Debug)]
 #[command(name = "codr")]
 #[command(about = "AI coding agent harness", long_about = None)]
 struct Cli {
-    /// Enable TUI (interactive) mode
-    #[arg(short = 'c', long = "chat")]
-    chat: bool,
+    /// Run in direct mode (non-interactive, single task execution)
+    #[arg(short = 'd', long = "direct")]
+    direct: bool,
 
     /// Enable YOLO mode (auto-approve bash commands)
     #[arg(long = "yolo")]
     yolo: bool,
 
-    /// Task to execute (in direct/non-interactive mode)
+    /// Task to execute (in direct/non-interactive mode, or as initial message in TUI mode)
     #[arg(trailing_var_arg = true)]
     task: Vec<String>,
 }
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get model name for display
     let model_name = match &model_type {
-        ModelType::LlamaServer { model, .. } => model.clone(),
+        ModelType::OpenAI { model, .. } => model.clone(),
         ModelType::Anthropic => "claude".to_string(),
         ModelType::Nim { model, .. } => model.clone(),
     };
@@ -52,24 +52,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tool_registry = create_coding_tools(cwd);
     let tools_description = tool_registry.descriptions();
 
-    let use_tui = cli.chat || cli.task.is_empty();
+    // Direct mode is only used when explicitly requested with --direct/-d
+    // Otherwise, TUI (chat) mode is the default
+    let use_tui = !cli.direct;
 
     if use_tui {
-        // TUI mode (interactive)
+        // TUI mode (interactive chat - default)
         let mut app = tui::App::new(model, tool_registry, model_name, cli.yolo);
         app.set_system_prompt(&get_system_prompt(&tools_description));
 
         // If task provided, use it as initial message
         if !cli.task.is_empty() {
             let initial_task = cli.task.join(" ");
-            app.messages.push(tui_components::ChatMessage::user(&initial_task));
+            app.messages
+                .push(tui_components::ChatMessage::user(&initial_task));
             app.start_processing();
         }
 
         tui::run_tui(app).await?;
     } else {
-        // Direct mode (non-interactive, single task)
+        // Direct mode (non-interactive, single task execution)
         let initial_task = cli.task.join(" ");
+        if initial_task.is_empty() {
+            eprintln!("Error: --direct mode requires a task to execute");
+            std::process::exit(1);
+        }
         run_direct(model, &tool_registry, &tools_description, &initial_task).await?;
     }
 
@@ -92,8 +99,8 @@ async fn run_direct(
         ("user", initial_task),
     ]);
 
-    // Main agent loop
-    loop {
+    // Main agent loop - exits when a plain text response is received
+    'agent_loop: loop {
         // Query the LM
         let lm_output = model.query(&messages).await?;
         println!("LM output:\n{}", lm_output);
@@ -102,9 +109,9 @@ async fn run_direct(
         // Remember what the LM said
         messages = model.add_assistant_message(messages, &lm_output);
 
-        // Parse the action
-        let action = match parse_action(&lm_output) {
-            Ok(a) => a,
+        // Parse the actions
+        let parsed = match parse_actions(&lm_output) {
+            Ok(p) => p,
             Err(AgentError::Terminating(msg)) => {
                 println!("{}", msg);
                 break;
@@ -116,30 +123,38 @@ async fn run_direct(
             }
         };
 
-        // Handle plain text response (no tools needed)
-        if let Action::Response(response) = &action {
-            println!("{}", response);
+        // Handle each action
+        let mut all_outputs = Vec::new();
+
+        for action in &parsed.actions {
+            // Handle plain text response (no tools needed)
+            if let Action::Response(response) = action {
+                println!("{}", response);
+                println!("\n{}", "═".repeat(60));
+                println!();
+                break 'agent_loop; // Exit the agent loop after a plain text response
+            }
+
+            // Execute tool/bash actions
+            let output = match execute_action(action, tool_registry) {
+                Ok(o) => o,
+                Err(AgentError::Terminating(msg)) => {
+                    println!("{}", msg);
+                    break 'agent_loop;
+                }
+                Err(AgentError::Timeout(msg)) => msg,
+            };
+
+            println!("Output:\n{}", output);
             println!("\n{}", "═".repeat(60));
             println!();
-            break; // End the interaction after a plain text response
+
+            all_outputs.push(output);
         }
 
-        // Execute tool/bash actions
-        let output = match execute_action(&action, tool_registry) {
-            Ok(o) => o,
-            Err(AgentError::Terminating(msg)) => {
-                println!("{}", msg);
-                break;
-            }
-            Err(AgentError::Timeout(msg)) => msg,
-        };
-
-        println!("Output:\n{}", output);
-        println!("\n{}", "═".repeat(60));
-        println!();
-
-        // Send command output back to LM
-        messages = model.add_user_message(messages, &output);
+        // Send command outputs back to LM
+        let combined_output = all_outputs.join("\n---\n\n");
+        messages = model.add_user_message(messages, &combined_output);
     }
 
     Ok(())
@@ -151,13 +166,20 @@ async fn run_direct(
 
 fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<String, AgentError> {
     use std::process::Command;
-    use std::thread;
     use std::sync::mpsc;
+    use std::thread;
 
     match action {
-        Action::Bash { command, workdir, timeout_ms, env } => {
+        Action::Bash {
+            command,
+            workdir,
+            timeout_ms,
+            env,
+        } => {
             if command.trim() == "exit" {
-                return Err(AgentError::Terminating("Agent requested to exit".to_string()));
+                return Err(AgentError::Terminating(
+                    "Agent requested to exit".to_string(),
+                ));
             }
 
             let mut cmd = Command::new("bash");
@@ -174,20 +196,21 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
             }
 
             if let Some(env_vars) = env
-                && let Some(obj) = env_vars.as_object() {
-                    for (key, value) in obj {
-                        if let Some(v) = value.as_str() {
-                            cmd.env(key, v);
-                        }
+                && let Some(obj) = env_vars.as_object()
+            {
+                for (key, value) in obj {
+                    if let Some(v) = value.as_str() {
+                        cmd.env(key, v);
                     }
                 }
+            }
 
             let result = if let Some(timeout) = timeout_ms {
                 let (tx, rx) = mpsc::channel();
                 let cmd_str = command.clone();
                 let workdir_clone = workdir.clone();
                 let env_clone = env.clone();
-                
+
                 thread::spawn(move || {
                     let mut cmd = Command::new("bash");
                     cmd.arg("-c")
@@ -197,65 +220,76 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
                         .env("LESS", "-R")
                         .env("PIP_PROGRESS_BAR", "off")
                         .env("TQDM_DISABLE", "1");
-                    
+
                     if let Some(dir) = &workdir_clone {
                         cmd.current_dir(dir);
                     }
                     if let Some(env_vars) = &env_clone
-                        && let Some(obj) = env_vars.as_object() {
-                            for (key, value) in obj {
-                                if let Some(v) = value.as_str() {
-                                    cmd.env(key, v);
-                                }
+                        && let Some(obj) = env_vars.as_object()
+                    {
+                        for (key, value) in obj {
+                            if let Some(v) = value.as_str() {
+                                cmd.env(key, v);
                             }
                         }
-                    
+                    }
+
                     let output = cmd.output();
                     tx.send(output).ok();
                 });
 
                 match rx.recv_timeout(std::time::Duration::from_millis(*timeout)) {
-                    Ok(Ok(output)) => Ok((output.status, output.stdout.to_vec(), output.stderr.to_vec())),
+                    Ok(Ok(output)) => Ok((
+                        output.status,
+                        output.stdout.to_vec(),
+                        output.stderr.to_vec(),
+                    )),
                     Ok(Err(e)) => Err(e),
-                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out")),
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "command timed out",
+                    )),
                 }
             } else {
-                cmd.output().map(|o| (o.status, o.stdout.to_vec(), o.stderr.to_vec()))
+                cmd.output()
+                    .map(|o| (o.status, o.stdout.to_vec(), o.stderr.to_vec()))
             };
 
             match result {
                 Ok((status, stdout, stderr)) => {
                     if !status.success() {
-                        return Err(AgentError::Timeout(format!("Command exited with code: {:?}", status.code())));
+                        return Err(AgentError::Timeout(format!(
+                            "Command exited with code: {:?}",
+                            status.code()
+                        )));
                     }
                     let stdout_str = String::from_utf8_lossy(&stdout).to_string();
                     let stderr_str = String::from_utf8_lossy(&stderr).to_string();
                     Ok(format!("{}\n{}", stdout_str, stderr_str).trim().to_string())
                 }
-                Err(e) => Err(AgentError::Timeout(format!("Command execution failed: {}", e))),
+                Err(e) => Err(AgentError::Timeout(format!(
+                    "Command execution failed: {}",
+                    e
+                ))),
             }
         }
-        Action::Tool { name, params } => {
-            match tool_registry.execute(name, params.clone()) {
-                Ok(output) => {
-                    let mut result = output.content;
-                    if !output.attachments.is_empty() {
-                        result.push_str(&format!("\n[{} attachment(s)]", output.attachments.len()));
-                    }
-                    if let Some(line_count) = output.metadata.line_count {
-                        result.push_str(&format!("\n[Lines: {}]", line_count));
-                    }
-                    if output.metadata.truncated {
-                        result.push_str(" [truncated]");
-                    }
-                    Ok(result)
+        Action::Tool { name, params } => match tool_registry.execute(name, params.clone()) {
+            Ok(output) => {
+                let mut result = output.content;
+                if !output.attachments.is_empty() {
+                    result.push_str(&format!("\n[{} attachment(s)]", output.attachments.len()));
                 }
-                Err(e) => Ok(format!("Tool error: {}", e)),
+                if let Some(line_count) = output.metadata.line_count {
+                    result.push_str(&format!("\n[Lines: {}]", line_count));
+                }
+                if output.metadata.truncated {
+                    result.push_str(" [truncated]");
+                }
+                Ok(result)
             }
-        }
-        Action::Response(response) => {
-            Ok(response.clone())
-        }
+            Err(e) => Ok(format!("Tool error: {}", e)),
+        },
+        Action::Response(response) => Ok(response.clone()),
     }
 }
 
@@ -263,23 +297,81 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
 // System Prompt
 // ============================================================
 
+/// Load project-specific context from CLAUDE.md or AGENT.md if present
+/// Strips out the title and initial description to keep only relevant content
+fn load_project_context() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+
+    // Try CLAUDE.md first, then AGENT.md
+    let claude_path = cwd.join("CLAUDE.md");
+    let agent_path = cwd.join("AGENT.md");
+
+    let content = if claude_path.exists() {
+        std::fs::read_to_string(&claude_path).ok()
+    } else if agent_path.exists() {
+        std::fs::read_to_string(&agent_path).ok()
+    } else {
+        None
+    }?;
+
+    // Clean up the content: remove title line and initial description
+    let cleaned = content
+        .lines()
+        .skip_while(|line| {
+            let trimmed = line.trim();
+            // Skip until we find a real content section (after title/description)
+            trimmed.starts_with("#") ||
+            trimmed.starts_with("This file provides") ||
+            trimmed.is_empty() ||
+            trimmed.starts_with("---")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(cleaned)
+}
+
 fn get_system_prompt(tools_description: &str) -> String {
-    format!(
-        "You are codr, a helpful coding assistant.\n\n\
-        Available tools:\n{}\n\n\
-        IMPORTANT - Response rules:\n\
-        - For greetings (\"hello\", \"hi\", \"hey\"): respond warmly WITHOUT tools\n\
-        - For casual questions: respond directly WITHOUT tools\n\
-        - For coding tasks: use tools only when you need to read files, edit code, or run commands\n\
-        - When done: wait for next instruction, do NOT continue with more actions\n\n\
-        Action format:\n\
-        - Tools: ```tool-action\n<tool_name>\n<json_params>\n```\n\
-        - Bash: ```bash-action\n<command>\n```\n\n\
-        Examples:\n\
-        ```tool-action\nread\n{{\"file_path\": \"src/main.rs\"}}\n```\n\
-        ```tool-action\nfind\n{{\"pattern\": \"*.rs\"}}\n```\n\
+    // For OpenAI-compatible models (llama.cpp), we need to be very explicit about the format
+    let mut prompt = format!(
+        "You are codr, a coding assistant with access to tools.\n\n\
+        ## Available Tools\n\n{}\n\n\
+        ## How to Call Tools\n\n\
+        IMPORTANT: You MUST call tools using the EXACT format below. Do NOT describe tools - CALL them.\n\n\
+        ### Tool Call Format (use EXACTLY this):\n\
+        ```tool-action\n<tool_name>\n<json_parameters>\n```\n\n\
+        ### Bash Command Format:\n\
+        ```bash-action\n<your_command>\n```\n\n\
+        ### Example Tool Calls:\n\n\
+        To read a file:\n\
+        ```tool-action\nread\n{{\"file_path\": \"src/main.rs\"}}\n```\n\n\
+        To find files:\n\
+        ```tool-action\nfind\n{{\"pattern\": \"*.rs\"}}\n```\n\n\
+        To search for text:\n\
         ```tool-action\ngrep\n{{\"pattern\": \"TODO\", \"path\": \".\"}}\n```\n\n\
-        CRITICAL: After completing any task, STOP and wait for the user's next message.",
+        To run a bash command:\n\
+        ```bash-action\ncargo build\n```\n\n\
+        ## Rules\n\n\
+        1. ALWAYS use tools for coding tasks - NEVER write code as plain text\n\
+        2. For greetings/casual chat: respond directly WITHOUT tools\n\
+        3. Wait for tool output before deciding next action\n\
+        4. After completing a task: STOP and wait for the next user message\n\
+        5. NEVER describe what tools you \"would\" use - actually CALL them\n\n\
+        Remember: Put your tool calls in ```tool-action or ```bash-action blocks.",
         tools_description
-    )
+    );
+
+    // Append project context if available
+    if let Some(context) = load_project_context() {
+        if !context.is_empty() {
+            prompt.push_str(&format!(
+                "\n\n\
+                ## Project-Specific Guidelines\n\n\
+                {}",
+                context
+            ));
+        }
+    }
+
+    prompt
 }
