@@ -331,8 +331,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     // This creates better visual separation between exchanges
     match msg.role.as_str() {
         "assistant" => {
-            // Small spacing before assistant messages
-            lines.push(Line::from(""));
+            // Single blank line for spacing
             lines.push(Line::from(""));
 
             // Thinking content (if present) - displayed in italic
