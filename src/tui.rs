@@ -1962,74 +1962,49 @@ async fn run_event_loop(
 // ── Helper Functions ─────────────────────────────────────────────
 
 /// Clean a streaming chunk by removing tool-action blocks to prevent flicker
-/// This preserves all other content including spaces and punctuation
+/// This handles partial blocks during streaming by removing everything from
+/// the opening tag until we see a closing tag.
 fn clean_streaming_chunk(chunk: &str) -> String {
     let mut result = String::new();
     let mut remaining = chunk;
+    let mut in_block = false;
 
-    // Remove tool-action blocks
-    let tool_pattern = "```tool-action";
-    let bash_pattern = "```bash-action";
-
+    // Remove tool-action blocks (handles partial blocks during streaming)
     loop {
-        // Find the earliest occurrence of either pattern
-        let tool_pos = remaining.find(tool_pattern);
-        let bash_pos = remaining.find(bash_pattern);
-
-        match (tool_pos, bash_pos) {
-            (Some(tp), Some(bp)) if tp < bp => {
-                // Tool-action comes first
-                result.push_str(&remaining[..tp]);
-                remaining = &remaining[tp + tool_pattern.len()..];
-                // Skip to the closing ```
-                if let Some(end) = remaining.find("```") {
-                    remaining = &remaining[end + 3..];
-                } else {
-                    // No closing found, discard the rest
-                    break;
-                }
-            }
-            (Some(_tp), Some(bp)) => {
-                // Bash-action comes first or only bash-action exists
-                result.push_str(&remaining[..bp]);
-                remaining = &remaining[bp + bash_pattern.len()..];
-                // Skip to the closing ```
-                if let Some(end) = remaining.find("```") {
-                    remaining = &remaining[end + 3..];
-                } else {
-                    // No closing found, discard the rest
-                    break;
-                }
-            }
-            (Some(tp), None) => {
-                // Only tool-action exists
-                result.push_str(&remaining[..tp]);
-                remaining = &remaining[tp + tool_pattern.len()..];
-                // Skip to the closing ```
-                if let Some(end) = remaining.find("```") {
-                    remaining = &remaining[end + 3..];
-                } else {
-                    // No closing found, discard the rest
-                    break;
-                }
-            }
-            (None, Some(bp)) => {
-                // Only bash-action exists
-                result.push_str(&remaining[..bp]);
-                remaining = &remaining[bp + bash_pattern.len()..];
-                // Skip to the closing ```
-                if let Some(end) = remaining.find("```") {
-                    remaining = &remaining[end + 3..];
-                } else {
-                    // No closing found, discard the rest
-                    break;
-                }
-            }
-            (None, None) => {
-                // No more blocks, add the rest and finish
-                result.push_str(remaining);
+        if in_block {
+            // We're inside a block, look for the closing ```
+            if let Some(end) = remaining.find("```") {
+                // Found closing, skip it and continue
+                remaining = &remaining[end + 3..];
+                in_block = false;
+            } else {
+                // Still inside block, discard everything
                 break;
             }
+        } else {
+            // Look for opening of either block type
+            let tool_pos = remaining.find("```tool-action");
+            let bash_pos = remaining.find("```bash-action");
+
+            // Find earliest opening (if any)
+            let (pos, pattern_len) = match (tool_pos, bash_pos) {
+                (Some(tp), Some(bp)) if tp <= bp => (tp, "```tool-action".len()),
+                (Some(_tp), Some(bp)) => (bp, "```bash-action".len()),
+                (Some(tp), None) => (tp, "```tool-action".len()),
+                (None, Some(bp)) => (bp, "```bash-action".len()),
+                (None, None) => {
+                    // No blocks found, add rest of content and finish
+                    result.push_str(remaining);
+                    break;
+                }
+            };
+
+            // Add content before the block
+            result.push_str(&remaining[..pos]);
+            // Skip the opening tag
+            remaining = &remaining[pos + pattern_len..];
+            // Now we're inside a block
+            in_block = true;
         }
     }
 
