@@ -806,8 +806,10 @@ impl App {
                                 );
                                 self.streaming_content.clear();
                             }
+                            // Clean thinking chunks to prevent tool-action blocks from showing
+                            let cleaned_thinking = clean_streaming_chunk(&thinking);
                             // Accumulate thinking chunks and flush on newlines for natural sentence chunks
-                            self.streaming_thinking.push_str(&thinking);
+                            self.streaming_thinking.push_str(&cleaned_thinking);
                             self.is_streaming_thinking = true;
 
                             // If the accumulated thinking ends with a newline, flush it as a message
