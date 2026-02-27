@@ -268,8 +268,12 @@ impl Model {
         for msg in messages.iter_mut().rev() {
             if msg.role == "user" {
                 msg.content.push_str(
-                    "\n\nRemember: Use ```tool-action or ```bash-action blocks for tool calls.\n\
-                     Example: ```tool-action\nread\n{\"file_path\": \"src/main.rs\"}\n```"
+                    "\n\n\
+                    IMPORTANT: Your response must be a tool call block:\n\
+                    ```tool-action\n<tool_name>\n<json_params>\n```\n\
+                    Examples:\n\
+                    ```tool-action\nread\n{\"file_path\": \"src/main.rs\"}\n```\n\
+                    ```tool-action\nfind\n{\"pattern\": \"*.rs\"}\n```"
                 );
                 break;
             }
