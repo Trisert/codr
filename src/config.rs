@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[derive(Default)]
 enum ModelTypeConfig {
     #[default]
+    #[serde(rename = "openai")]
     OpenAI,
     Anthropic,
     Nim,
