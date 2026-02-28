@@ -1,4 +1,4 @@
-# codr
+| `Ctrl+C` | Cancel agent (press twice to quit) |
 
 A minimal AI agent for terminal use, built in Rust. Inspired by [minimal-agent.com](https://minimal-agent.com).
 
