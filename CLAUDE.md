@@ -35,7 +35,7 @@ codr is a terminal-based AI agent (~400 lines of core implementation) that suppo
 src/
 ├── main.rs          # Entry point, CLI parsing, direct mode execution loop
 ├── model.rs         # Multi-provider LLM abstraction with streaming support
-├── parser.rs        # Parses tool-action and bash-action blocks from LM responses
+├── parser.rs        # Parses codr_tool and codr_bash XML blocks from LM responses
 ├── config.rs        # TOML configuration loader with XDG directory support
 ├── error.rs         # Custom error types (Timeout, Terminating)
 ├── tui.rs           # Terminal UI with background agent loop pattern
@@ -77,7 +77,6 @@ pub async fn query_streaming<F, G>(
 **Key implementation details:**
 - **Thinking chunks** are accumulated and flushed to messages on newlines (creates natural sentence chunks)
 - **Text chunks** are accumulated in real-time and shown in the streaming buffer
-- **Tool-action blocks** (````tool-action` and ````bash-action`) are filtered from display via `clean_content()`
 - **Cancellation** works by checking the cancel token in streaming callbacks and dropping the update channel
 
 ### TUI Architecture
@@ -92,8 +91,13 @@ The TUI uses a **background agent loop pattern**:
    - `ActionMessage` - Tool/bash action to execute
    - `OutputMessage` - Tool execution output
    - `ErrorMessage` - Error messages
-   - `UsageUpdate` - Token/cost updates
+   - `UsageUpdate` - Token/cost updates (input_tokens, output_tokens, cost)
    - `Done` - Stream complete
+
+**Token tracking:**
+- `session_input_tokens` - Tokens sent to LLM (prompt/input)
+- `session_output_tokens` - Tokens received from LLM (completion/output)
+- `session_cost` - Total cost in currency
 
 **Critical state variables:**
 - `streaming_content` - Accumulated text content (flushed on Done)
@@ -119,7 +123,22 @@ trait Tool {
 - `attachments` - Binary data (e.g., images)
 - `metadata` - File path, line count, truncation status
 
-**Available tools:** `read`, `bash`, `edit`, `write`, `grep`, `find`
+**Available tools:** `read`, `bash`, `edit`, `write`, `grep`, `find`, `file_info`
+
+**Tool Categories:**
+- `FileOps` - read, write, edit, file_info
+- `Search` - grep, find
+- `System` - bash
+
+### Role System
+
+The agent has three operation modes (cycled with `Shift+Tab`):
+
+- **YOLO** (Red) - Full access, all tools auto-approved
+- **SAFE** (Green, default) - All tools available, write/edit/bash require approval
+- **PLAN** (Blue) - Read-only mode: read, bash, grep, find, file_info only
+
+The current role is displayed in the footer: `codr <model> [ROLE]`
 
 **Async Tool System (Experimental):**
 `src/tools/async_handler.rs` contains a Codex-style async tool handler system with:
@@ -132,8 +151,9 @@ trait Tool {
 
 The parser (`parse_action()`) handles multiple action formats from different LLM providers:
 
-- **Tool actions:** ````tool-action\n<tool_name>\n<json_params>\n````
-- **Bash actions:** ````bash-action\n<command>\n``` or JSON format with workdir/timeout/env
+- **XML Tool actions:** `<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>`
+- **XML Bash actions:** `<codr_bash>ls -la</codr_bash>`
+- **Legacy tool-action:** Backtick format (still supported for backward compatibility)
 - **Plain responses:** Text without tool calls (indicates conversation end)
 
 The parser uses regex with `(?s)` dotall flag to capture multi-line blocks.
@@ -201,13 +221,8 @@ The system prompt is dynamically generated to include tool descriptions and enfo
 When working with streaming content:
 - **Thinking** is flushed to messages on newlines (via `StreamingThinkingChunk` handler)
 - **Content** is accumulated and shown in real-time (via `StreamingChunk` handler)
-- **Tool-action flicker prevention**: Chunks are cleaned via `clean_streaming_chunk()` before adding to `streaming_content` to prevent brief display of tool-action blocks
 - **On Done**, remaining content is flushed to a final message
 - **On Disconnect**, same flushing happens (handles abrupt termination)
-
-### Tool-Action Block Filtering
-
-The `clean_content()` function in `tui_components.rs` removes ````tool-action` and ````bash-action` blocks from display. When modifying message rendering, ensure this filtering is preserved.
 
 ### Cancellation
 
@@ -231,6 +246,7 @@ Cancellation (`Ctrl+C`) works by:
 - `[r]` - Reject bash command (when pending)
 
 **Other:**
+- `Shift+Tab` - Cycle roles (PLAN → SAFE → YOLO → PLAN)
 - `Ctrl+Q` - Quit application
 - `Ctrl+C` - Cancel agent (first press) / Quit (second press within 2s)
 - `Ctrl+O` - Copy selection or all messages to clipboard
@@ -254,8 +270,25 @@ Cancellation (`Ctrl+C`) works by:
 
 To add a new tool:
 1. Implement the `Tool` trait in `src/tools/impl.rs`
-2. Register it in `create_coding_tools()` in `src/tools/mod.rs`
-3. Update system prompt if needed (via tools_description)
+2. Implement the `category()` method returning a `ToolCategory` (FileOps/Search/System)
+3. Register it in `create_coding_tools()` in `src/tools/mod.rs`
+4. Update `Role::tool_available()` if the tool should be restricted in certain modes
+
+### Edit Tool Modes
+
+The `edit` tool supports two editing modes:
+
+1. **String replacement** (original):
+   ```json
+   {"file_path": "src/main.rs", "old_text": "old", "new_text": "new"}
+   ```
+
+2. **Line-based editing** (for replacing ranges):
+   ```json
+   {"file_path": "src/main.rs", "line_start": 10, "line_end": 20, "new_content": "new content"}
+   ```
+
+Both modes require reading the file first to verify contents.
 
 **Tool Validation:**
 Tools should validate their parameters to catch malformed LLM output:

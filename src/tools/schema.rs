@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::sync::Arc;
 
 // ============================================================
 // JSON Schema Types
@@ -160,13 +161,29 @@ impl Default for ToolSchema {
 // Validation Error
 // ============================================================
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone)]
 pub struct ValidationError {
-    pub error: String,
-    pub message: String,
-    pub tool: String,
+    pub error: Arc<str>,
+    pub message: Arc<str>,
+    pub tool: Arc<str>,
     pub received: Value,
     pub expected: Value,
+}
+
+impl serde::Serialize for ValidationError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ValidationError", 5)?;
+        s.serialize_field("error", &*self.error)?;
+        s.serialize_field("message", &*self.message)?;
+        s.serialize_field("tool", &*self.tool)?;
+        s.serialize_field("received", &self.received)?;
+        s.serialize_field("expected", &self.expected)?;
+        s.end()
+    }
 }
 
 impl std::fmt::Display for ValidationError {
@@ -186,9 +203,9 @@ impl std::error::Error for ValidationError {}
 impl ValidationError {
     pub fn new(tool: &str, message: &str, received: Value, expected: Value) -> Self {
         Self {
-            error: "INVALID_PARAMS".to_string(),
-            message: message.to_string(),
-            tool: tool.to_string(),
+            error: "INVALID_PARAMS".into(),
+            message: message.into(),
+            tool: tool.into(),
             received,
             expected,
         }
@@ -342,5 +359,147 @@ impl ExtractParams for Value {
                 Value::String("boolean".to_string()),
             )
         })
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_schema_new() {
+        let schema = ToolSchema::new();
+        assert!(schema.properties.is_empty());
+    }
+
+    #[test]
+    fn test_tool_schema_string() {
+        let schema = ToolSchema::new().string("name", "The name", true);
+        assert_eq!(schema.properties.len(), 1);
+        assert!(schema.required.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_tool_schema_integer() {
+        let schema = ToolSchema::new().integer("count", "A count", false);
+        assert_eq!(schema.properties.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_schema_boolean() {
+        let schema = ToolSchema::new().boolean("enabled", "Is enabled", true);
+        assert_eq!(schema.properties.len(), 1);
+    }
+
+    #[test]
+    fn test_property_creation() {
+        let prop = Property {
+            name: "test".to_string(),
+            property_type: PropertyType::String,
+            description: "A name".to_string(),
+            required: true,
+            default: None,
+        };
+        assert_eq!(prop.name, "test");
+    }
+
+    #[test]
+    fn test_validation_error_new() {
+        let err = ValidationError::new(
+            "test_tool",
+            "Invalid parameter",
+            Value::Null,
+            Value::String("string".to_string()),
+        );
+        assert_eq!(&*err.error, "INVALID_PARAMS");
+    }
+
+    #[test]
+    fn test_extract_params_get_str() {
+        let value = serde_json::json!({ "name": "test" });
+        let result = value.get_str("name");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_extract_params_get_str_missing() {
+        let value = serde_json::json!({});
+        let result = value.get_str("name");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_params_get_required_str() {
+        let value = serde_json::json!({ "name": "test" });
+        let result = value.get_required_str("name");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test");
+    }
+
+    #[test]
+    fn test_extract_params_get_required_str_missing() {
+        let value = serde_json::json!({});
+        let result = value.get_required_str("name");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_params_get_bool_true() {
+        let value = serde_json::json!({ "enabled": true });
+        let result = value.get_bool("enabled");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(true));
+    }
+
+    #[test]
+    fn test_extract_params_get_bool_false() {
+        let value = serde_json::json!({ "enabled": false });
+        let result = value.get_bool("enabled");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(false));
+    }
+
+    #[test]
+    fn test_extract_params_get_bool_from_string_true() {
+        let value = serde_json::json!({ "enabled": "true" });
+        let result = value.get_bool("enabled");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(true));
+    }
+
+    #[test]
+    fn test_extract_params_get_bool_from_string_invalid() {
+        let value = serde_json::json!({ "enabled": "invalid" });
+        let result = value.get_bool("enabled");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_params_get_bool_missing() {
+        let value = serde_json::json!({});
+        let result = value.get_bool("enabled");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_params_get_required_bool() {
+        let value = serde_json::json!({ "enabled": true });
+        let result = value.get_required_bool("enabled");
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_extract_params_get_required_bool_missing() {
+        let value = serde_json::json!({});
+        let result = value.get_required_bool("enabled");
+        assert!(result.is_err());
     }
 }

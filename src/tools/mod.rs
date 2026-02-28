@@ -9,6 +9,85 @@ pub mod schema;
 
 use schema::{ToolSchema, ValidationError};
 use serde_json::Value;
+use std::sync::Arc;
+
+// ============================================================
+// Role System
+// ============================================================
+
+/// Role determines which tools are available and whether they require approval
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// Yolo mode: Full access, all tools auto-approved
+    Yolo,
+    /// Safe mode: All tools available, write/edit/bash require approval
+    Safe,
+    /// Planning mode: Read + bash only, no write/edit tools available
+    Planning,
+}
+
+impl Role {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Yolo => "YOLO",
+            Self::Safe => "SAFE",
+            Self::Planning => "PLAN",
+        }
+    }
+
+    pub fn color(&self) -> (u8, u8, u8) {
+        match self {
+            Self::Yolo => (255, 100, 100),   // Red
+            Self::Safe => (100, 255, 100),   // Green
+            Self::Planning => (100, 200, 255), // Blue
+        }
+    }
+
+    /// Check if a tool requires approval in this role
+    pub fn requires_approval(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Yolo => false,
+            Self::Safe => matches!(tool_name, "write" | "edit" | "bash"),
+            Self::Planning => matches!(tool_name, "write" | "edit" | "bash"),
+        }
+    }
+
+    /// Check if a tool is available in this role
+    pub fn tool_available(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Yolo => true,
+            Self::Safe => true,  // All tools available, some require approval
+            Self::Planning => matches!(tool_name, "read" | "bash" | "grep" | "find" | "file_info"),
+        }
+    }
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Self::Safe
+    }
+}
+
+// ============================================================
+// Tool Categories
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolCategory {
+    FileOps,    // read, write, edit, file_info
+    Search,     // grep, find
+    System,     // bash
+}
+
+impl ToolCategory {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::FileOps => "File Operations",
+            Self::Search => "Search",
+            Self::System => "System",
+        }
+    }
+}
 
 // ============================================================
 // Tool Trait
@@ -31,6 +110,11 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given parameters
     #[allow(clippy::result_large_err)]
     fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Get the tool category (optional override)
+    fn category(&self) -> ToolCategory {
+        ToolCategory::FileOps
+    }
 
     /// Validate parameters against schema (optional override)
     #[allow(clippy::result_large_err)]
@@ -98,11 +182,11 @@ impl Default for ToolContext {
 
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
-    pub content: String,
+    pub content: Arc<String>,  // Shared content
     pub attachments: Vec<Attachment>,
     pub metadata: OutputMetadata,
     /// Alternative content for TUI display (if set, this is shown instead of content)
-    pub content_for_display: Option<String>,
+    pub content_for_display: Option<Arc<String>>,  // Shared display content
 }
 
 #[allow(dead_code)]
@@ -127,7 +211,7 @@ pub struct OutputMetadata {
 impl ToolOutput {
     pub fn text(content: String) -> Self {
         Self {
-            content,
+            content: Arc::new(content),
             attachments: Vec::new(),
             metadata: OutputMetadata::default(),
             content_for_display: None,
@@ -148,8 +232,8 @@ impl ToolOutput {
         self
     }
 
-    pub fn with_summary_display(mut self, summary: String) -> Self {
-        self.content_for_display = Some(summary);
+    pub fn with_summary_display<S: Into<Arc<String>>>(mut self, summary: S) -> Self {
+        self.content_for_display = Some(summary.into());
         self
     }
 }
@@ -235,6 +319,33 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// Check if a tool is available for the given role
+    pub fn tool_available(&self, name: &str, role: Role) -> bool {
+        if let Some(tool) = self.get(name) {
+            role.tool_available(tool.name())
+        } else {
+            false
+        }
+    }
+
+    /// Check if a tool requires approval in the given role
+    pub fn tool_requires_approval(&self, name: &str, role: Role) -> bool {
+        if let Some(tool) = self.get(name) {
+            role.requires_approval(tool.name())
+        } else {
+            false
+        }
+    }
+
+    /// Get tools available for a specific role
+    pub fn get_tools_for_role(&self, role: Role) -> Vec<&dyn Tool> {
+        self.tools
+            .iter()
+            .filter(|t| role.tool_available(t.name()))
+            .map(|t| t.as_ref())
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -399,13 +510,115 @@ impl ToolRegistry {
         results.into_iter().map(|(_, r)| r).collect()
     }
 
-    /// Get tool descriptions for AI context
+    /// Get tool descriptions for AI context, organized by category
     pub fn descriptions(&self) -> String {
-        self.tools
-            .iter()
-            .map(|t| format!("- {}: {}", t.name(), t.description()))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut by_category: std::collections::HashMap<ToolCategory, Vec<&str>> =
+            std::collections::HashMap::new();
+
+        for tool in &self.tools {
+            by_category
+                .entry(tool.category())
+                .or_insert_with(Vec::new)
+                .push(tool.name());
+        }
+
+        let mut result = String::new();
+
+        // Add File Operations tools
+        if let Some(tools) = by_category.get(&ToolCategory::FileOps) {
+            result.push_str(&format!("## {}\n", ToolCategory::FileOps.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+            result.push('\n');
+        }
+
+        // Add Search tools
+        if let Some(tools) = by_category.get(&ToolCategory::Search) {
+            result.push_str(&format!("## {}\n", ToolCategory::Search.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+            result.push('\n');
+        }
+
+        // Add System tools
+        if let Some(tools) = by_category.get(&ToolCategory::System) {
+            result.push_str(&format!("## {}\n", ToolCategory::System.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+        }
+
+        result.trim_end().to_string()
+    }
+
+    /// Get tool descriptions for AI context, filtered by role
+    pub fn descriptions_for_role(&self, role: Role) -> String {
+        let mut by_category: std::collections::HashMap<ToolCategory, Vec<&str>> =
+            std::collections::HashMap::new();
+
+        for tool in self.get_tools_for_role(role) {
+            by_category
+                .entry(tool.category())
+                .or_insert_with(Vec::new)
+                .push(tool.name());
+        }
+
+        let mut result = String::new();
+
+        // Add File Operations tools
+        if let Some(tools) = by_category.get(&ToolCategory::FileOps) {
+            result.push_str(&format!("## {}\n", ToolCategory::FileOps.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+            result.push('\n');
+        }
+
+        // Add Search tools
+        if let Some(tools) = by_category.get(&ToolCategory::Search) {
+            result.push_str(&format!("## {}\n", ToolCategory::Search.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+            result.push('\n');
+        }
+
+        // Add System tools
+        if let Some(tools) = by_category.get(&ToolCategory::System) {
+            result.push_str(&format!("## {}\n", ToolCategory::System.name()));
+            for &name in tools {
+                if let Some(tool) = self.get(name) {
+                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
+                }
+            }
+        }
+
+        // Add role-specific note
+        match role {
+            Role::Planning => {
+                result.push_str("\nNote: In Planning mode, write and edit tools are not available. Use bash for read-only operations.\n");
+            }
+            Role::Safe => {
+                result.push_str("\nNote: In Safe mode, write, edit, and bash operations require approval.\n");
+            }
+            Role::Yolo => {
+                result.push_str("\nNote: In YOLO mode, all operations are auto-approved.\n");
+            }
+        }
+
+        result.trim_end().to_string()
     }
 
     /// Suggest tool based on keywords
@@ -464,7 +677,8 @@ pub fn create_coding_tools(cwd: std::path::PathBuf) -> ToolRegistry {
         .register(Box::new(r#impl::EditTool::new()))
         .register(Box::new(r#impl::WriteTool::new()))
         .register(Box::new(r#impl::GrepTool::new()))
-        .register(Box::new(r#impl::FindTool::new()));
+        .register(Box::new(r#impl::FindTool::new()))
+        .register(Box::new(r#impl::FileInfoTool::new()));
     registry
 }
 
@@ -476,4 +690,301 @@ pub fn create_read_only_tools(cwd: std::path::PathBuf) -> ToolRegistry {
         .register(Box::new(r#impl::GrepTool::new()))
         .register(Box::new(r#impl::FindTool::new()));
     registry
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::r#impl::{ReadTool, BashTool};
+
+    // ============================================================
+    // ToolContext Tests
+    // ============================================================
+
+    #[test]
+    fn test_tool_context_default() {
+        let ctx = ToolContext::default();
+        
+        assert!(ctx.cwd.exists() || ctx.cwd == std::path::PathBuf::from("."));
+        assert!(!ctx.env.is_empty());
+        assert_eq!(ctx.token_limit, 500_000);
+        assert_eq!(ctx.line_limit, 5_000);
+        assert_eq!(ctx.max_image_dimension, 2000);
+    }
+
+    #[test]
+    fn test_tool_context_new() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
+        
+        assert_eq!(ctx.cwd, std::path::PathBuf::from("/tmp"));
+        assert!(!ctx.env.is_empty());
+    }
+
+    #[test]
+    fn test_tool_context_with_limits() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"))
+            .with_limits(1000, 100);
+        
+        assert_eq!(ctx.token_limit, 1000);
+        assert_eq!(ctx.line_limit, 100);
+    }
+
+    #[test]
+    fn test_tool_context_resolve_path_absolute() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
+        
+        let resolved = ctx.resolve_path("/etc/passwd");
+        assert_eq!(resolved, std::path::PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_tool_context_resolve_path_relative() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
+        
+        let resolved = ctx.resolve_path("test.txt");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/test.txt"));
+    }
+
+    // ============================================================
+    // ToolOutput Tests
+    // ============================================================
+
+    #[test]
+    fn test_tool_output_text() {
+        let output = ToolOutput::text("Hello world".to_string());
+        
+        assert_eq!(&*output.content, "Hello world");
+        assert!(output.attachments.is_empty());
+        assert!(output.content_for_display.is_none());
+    }
+
+    #[test]
+    fn test_tool_output_with_attachment() {
+        let output = ToolOutput::text("Image content".to_string())
+            .with_attachment("test.png".to_string(), "image/png".to_string(), vec![1, 2, 3]);
+        
+        assert_eq!(output.attachments.len(), 1);
+        assert_eq!(output.attachments[0].name, "test.png");
+        assert_eq!(output.attachments[0].content_type, "image/png");
+        assert_eq!(output.attachments[0].data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tool_output_with_metadata() {
+        let output = ToolOutput::text("Content".to_string())
+            .with_metadata(OutputMetadata {
+                file_path: Some("test.txt".to_string()),
+                line_count: Some(10),
+                byte_count: Some(100),
+                truncated: false,
+                display_summary: None,
+            });
+        
+        assert_eq!(output.metadata.file_path, Some("test.txt".to_string()));
+        assert_eq!(output.metadata.line_count, Some(10));
+    }
+
+    #[test]
+    fn test_tool_output_with_summary_display() {
+        let output = ToolOutput::text("Full content...".to_string())
+            .with_summary_display("Short summary".to_string());
+        
+        assert!(output.content_for_display.is_some());
+        assert_eq!(&*output.content_for_display.unwrap(), "Short summary");
+    }
+
+    #[test]
+    fn test_tool_output_clone() {
+        let output = ToolOutput::text("Hello".to_string())
+            .with_metadata(OutputMetadata {
+                file_path: Some("test.txt".to_string()),
+                ..Default::default()
+            });
+        
+        let cloned = output.clone();
+        
+        assert_eq!(&*cloned.content, "Hello");
+        assert_eq!(cloned.metadata.file_path, Some("test.txt".to_string()));
+    }
+
+    // ============================================================
+    // OutputMetadata Tests
+    // ============================================================
+
+    #[test]
+    fn test_output_metadata_default() {
+        let meta = OutputMetadata::default();
+        
+        assert!(meta.file_path.is_none());
+        assert!(meta.line_count.is_none());
+        assert!(meta.byte_count.is_none());
+        assert!(!meta.truncated);
+        assert!(meta.display_summary.is_none());
+    }
+
+    // ============================================================
+    // Attachment Tests
+    // ============================================================
+
+    #[test]
+    fn test_attachment_creation() {
+        let attachment = Attachment {
+            name: "test.png".to_string(),
+            content_type: "image/png".to_string(),
+            data: vec![1, 2, 3],
+        };
+        
+        assert_eq!(attachment.name, "test.png");
+        assert_eq!(attachment.content_type, "image/png");
+        assert_eq!(attachment.data, vec![1, 2, 3]);
+    }
+
+    // ============================================================
+    // ToolError Tests
+    // ============================================================
+
+    #[test]
+    fn test_tool_error_io() {
+        let err = ToolError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        assert!(err.to_string().contains("file not found"));
+    }
+
+    #[test]
+    fn test_tool_error_path_not_found() {
+        let err = ToolError::PathNotFound("/missing/file.txt".to_string());
+        assert!(err.to_string().contains("Path not found"));
+    }
+
+    #[test]
+    fn test_tool_error_invalid_parameters() {
+        let err = ToolError::InvalidParameters("Missing required parameter".to_string());
+        assert!(err.to_string().contains("Invalid parameters"));
+    }
+
+    #[test]
+    fn test_tool_error_execution_failed() {
+        let err = ToolError::ExecutionFailed("Command failed".to_string());
+        assert!(err.to_string().contains("Execution failed"));
+    }
+
+    // ============================================================
+    // ToolRegistry Tests
+    // ============================================================
+
+    #[test]
+    fn test_tool_registry_new() {
+        let registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
+        
+        assert_eq!(registry.tools.len(), 0);
+    }
+
+    #[test]
+    fn test_tool_registry_register() {
+        let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
+        registry.register(Box::new(ReadTool::new()));
+        
+        assert_eq!(registry.tools.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_registry_get() {
+        let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
+        registry.register(Box::new(ReadTool::new()));
+        
+        let tool = registry.get("read");
+        assert!(tool.is_some());
+        
+        let tool = registry.get("nonexistent");
+        assert!(tool.is_none());
+    }
+
+    #[test]
+    fn test_tool_registry_list() {
+        let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
+        registry.register(Box::new(ReadTool::new()));
+        registry.register(Box::new(BashTool::new()));
+        
+        let tools = registry.list();
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_registry_descriptions() {
+        let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
+        registry.register(Box::new(ReadTool::new()));
+        
+        let descriptions = registry.descriptions();
+        assert!(descriptions.contains("read"));
+    }
+
+    #[test]
+    fn test_tool_registry_suggest_tool_direct_match() {
+        let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
+        
+        let suggestion = registry.suggest_tool("read");
+        assert!(suggestion.is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_suggest_tool_keyword() {
+        let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
+        
+        let suggestion = registry.suggest_tool("view a file");
+        assert!(suggestion.is_some());
+    }
+
+    #[test]
+    fn test_tool_registry_suggest_tool_no_match() {
+        let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
+        
+        let suggestion = registry.suggest_tool("xyznonexistent");
+        assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn test_tool_registry_execute() {
+        let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
+        
+        let result = registry.execute("read", serde_json::json!({
+            "file_path": "/nonexistent/file.txt"
+        }));
+        
+        // Should fail because file doesn't exist, but should not panic
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // Predefined Tool Sets Tests
+    // ============================================================
+
+    #[test]
+    fn test_create_coding_tools() {
+        let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
+
+        assert_eq!(registry.tools.len(), 7);
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("write").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("file_info").is_some());
+    }
+
+    #[test]
+    fn test_create_read_only_tools() {
+        let registry = create_read_only_tools(std::path::PathBuf::from("/tmp"));
+        
+        assert_eq!(registry.tools.len(), 3);
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("grep").is_some());
+        assert!(registry.get("find").is_some());
+        assert!(registry.get("bash").is_none());
+        assert!(registry.get("edit").is_none());
+        assert!(registry.get("write").is_none());
+    }
 }

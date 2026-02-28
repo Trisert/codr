@@ -1,9 +1,9 @@
 use crate::error::AgentError;
 use crate::model::{Message, Model};
 use crate::parser::{Action, parse_actions};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, Role};
 use crate::tui_components::{
-    ApprovalState, ChatMessage, MarkdownRenderer, PendingAction, THEME,
+    ApprovalState, ChatMessage, PendingAction, THEME,
     render_message,
 };
 use crossterm::{
@@ -126,20 +126,6 @@ impl ScrollState {
             return true;
         }
         self.offset + self.viewport_height >= self.total_lines
-    }
-
-    pub fn is_at_top(&self) -> bool {
-        self.offset == 0
-    }
-
-    #[allow(dead_code)]
-    pub fn can_scroll_down(&self) -> bool {
-        !self.is_at_bottom()
-    }
-
-    #[allow(dead_code)]
-    pub fn can_scroll_up(&self) -> bool {
-        !self.is_at_top()
     }
 
     pub fn scroll_percentage(&self) -> f32 {
@@ -366,14 +352,15 @@ fn simple_base64_encode(input: &str) -> Result<String, String> {
 // ── Messages from background agent task to the UI ────────────
 
 enum AgentUpdate {
-    StreamingChunk(String),
-    StreamingThinkingChunk(String),
-    ActionMessage(String),
-    OutputMessage(String),
-    InfoMessage(String),
-    ErrorMessage(String),
-    SystemMessage(String),
-    UsageUpdate { tokens: u32, cost: f64 },
+    StreamingChunk(Arc<str>),
+    StreamingThinkingChunk(Arc<str>),
+    ActionMessage(Arc<str>),
+    OutputMessage(Arc<String>),  // Changed from Arc<str> to Arc<String>
+    InfoMessage(Arc<String>),    // Changed from Arc<str> to Arc<String>
+    ErrorMessage(Arc<str>),
+    SystemMessage(Arc<str>),
+    UsageUpdate { input_tokens: u32, output_tokens: u32, cost: f64 },
+    ParallelToolCount(usize),
     Done,
 }
 
@@ -386,12 +373,12 @@ async fn agent_loop(
     mut conversation: Vec<Message>,
     tx: mpsc::UnboundedSender<AgentUpdate>,
     cancel_token: CancellationToken,
-    yolo_mode: bool,
+    role: Role,
 ) {
     loop {
         // Check for cancellation
         if cancel_token.is_cancelled() {
-            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".to_string()));
+            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".into()));
             let _ = tx.send(AgentUpdate::Done);
             return;
         }
@@ -400,6 +387,7 @@ async fn agent_loop(
         let tx_clone = tx.clone();
         let cancel_token_thinking = cancel_token.clone();
         let tx_thinking = tx.clone();
+        let cancel_token_for_query = cancel_token.clone();
         let lm_output = match model
             .query_streaming(
                 &conversation,
@@ -407,20 +395,27 @@ async fn agent_loop(
                     if cancel_token_clone.is_cancelled() {
                         return;
                     }
-                    let _ = tx_clone.send(AgentUpdate::StreamingChunk(chunk));
+                    let _ = tx_clone.send(AgentUpdate::StreamingChunk(chunk.into()));
                 },
                 move |thinking| {
                     if cancel_token_thinking.is_cancelled() {
                         return;
                     }
-                    let _ = tx_thinking.send(AgentUpdate::StreamingThinkingChunk(thinking));
+                    let _ = tx_thinking.send(AgentUpdate::StreamingThinkingChunk(thinking.into()));
                 },
+                &cancel_token_for_query,
             )
             .await
         {
             Ok(output) => output,
             Err(e) => {
-                let _ = tx.send(AgentUpdate::ErrorMessage(format!("Query error: {}", e)));
+                // Check if error is due to cancellation
+                if cancel_token.is_cancelled() || e.to_string().contains("cancelled") {
+                    let _ = tx.send(AgentUpdate::SystemMessage("Request cancelled".into()));
+                    let _ = tx.send(AgentUpdate::Done);
+                    return;
+                }
+                let _ = tx.send(AgentUpdate::ErrorMessage(format!("Query error: {}", e).into()));
                 let _ = tx.send(AgentUpdate::Done);
                 return;
             }
@@ -428,7 +423,7 @@ async fn agent_loop(
 
         // Check for cancellation after query
         if cancel_token.is_cancelled() {
-            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".to_string()));
+            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".into()));
             let _ = tx.send(AgentUpdate::Done);
             return;
         }
@@ -436,7 +431,8 @@ async fn agent_loop(
         // Send usage update if available
         if let Ok(usage) = model.get_usage() {
             let _ = tx.send(AgentUpdate::UsageUpdate {
-                tokens: usage.completion_tokens.unwrap_or(0),
+                input_tokens: usage.prompt_tokens.unwrap_or(0),
+                output_tokens: usage.completion_tokens.unwrap_or(0),
                 cost: usage.cost_in_currency.unwrap_or(0.0),
             });
         }
@@ -444,23 +440,29 @@ async fn agent_loop(
         let parsed = match parse_actions(&lm_output) {
             Ok(p) => p,
             Err(AgentError::Terminating(msg)) => {
-                let _ = tx.send(AgentUpdate::ErrorMessage(msg));
+                let _ = tx.send(AgentUpdate::ErrorMessage(msg.into()));
                 let _ = tx.send(AgentUpdate::Done);
                 return;
             }
             Err(AgentError::Timeout(msg)) => {
-                let _ = tx.send(AgentUpdate::ErrorMessage(msg.clone()));
+                let _ = tx.send(AgentUpdate::ErrorMessage((&*msg).to_string().into()));
                 conversation.push(Message {
-                    role: "user".to_string(),
-                    content: msg,
+                    role: "user".into(),
+                    content: Arc::new(msg),
                 });
                 continue;
             }
         };
 
+        // Send parallel tool count to UI
+        let tool_count = parsed.actions.iter()
+            .filter(|a| !matches!(a, Action::Response(_)))
+            .count();
+        let _ = tx.send(AgentUpdate::ParallelToolCount(tool_count));
+
         // Check for cancellation after parsing
         if cancel_token.is_cancelled() {
-            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".to_string()));
+            let _ = tx.send(AgentUpdate::SystemMessage("interrupted".into()));
             let _ = tx.send(AgentUpdate::Done);
             return;
         }
@@ -470,23 +472,16 @@ async fn agent_loop(
         let mut retry_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
+        // First pass: execute all tool/bash actions
+        // Second pass: handle response (if any) after all tools complete
         for action in &parsed.actions {
-            // Check for Response (plain text)
-            if let Action::Response(response) = action {
-                let _ = tx.send(AgentUpdate::Done);
-                conversation.push(Message {
-                    role: "assistant".to_string(),
-                    content: lm_output.to_string(),
-                });
-                conversation.push(Message {
-                    role: "user".to_string(),
-                    content: response.clone(),
-                });
-                return;
+            // Skip Response actions in first pass - we'll handle them after tools
+            if matches!(action, Action::Response(_)) {
+                continue;
             }
 
             let action_key = match action {
-                Action::Bash { command, .. } => command.clone(),
+                Action::Bash { command, .. } => (&*command).to_string(),
                 Action::Tool { name, params } => format!("{}:{}", name, params),
                 Action::Response(_) => continue,
             };
@@ -494,49 +489,83 @@ async fn agent_loop(
             let retry_count = retry_counts.get(&action_key).copied().unwrap_or(0);
 
             // Send action message only for bash (for approval), not for tools (cleaner UI)
+            // Check if tool requires approval based on role
+            let needs_approval = match &action {
+                Action::Bash { .. } => role.requires_approval("bash"),
+                Action::Tool { name, .. } => role.requires_approval(name.as_ref()),
+                Action::Response(_) => false,
+            };
+
             if let Action::Bash { command, .. } = &action {
-                let _ = tx.send(AgentUpdate::ActionMessage(format!("bash: {}", command)));
+                let _ = tx.send(AgentUpdate::ActionMessage(format!("bash: {}", command).into()));
             }
 
             // Execute the action
-            let result: Result<String, String> = match action {
+            let result: Result<(Arc<String>, Option<Arc<String>>), String> = match action {
                 Action::Bash { command, .. } => {
-                    if yolo_mode {
-                        execute_bash_action(command)
-                            .map(|o| o.to_string())
+                    if !needs_approval {
+                        execute_bash_action(&*command)
+                            .map(|o| (Arc::new(o), None))
                             .map_err(|e| e.to_string())
                     } else {
                         let _ = tx.send(AgentUpdate::Done);
                         return;
                     }
                 }
-                Action::Tool { name, params } => tool_registry
-                    .execute(name, params.clone())
-                    .map(|o| o.content_for_display.unwrap_or(o.content))
-                    .map_err(|e| e.to_string()),
+                Action::Tool { name, params } => {
+                    // Check if tool is available in current role
+                    if !role.tool_available(name.as_ref()) {
+                        let error_msg = format!("Tool '{}' is not available in {} mode. Use Shift+Tab to change roles.", name, role.name());
+                        let _ = tx.send(AgentUpdate::ErrorMessage(error_msg.clone().into()));
+                        conversation.push(Message {
+                            role: "assistant".into(),
+                            content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+                        });
+                        conversation.push(Message {
+                            role: "user".into(),
+                            content: Arc::new(error_msg),
+                        });
+                        continue;
+                    }
+
+                    // Execute tool and get both full content and display summary
+                    tool_registry
+                        .execute(name.as_ref(), params.clone())
+                        .map(|o| {
+                            // Full content for LLM, display summary for UI
+                            let llm_content: Arc<String> = o.content;
+                            let ui_summary: Option<Arc<String>> = o.content_for_display;
+                            (llm_content, ui_summary)
+                        })
+                        .map_err(|e| e.to_string())
+                }
                 Action::Response(_) => continue,
             };
 
             match result {
-                Ok(output) => {
-                    // Send output to UI
-                    if let Action::Tool { name, .. } = action {
-                        if name == "read" {
-                            let _ = tx.send(AgentUpdate::InfoMessage(output.clone()));
+                Ok((llm_output_content, ui_display)) => {
+                    // Send output to UI (use summary if available, otherwise full content)
+                    if let Action::Tool { name, .. } = &action {
+                        let display_text = ui_display.as_ref().unwrap_or(&llm_output_content);
+                        if name.as_ref() == "read" {
+                            let _ = tx.send(AgentUpdate::InfoMessage(display_text.clone()));
                         } else {
-                            let _ = tx.send(AgentUpdate::OutputMessage(output.clone()));
+                            let _ = tx.send(AgentUpdate::OutputMessage(display_text.clone()));
                         }
-                    } else if let Action::Bash { .. } = action {
-                        let _ = tx.send(AgentUpdate::OutputMessage(output.clone()));
+                    } else if let Action::Bash { .. } = &action {
+                        let _ = tx.send(AgentUpdate::OutputMessage(llm_output_content.clone()));
                     }
 
+                    // Clean the lm_output before adding to conversation (remove tool/thinking tags)
+                    let cleaned_output = crate::tui_components::clean_for_conversation(&lm_output);
+
                     conversation.push(Message {
-                        role: "assistant".to_string(),
-                        content: lm_output.to_string(),
+                        role: "assistant".into(),
+                        content: Arc::new(cleaned_output),
                     });
                     conversation.push(Message {
-                        role: "user".to_string(),
-                        content: output,
+                        role: "user".into(),
+                        content: Arc::new(format!("Tool result:\n{}", &*llm_output_content)),
                     });
 
                     // Reset retry count on success
@@ -559,39 +588,57 @@ async fn agent_loop(
                             error_msg,
                             retry_count + 1,
                             max_retries
-                        )));
+                        ).into()));
                         conversation.push(Message {
-                            role: "assistant".to_string(),
-                            content: lm_output.to_string(),
+                            role: "assistant".into(),
+                            content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
                         });
                         conversation.push(Message {
-                            role: "user".to_string(),
-                            content: format!(
+                            role: "user".into(),
+                            content: Arc::new(format!(
                                 "Error: {}\n\n{}",
                                 error_json, "Please fix the parameters and try again."
-                            ),
+                            )),
                         });
                     } else {
                         // Max retries exceeded
                         let _ = tx.send(AgentUpdate::OutputMessage(format!(
                             "Error after {} retries: {}",
                             max_retries, error_msg
-                        )));
+                        ).into()));
                         conversation.push(Message {
-                            role: "assistant".to_string(),
-                            content: lm_output.to_string(),
+                            role: "assistant".into(),
+                            content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
                         });
                         conversation.push(Message {
-                            role: "user".to_string(),
-                            content: format!(
+                            role: "user".into(),
+                            content: Arc::new(format!(
                                 "Tool execution failed after {} retries: {}",
                                 max_retries, error_msg
-                            ),
+                            )),
                         });
                     }
                 }
             }
         }
+
+        // After all tools/bash actions complete, check if there was a Response action
+        // This handles the case where LLM outputs both tool calls and explanatory text
+        if let Some(Action::Response(response)) = parsed.actions.iter().find(|a| matches!(a, Action::Response(_))) {
+            let _ = tx.send(AgentUpdate::Done);
+            conversation.push(Message {
+                role: "assistant".into(),
+                content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+            });
+            conversation.push(Message {
+                role: "user".into(),
+                content: response.clone(),
+            });
+            return;
+        }
+
+        // If we processed tool actions but there's no Response action, continue the loop
+        // to get the next LLM response
     }
 }
 
@@ -605,16 +652,18 @@ pub struct App {
     pub tool_registry: Arc<ToolRegistry>,
     pub tools_description: String,
     pub system_messages: Vec<Message>,
-    #[allow(dead_code)]
-    pub markdown_renderer: MarkdownRenderer,
     pub pending_action: Option<PendingAction>,
     pub approval_state: ApprovalState,
-    pub streaming_content: String,
-    pub streaming_thinking: String,
-    pub is_streaming_thinking: bool,
-    pub session_tokens: u32,
+    // Simple accumulator for agent response (displayed when done)
+    response_accumulator: String,
+    // Accumulator for thinking content
+    thinking_accumulator: String,
+    pub session_input_tokens: u32,
+    pub session_output_tokens: u32,
     pub session_cost: f64,
     pub model_name: String,
+    // Role system (Yolo/Safe/Planning)
+    pub role: Role,
     // New scrolling state
     scroll_state: ScrollState,
     // Selection state
@@ -638,6 +687,10 @@ pub struct App {
     // Prompt history
     history: Vec<String>,
     history_index: Option<usize>,
+    // Animation frame counter for UI effects
+    animation_frame: usize,
+    // Track parallel tool execution
+    parallel_tool_count: usize,
 }
 
 impl App {
@@ -647,7 +700,8 @@ impl App {
         model_name: String,
         yolo_mode: bool,
     ) -> Self {
-        let tools_description = tool_registry.descriptions();
+        let role = if yolo_mode { Role::Yolo } else { Role::Safe };
+        let tools_description = tool_registry.descriptions_for_role(role);
         Self {
             messages: Vec::new(),
             input: String::new(),
@@ -658,15 +712,15 @@ impl App {
             tool_registry: Arc::new(tool_registry),
             tools_description,
             system_messages: Vec::new(),
-            markdown_renderer: MarkdownRenderer::new(),
             pending_action: None,
             approval_state: ApprovalState::None,
-            streaming_content: String::new(),
-            streaming_thinking: String::new(),
-            is_streaming_thinking: false,
-            session_tokens: 0,
+            response_accumulator: String::new(),
+            thinking_accumulator: String::new(),
+            session_input_tokens: 0,
+            session_output_tokens: 0,
             session_cost: 0.0,
             model_name,
+            role,
             scroll_state: ScrollState::new(),
             selection: SelectionState::new(),
             toasts: Vec::new(),
@@ -680,24 +734,45 @@ impl App {
             is_mouse_dragging: false,
             history: Vec::new(),
             history_index: None,
+            animation_frame: 0,
+            parallel_tool_count: 0,
         }
     }
 
     pub fn set_system_prompt(&mut self, system_prompt: &str) {
         self.system_messages = vec![Message {
-            role: "system".to_string(),
-            content: system_prompt.to_string(),
+            role: "system".into(),
+            content: Arc::new(system_prompt.to_string()),
         }];
+    }
+
+    /// Update the role and regenerate tools description
+    pub fn set_role(&mut self, role: Role) {
+        self.role = role;
+        self.tools_description = self.tool_registry.descriptions_for_role(role);
+        // Update yolo_mode based on role for compatibility
+        self.yolo_mode = matches!(role, Role::Yolo);
+    }
+
+    /// Cycle to the next role (Planning -> Safe -> Yolo -> Planning)
+    pub fn cycle_role(&mut self) {
+        let new_role = match self.role {
+            Role::Planning => Role::Safe,
+            Role::Safe => Role::Yolo,
+            Role::Yolo => Role::Planning,
+        };
+        self.set_role(new_role);
     }
 
     fn get_conversation_history(&self) -> Vec<Message> {
         let mut messages = self.system_messages.clone();
         for chat_msg in &self.messages {
-            // Include user, assistant, and tool outputs (output, info, action roles)
-            match chat_msg.role.as_str() {
-                "user" | "assistant" | "output" | "info" | "action" | "error" => {
+            // Include user, assistant, and output messages for the LLM
+            // Output messages contain tool results which the LLM needs to see
+            match &*chat_msg.role {
+                "user" | "assistant" | "output" => {
                     messages.push(Message {
-                        role: chat_msg.role.clone(),
+                        role: if &*chat_msg.role == "output" { "user".into() } else { chat_msg.role.clone() },
                         content: chat_msg.content.clone(),
                     });
                 }
@@ -706,7 +781,9 @@ impl App {
         }
         messages
     }
+}
 
+impl App {
     /// Start processing a message in the background (non-blocking).
     pub fn start_processing(&mut self) {
         if self.input.trim().is_empty() {
@@ -727,9 +804,8 @@ impl App {
         self.input.clear();
         self.cursor_position = 0;
         self.is_processing = true;
-        self.streaming_content.clear();
-        self.streaming_thinking.clear();
-        self.is_streaming_thinking = false;
+        self.response_accumulator.clear();
+        self.thinking_accumulator.clear();
         self.scroll_state.scroll_to_bottom();
         self.clear_selection();
 
@@ -737,7 +813,7 @@ impl App {
         let model = self.model.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let tools_description = self.tools_description.clone();
-        let yolo_mode = self.yolo_mode;
+        let role = self.role;
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.update_rx = Some(rx);
@@ -753,7 +829,7 @@ impl App {
                 conversation,
                 tx,
                 cancel_token,
-                yolo_mode,
+                role,
             )
             .await;
         });
@@ -776,88 +852,37 @@ impl App {
                 match rx.try_recv() {
                     Ok(update) => match update {
                         AgentUpdate::StreamingChunk(chunk) => {
-                            // If we were streaming thinking and now get content, flush any remaining thinking
-                            if self.is_streaming_thinking {
-                                if !self.streaming_thinking.is_empty() {
-                                    self.messages.push(
-                                        ChatMessage::assistant_with_thinking_and_content(
-                                            "",
-                                            Some(self.streaming_thinking.clone()),
-                                        ),
-                                    );
-                                    self.streaming_thinking.clear();
-                                }
-                                self.is_streaming_thinking = false;
-                            }
-                            // Clean chunk immediately to prevent flicker from tool-action blocks
-                            // We need to preserve the chunk but remove any tool-action/bash-action blocks
-                            let cleaned = clean_streaming_chunk(&chunk);
-                            self.streaming_content.push_str(&cleaned);
-                            self.scroll_state.scroll_to_bottom();
+                            // Simply accumulate content, display when done
+                            self.response_accumulator.push_str(&chunk);
                         }
                         AgentUpdate::StreamingThinkingChunk(thinking) => {
-                            // If we were streaming content and now get thinking, flush the content
-                            if !self.is_streaming_thinking && !self.streaming_content.is_empty() {
-                                self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
-                                );
-                                self.streaming_content.clear();
-                            }
-                            // Clean thinking chunks to prevent tool-action blocks from showing
-                            let cleaned_thinking = clean_streaming_chunk(&thinking);
-                            // Accumulate thinking chunks and flush on newlines for natural sentence chunks
-                            self.streaming_thinking.push_str(&cleaned_thinking);
-                            self.is_streaming_thinking = true;
-
-                            // If the accumulated thinking ends with a newline, flush it as a message
-                            if self.streaming_thinking.ends_with('\n') {
-                                self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        "",
-                                        Some(self.streaming_thinking.clone()),
-                                    ),
-                                );
-                                self.streaming_thinking.clear();
-                                // Note: we keep is_streaming_thinking = true since more thinking may come
-                            }
-                            self.scroll_state.scroll_to_bottom();
+                            // Accumulate thinking content for display
+                            self.thinking_accumulator.push_str(&thinking);
                         }
                         AgentUpdate::ActionMessage(content) => {
-                            // Flush any accumulated content before showing the action
-                            if !self.streaming_content.is_empty() {
+                            // Flush any accumulated content (with thinking) before showing the action
+                            let thinking = if !self.thinking_accumulator.is_empty() {
+                                Some(self.thinking_accumulator.clone())
+                            } else {
+                                None
+                            };
+                            if !self.response_accumulator.is_empty() {
                                 self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
+                                    ChatMessage::assistant_with_explicit_thinking(&self.response_accumulator, thinking),
                                 );
-                                self.streaming_content.clear();
+                                self.response_accumulator.clear();
+                                self.thinking_accumulator.clear();
                             }
-                            // Also flush any remaining thinking
-                            if !self.streaming_thinking.is_empty() {
-                                self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        "",
-                                        Some(self.streaming_thinking.clone()),
-                                    ),
-                                );
-                                self.streaming_thinking.clear();
-                            }
-                            self.is_streaming_thinking = false;
-
                             self.messages.push(ChatMessage::action(&content));
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
-                            // Check if this is a bash action that needs approval (not in YOLO mode)
-                            if !self.yolo_mode && content.starts_with("bash:") {
+                            // Check if this is a bash action that needs approval (based on role)
+                            if self.role.requires_approval("bash") && content.starts_with("bash:") {
                                 // Extract command from the action display
                                 let command = content.strip_prefix("bash: ").unwrap_or(&content);
                                 let action = PendingAction {
-                                    action_type: "bash".to_string(),
-                                    content: command.to_string(),
+                                    action_type: "bash".into(),
+                                    content: Arc::new(command.to_string()),
                                 };
                                 pending_action = Some((action, ApprovalState::Pending));
                                 self.is_processing = false;
@@ -868,45 +893,43 @@ impl App {
                             }
                         }
                         AgentUpdate::OutputMessage(content) => {
-                            // Flush any accumulated content before showing output
-                            if !self.streaming_content.is_empty() {
+                            // Flush any accumulated content (with thinking) before showing output
+                            let thinking = if !self.thinking_accumulator.is_empty() {
+                                Some(self.thinking_accumulator.clone())
+                            } else {
+                                None
+                            };
+                            if !self.response_accumulator.is_empty() {
                                 self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
+                                    ChatMessage::assistant_with_explicit_thinking(&self.response_accumulator, thinking),
                                 );
-                                self.streaming_content.clear();
+                                self.response_accumulator.clear();
+                                self.thinking_accumulator.clear();
                             }
-                            self.messages.push(ChatMessage::output(&content));
+                            self.messages.push(ChatMessage::output(&*content));
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
                         }
                         AgentUpdate::InfoMessage(content) => {
-                            // Flush any accumulated content before showing info
-                            if !self.streaming_content.is_empty() {
-                                self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
-                                );
-                                self.streaming_content.clear();
-                            }
-                            self.messages.push(ChatMessage::info(&content));
+                            // Don't flush accumulator for info messages - keep them compact
+                            // This prevents gaps between consecutive info messages during tool execution
+                            self.messages.push(ChatMessage::info(&*content));
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
                         }
                         AgentUpdate::ErrorMessage(content) => {
-                            // Flush any accumulated content before showing error
-                            if !self.streaming_content.is_empty() {
+                            // Flush any accumulated content (with thinking) before showing error
+                            let thinking = if !self.thinking_accumulator.is_empty() {
+                                Some(self.thinking_accumulator.clone())
+                            } else {
+                                None
+                            };
+                            if !self.response_accumulator.is_empty() {
                                 self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
+                                    ChatMessage::assistant_with_explicit_thinking(&self.response_accumulator, thinking),
                                 );
-                                self.streaming_content.clear();
+                                self.response_accumulator.clear();
+                                self.thinking_accumulator.clear();
                             }
                             self.messages.push(ChatMessage::error(&content));
                             self.scroll_state.scroll_to_bottom();
@@ -917,61 +940,44 @@ impl App {
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
                         }
-                        AgentUpdate::UsageUpdate { tokens, cost } => {
-                            self.session_tokens += tokens;
+                        AgentUpdate::UsageUpdate { input_tokens, output_tokens, cost } => {
+                            self.session_input_tokens += input_tokens;
+                            self.session_output_tokens += output_tokens;
                             self.session_cost += cost;
                         }
+                        AgentUpdate::ParallelToolCount(count) => {
+                            self.parallel_tool_count = count;
+                        }
                         AgentUpdate::Done => {
-                            // Flush any remaining streaming thinking (that didn't end with newline)
-                            if !self.streaming_thinking.is_empty() {
+                            // Flush any remaining accumulated content
+                            if !self.response_accumulator.is_empty() {
                                 self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        "",
-                                        Some(self.streaming_thinking.clone()),
-                                    ),
+                                    ChatMessage::assistant(&self.response_accumulator),
                                 );
-                                self.streaming_thinking.clear();
-                            }
-                            // Flush any remaining streaming content
-                            if !self.streaming_content.is_empty() {
-                                self.messages.push(
-                                    ChatMessage::assistant_with_thinking_and_content(
-                                        &self.streaming_content,
-                                        None,
-                                    ),
-                                );
-                                self.streaming_content.clear();
+                                self.response_accumulator.clear();
                             }
                             self.is_processing = false;
-                            self.streaming_thinking.clear();
-                            self.is_streaming_thinking = false;
+                            self.parallel_tool_count = 0;
                             should_clear_rx = true;
                             should_return = true;
                         }
                     },
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // Flush any remaining streaming thinking (that didn't end with newline)
-                        if !self.streaming_thinking.is_empty() {
+                        // Flush any remaining accumulated content with thinking
+                        let thinking = if !self.thinking_accumulator.is_empty() {
+                            Some(self.thinking_accumulator.clone())
+                        } else {
+                            None
+                        };
+                        if !self.response_accumulator.is_empty() {
                             self.messages
-                                .push(ChatMessage::assistant_with_thinking_and_content(
-                                    "",
-                                    Some(self.streaming_thinking.clone()),
-                                ));
-                            self.streaming_thinking.clear();
-                        }
-                        // Flush any remaining streaming content
-                        if !self.streaming_content.is_empty() {
-                            self.messages
-                                .push(ChatMessage::assistant_with_thinking_and_content(
-                                    &self.streaming_content,
-                                    None,
-                                ));
-                            self.streaming_content.clear();
+                                .push(ChatMessage::assistant_with_explicit_thinking(&self.response_accumulator, thinking));
+                            self.response_accumulator.clear();
+                            self.thinking_accumulator.clear();
                         }
                         self.is_processing = false;
-                        self.streaming_thinking.clear();
-                        self.is_streaming_thinking = false;
+                        self.parallel_tool_count = 0;
                         should_clear_rx = true;
                         should_return = true;
                     }
@@ -999,10 +1005,8 @@ impl App {
     pub fn cancel_processing(&mut self) {
         self.cancel_token.cancel();
         self.is_processing = false;
-        // Clear any pending streaming content
-        self.streaming_content.clear();
-        self.streaming_thinking.clear();
-        self.is_streaming_thinking = false;
+        // Clear any pending response
+        self.response_accumulator.clear();
         // Drop the update_rx to stop processing further updates
         self.update_rx = None;
     }
@@ -1020,15 +1024,14 @@ impl App {
             self.history_index = Some(self.history.len());
         }
 
-        if let Some(idx) = self.history_index {
-            if idx > 0 {
+        if let Some(idx) = self.history_index
+            && idx > 0 {
                 self.history_index = Some(idx - 1);
                 if let Some(entry) = self.history.get(idx - 1) {
                     self.input = entry.clone();
                     self.cursor_position = self.input.len();
                 }
             }
-        }
     }
 
     /// Navigate to the next entry in history (Down arrow)
@@ -1037,8 +1040,8 @@ impl App {
             return;
         }
 
-        if let Some(idx) = self.history_index {
-            if idx < self.history.len() {
+        if let Some(idx) = self.history_index
+            && idx < self.history.len() {
                 self.history_index = Some(idx + 1);
                 if idx + 1 < self.history.len() {
                     if let Some(entry) = self.history.get(idx + 1) {
@@ -1052,7 +1055,6 @@ impl App {
                     self.history_index = None;
                 }
             }
-        }
     }
 
     /// Exit history browsing mode (called when user edits input manually)
@@ -1077,13 +1079,6 @@ impl App {
 
     /// Update the selection end to the given line index
     pub fn update_selection(&mut self, line_index: usize) {
-        self.selection.end_line = line_index;
-        self.selection.mode = SelectionMode::Selected;
-    }
-
-    /// Extend the selection to the given line index
-    #[allow(dead_code)]
-    pub fn extend_selection(&mut self, line_index: usize) {
         self.selection.end_line = line_index;
         self.selection.mode = SelectionMode::Selected;
     }
@@ -1227,10 +1222,10 @@ impl App {
         let mut conversation = self.get_conversation_history();
 
         if let Some(last_msg) = self.messages.last()
-            && last_msg.role == "action"
+            && &*last_msg.role == "action"
         {
             conversation.push(Message {
-                role: "assistant".to_string(),
+                role: "assistant".into(),
                 content: last_msg.content.clone(),
             });
         }
@@ -1238,11 +1233,11 @@ impl App {
         match approval {
             ApprovalState::Approved => {
                 if let Some(PendingAction { content: cmd, .. }) = pending {
-                    let output = execute_bash_action(&cmd)?;
+                    let output = execute_bash_action(&*cmd)?;
                     self.messages.push(ChatMessage::output(&output));
                     conversation.push(Message {
-                        role: "user".to_string(),
-                        content: output,
+                        role: "user".into(),
+                        content: Arc::new(output),
                     });
                 }
             }
@@ -1250,8 +1245,8 @@ impl App {
                 self.messages
                     .push(ChatMessage::output("Action rejected by user"));
                 conversation.push(Message {
-                    role: "user".to_string(),
-                    content: "Action rejected".to_string(),
+                    role: "user".into(),
+                    content: Arc::new("Action rejected".to_string()),
                 });
             }
             _ => {}
@@ -1262,7 +1257,7 @@ impl App {
         let model = self.model.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let tools_description = self.tools_description.clone();
-        let yolo_mode = self.yolo_mode;
+        let role = self.role;
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.update_rx = Some(rx);
@@ -1278,7 +1273,7 @@ impl App {
                 conversation,
                 tx,
                 cancel_token,
-                yolo_mode,
+                role,
             )
             .await;
         });
@@ -1343,6 +1338,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 
     // ── Footer bar ───────────────────────────────────────────
     draw_footer(f, app, zones[3]);
+
+    // ── Rainbow Working indicator (over input area) ─────────
+    if app.is_processing {
+        draw_working_indicator(f, app, zones[2]);
+    }
 }
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1350,8 +1350,14 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     // Clean up expired toasts
     app.cleanup_toasts();
 
-    // Left side: codr branding with model name
-    let left_text = format!("  codr {}", app.model_name);
+    // Get current memory usage (RSS in MB)
+    let memory_mb = get_process_memory_mb();
+
+    // Get role color
+    let (role_r, role_g, role_b) = app.role.color();
+
+    // Left side: codr branding with model name and role
+    let left_text = format!("  codr {} [{}]", app.model_name, app.role.name());
 
     // Scroll indicators
     let scroll_pct = app.scroll_state.scroll_percentage();
@@ -1366,12 +1372,13 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
 
-    // Right side: token/cost info or processing indicator
+    // Right side: token/cost info or processing indicator (with memory)
     let is_pending = matches!(app.approval_state, ApprovalState::Pending);
     let right_text = if is_pending || app.is_processing {
-        format!("{}  {}  ", scroll_indicator, lock_indicator)
+        format!("{}MB {}  {}  ", memory_mb, scroll_indicator, lock_indicator)
     } else {
-        format!("{}tok  ${:.4}{}{}  ", app.session_tokens, app.session_cost, scroll_indicator, lock_indicator)
+        format!("in: {} out: {}  ${:.4}  {}MB{}{}  ",
+            app.session_input_tokens, app.session_output_tokens, app.session_cost, memory_mb, scroll_indicator, lock_indicator)
     };
 
     let padding = (area.width as usize).saturating_sub(left_text.len() + right_text.len());
@@ -1379,10 +1386,30 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     // Footer with subtle top border for visual separation
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(
-            left_text,
+            "  codr ",
             Style::default()
                 .fg(Color::Rgb(147, 197, 253)) // Sky blue branding
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            &app.model_name,
+            Style::default()
+                .fg(Color::Rgb(147, 197, 253))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " [",
+            Style::default().fg(Color::Rgb(147, 197, 253)),
+        ),
+        Span::styled(
+            app.role.name(),
+            Style::default()
+                .fg(Color::Rgb(role_r, role_g, role_b))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "]",
+            Style::default().fg(Color::Rgb(147, 197, 253)),
         ),
         Span::styled(" ".repeat(padding), t.dim),
         Span::styled(
@@ -1420,12 +1447,121 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Get current process memory usage in MB (RSS)
+fn get_process_memory_mb() -> u64 {
+    // Use the libc-based approach for cross-platform memory reading
+    #[cfg(unix)]
+    {
+        use std::fs;
 
+        if let Ok(status) = fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    // VmRSS:     12345 kB
+                    if let Some(kb_str) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            return kb / 1024; // Convert to MB
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback for systems without /proc (like macOS)
+        0
+    }
+
+    #[cfg(not(unix))]
+    {
+        0 // Not implemented for non-Unix systems
+    }
+}
+
+/// Draw rainbow "Working..." indicator floating over the input area
+fn draw_working_indicator(f: &mut Frame, app: &App, input_area: Rect) {
+    // Position indicator at the top line of the input area (over the prompt)
+    let y = input_area.y;
+
+    let indicator_area = Rect {
+        x: input_area.x + 2,
+        y,
+        width: input_area.width.saturating_sub(4),
+        height: 1,
+    };
+
+    // Animated rainbow colors (left-to-right gradient sweep)
+    let frame = app.animation_frame;
+    let text = if app.parallel_tool_count > 1 {
+        format!("Running {} tools in parallel{}", app.parallel_tool_count, ".".repeat((frame / 8) % 4))
+    } else {
+        format!("Working{}", ".".repeat((frame / 8) % 4))
+    };
+
+    // Create rainbow gradient spans (left-aligned over prompt)
+    let mut spans = Vec::new();
+
+    // Text with gradient effect (left-aligned)
+    for (i, c) in text.chars().enumerate() {
+        let progress = ((frame as i32 + i as i32 * 8).rem_euclid(256)) as u8;
+        let (r, g, b) = rainbow_color(progress);
+        spans.push(Span::styled(
+            c.to_string(),
+            Style::default()
+                .fg(Color::Rgb(r, g, b))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Right padding (no left padding to keep it aligned with prompt)
+    let width = indicator_area.width as usize;
+    let text_width = text.width();
+    for i in 0..width.saturating_sub(text_width) {
+        let progress = ((frame + (text_width + i) * 2) % 256) as u8;
+        let (r, g, b) = rainbow_color(progress);
+        spans.push(Span::styled(" ", Style::default().fg(Color::Rgb(r, g, b))));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans));
+    f.render_widget(paragraph, indicator_area);
+}
+
+/// Generate rainbow RGB color from 0-255 value (hue-based)
+fn rainbow_color(value: u8) -> (u8, u8, u8) {
+    let v = value as u32;
+    let phase = v * 6;
+
+    let (r, g, b) = match phase {
+        0..=255 => {
+            // Red to Yellow
+            (255, phase as u8, 0)
+        }
+        256..=511 => {
+            // Yellow to Green
+            ((511 - phase) as u8, 255, 0)
+        }
+        512..=767 => {
+            // Green to Cyan
+            (0, 255, (phase - 512) as u8)
+        }
+        768..=1023 => {
+            // Cyan to Blue
+            (0, (1023 - phase) as u8, 255)
+        }
+        1024..=1279 => {
+            // Blue to Magenta
+            ((phase - 1024) as u8, 0, 255)
+        }
+        _ => {
+            // Magenta to Red
+            (255, 0, (1535 - phase) as u8)
+        }
+    };
+    (r, g, b)
+}
 
 fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
     let _t = &*THEME;
     // minimal padding on sides instead of borders
-    let width = area.width.saturating_sub(2) as usize; 
+    let width = area.width.saturating_sub(2) as usize;
 
     // Store conversation area for click handling
     app.conversation_area = Some(area);
@@ -1434,28 +1570,11 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
     app.scroll_state.viewport_height = area.height as usize;
 
     // Render all messages into lines
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut all_lines: Vec<Line<'_>> = Vec::new();
     let mut rendered_text: Vec<String> = Vec::new(); // Store raw text for copying
 
     for msg in &app.messages {
         let rendered = render_message(msg, width);
-        for line in &rendered {
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            rendered_text.push(text);
-        }
-        all_lines.extend(rendered);
-    }
-
-    // Render streaming content/thinking if available
-    if !app.streaming_content.is_empty() || !app.streaming_thinking.is_empty() {
-        let thinking = if !app.streaming_thinking.is_empty() {
-            Some(app.streaming_thinking.clone())
-        } else {
-            None
-        };
-        let streaming_msg =
-            ChatMessage::assistant_with_thinking_and_content(&app.streaming_content, thinking);
-        let rendered = render_message(&streaming_msg, width);
         for line in &rendered {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             rendered_text.push(text);
@@ -1492,7 +1611,13 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
                         .collect::<Vec<_>>(),
                 )
             } else {
-                line.clone()
+                // Convert to owned static lines
+                Line::from(
+                    line.spans
+                        .iter()
+                        .map(|span| Span::raw(span.content.to_string()))
+                        .collect::<Vec<_>>(),
+                )
             }
         })
         .collect();
@@ -1714,6 +1839,9 @@ async fn run_event_loop(
         // Drain any pending updates from the background task
         app.poll_updates();
 
+        // Increment animation frame for UI effects
+        app.animation_frame = app.animation_frame.wrapping_add(1);
+
         terminal.draw(|f| draw_ui(f, app))?;
 
         if app.should_quit {
@@ -1817,8 +1945,8 @@ async fn run_event_loop(
                                 let all_content = app
                                     .messages
                                     .iter()
-                                    .filter(|m| matches!(m.role.as_str(), "action"))
-                                    .map(|m| m.content.clone())
+                                    .filter(|m| &*m.role == "action")
+                                    .map(|m| m.content.as_str())
                                     .collect::<Vec<_>>()
                                     .join("\n");
                                 if !all_content.is_empty() {
@@ -1930,6 +2058,11 @@ async fn run_event_loop(
                                 app.cursor_position += 1;
                             }
                         }
+                        // -- Role cycling (Shift+Tab) --
+                        KeyCode::BackTab => {
+                            app.cycle_role();
+                            app.show_toast(format!("Role: {}", app.role.name()));
+                        }
                         _ => {}
                     }
                 }
@@ -1957,56 +2090,4 @@ async fn run_event_loop(
     }
 
     Ok(())
-}
-
-// ── Helper Functions ─────────────────────────────────────────────
-
-/// Clean a streaming chunk by removing tool-action blocks to prevent flicker
-/// This handles partial blocks during streaming by removing everything from
-/// the opening tag until we see a closing tag.
-fn clean_streaming_chunk(chunk: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = chunk;
-    let mut in_block = false;
-
-    // Remove tool-action blocks (handles partial blocks during streaming)
-    loop {
-        if in_block {
-            // We're inside a block, look for the closing ```
-            if let Some(end) = remaining.find("```") {
-                // Found closing, skip it and continue
-                remaining = &remaining[end + 3..];
-                in_block = false;
-            } else {
-                // Still inside block, discard everything
-                break;
-            }
-        } else {
-            // Look for opening of either block type
-            let tool_pos = remaining.find("```tool-action");
-            let bash_pos = remaining.find("```bash-action");
-
-            // Find earliest opening (if any)
-            let (pos, pattern_len) = match (tool_pos, bash_pos) {
-                (Some(tp), Some(bp)) if tp <= bp => (tp, "```tool-action".len()),
-                (Some(_tp), Some(bp)) => (bp, "```bash-action".len()),
-                (Some(tp), None) => (tp, "```tool-action".len()),
-                (None, Some(bp)) => (bp, "```bash-action".len()),
-                (None, None) => {
-                    // No blocks found, add rest of content and finish
-                    result.push_str(remaining);
-                    break;
-                }
-            };
-
-            // Add content before the block
-            result.push_str(&remaining[..pos]);
-            // Skip the opening tag
-            remaining = &remaining[pos + pattern_len..];
-            // Now we're inside a block
-            in_block = true;
-        }
-    }
-
-    result
 }

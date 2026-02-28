@@ -7,6 +7,7 @@ use super::{Tool, ToolContext, ToolError, ToolOutput};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 // ============================================================
 // Read Tool
@@ -44,6 +45,10 @@ impl Tool for ReadTool {
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::FileOps
     }
 
     fn execute(
@@ -112,7 +117,7 @@ impl Tool for ReadTool {
         });
 
         // For display purposes, override content with just the summary
-        output.content_for_display = Some(display_summary);
+        output.content_for_display = Some(Arc::new(display_summary.into()));
 
         Ok(output)
     }
@@ -157,6 +162,10 @@ impl Tool for BashTool {
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::System
     }
 
     fn execute(
@@ -234,8 +243,11 @@ impl EditTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
             .string("file_path", "Path to the file to edit", true)
-            .string("old_text", "Exact text to find and replace", true)
-            .string("new_text", "Replacement text", true);
+            .string("old_text", "Exact text to find and replace (use with new_text)", false)
+            .string("new_text", "Replacement text (use with old_text)", false)
+            .integer("line_start", "Starting line number for line-based edit (0-indexed)", false)
+            .integer("line_end", "Ending line number for line-based edit (0-indexed)", false)
+            .string("new_content", "New content for line range (use with line_start/line_end)", false);
 
         Self { schema }
     }
@@ -251,12 +263,17 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Make surgical edits to files by finding exact text and replacing it. \
-        The old_text must match exactly. Use the read tool first to see file contents."
+        "Edit files using two modes: (1) String replacement: use old_text and new_text to replace exact text. \
+        (2) Line-based editing: use line_start, line_end, and new_content to replace a line range. \
+        Always read the file first to see its contents."
     }
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::FileOps
     }
 
     fn execute(
@@ -265,9 +282,6 @@ impl Tool for EditTool {
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         let file_path = params.get_required_str("file_path")?;
-        let old_text = params.get_required_str("old_text")?;
-        let new_text = params.get_required_str("new_text")?;
-
         let path = ctx.resolve_path(&file_path);
 
         if !path.exists() {
@@ -275,6 +289,53 @@ impl Tool for EditTool {
         }
 
         let content = fs::read_to_string(&path)?;
+
+        // Determine which mode to use: line-based or string replacement
+        let line_start = params.get_integer("line_start")?;
+        let line_end = params.get_integer("line_end")?;
+        let new_content = params.get_str("new_content")?;
+
+        // Line-based editing mode
+        if line_start.is_some() || line_end.is_some() || new_content.is_some() {
+            let start = line_start.unwrap_or(0) as usize;
+            let end = line_end.unwrap_or(start as i64) as usize;
+            let replacement = new_content.unwrap_or_default();
+
+            let lines: Vec<&str> = content.lines().collect();
+
+            if start >= lines.len() || end >= lines.len() {
+                return Ok(ToolOutput::text(format!(
+                    "Edit failed: line range {}-{} out of bounds (file has {} lines).",
+                    start, end, lines.len()
+                )));
+            }
+
+            if start > end {
+                return Ok(ToolOutput::text(format!(
+                    "Edit failed: line_start ({}) must be <= line_end ({})",
+                    start, end
+                )));
+            }
+
+            // Build new content with line range replaced
+            let mut new_lines: Vec<String> = lines[..start].iter().map(|s| s.to_string()).collect();
+            new_lines.push(replacement.clone());
+            new_lines.extend(lines[end + 1..].iter().map(|s| s.to_string()));
+
+            let new_content = new_lines.join("\n");
+            fs::write(&path, new_content)?;
+
+            let summary = format!("Edited {} (lines {}-{})", file_path, start, end);
+            return Ok(ToolOutput::text(format!(
+                "Successfully edited {} (replaced lines {}-{} with {} lines)",
+                file_path, start, end, replacement.lines().count()
+            ))
+            .with_summary_display(summary));
+        }
+
+        // String replacement mode (original)
+        let old_text = params.get_required_str("old_text")?;
+        let new_text = params.get_required_str("new_text")?;
 
         if !content.contains(&old_text) {
             return Ok(ToolOutput::text(
@@ -294,6 +355,128 @@ impl Tool for EditTool {
             file_path
         ))
         .with_summary_display(summary))
+    }
+}
+
+// ============================================================
+// File Info Tool
+// ============================================================
+
+#[allow(dead_code)]
+pub struct FileInfoTool {
+    schema: ToolSchema,
+}
+
+impl FileInfoTool {
+    pub fn new() -> Self {
+        let schema = ToolSchema::new()
+            .string("file_path", "Path to the file to get metadata for", true);
+
+        Self { schema }
+    }
+}
+
+impl Tool for FileInfoTool {
+    fn name(&self) -> &str {
+        "file_info"
+    }
+
+    fn label(&self) -> &str {
+        "File Metadata"
+    }
+
+    fn description(&self) -> &str {
+        "Get detailed file metadata including size, permissions, modification time, and type. \
+        Useful for understanding file properties without reading the entire content."
+    }
+
+    fn parameters(&self) -> &ToolSchema {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let file_path = params.get_required_str("file_path")?;
+        let path = ctx.resolve_path(&file_path);
+
+        if !path.exists() {
+            return Err(ToolError::PathNotFound(file_path));
+        }
+
+        let metadata = std::fs::metadata(&path)?;
+        let size = metadata.len();
+        let _modified = metadata.modified().ok();
+        let _perms = metadata.permissions();
+        let is_dir = path.is_dir();
+        let is_symlink = path.is_symlink();
+
+        // Format output as structured text
+        let mut output = format!("File: {}\n", file_path);
+        output.push_str(&format!("Type: {}\n",
+            if is_dir { "Directory" }
+            else if is_symlink { "Symlink" }
+            else { "Regular File" }
+        ));
+        output.push_str(&format!("Size: {} bytes\n", size));
+        output.push_str(&format!("Size (human): {}\n",
+            if size < 1024 { format!("{} B", size) }
+            else if size < 1024 * 1024 { format!("{:.1} KB", size as f64 / 1024.0) }
+            else if size < 1024 * 1024 * 1024 { format!("{:.1} MB", size as f64 / (1024.0 * 1024.0)) }
+            else { format!("{:.1} GB", size as f64 / (1024.0 * 1024.0 * 1024.0)) }
+        ));
+
+        // Format modification time in a simple format
+        if let Ok(modified) = path.metadata().and_then(|m| m.modified()) {
+            use std::time::UNIX_EPOCH;
+            if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                let secs = duration.as_secs();
+                // Simple date formatting
+                let days_since_epoch = secs / 86400;
+                let year = 1970 + (days_since_epoch / 365) as i32;
+                let day_of_year = (days_since_epoch % 365) as u32;
+                let month = (day_of_year / 30) + 1;
+                let day = (day_of_year % 30) + 1;
+                let hours = ((secs % 86400) / 3600) as u32;
+                let minutes = ((secs % 3600) / 60) as u32;
+                output.push_str(&format!("Modified: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n",
+                    year, month, day, hours, minutes, secs % 60));
+            }
+        }
+
+        // Get file extension
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("none");
+        output.push_str(&format!("Extension: {}\n", extension));
+
+        // MIME type hint
+        let mime_hint = match extension {
+            "rs" => "text/rust",
+            "py" => "text/python",
+            "js" => "text/javascript",
+            "ts" => "text/typescript",
+            "json" => "application/json",
+            "toml" => "text/toml",
+            "yaml" | "yml" => "text/yaml",
+            "md" => "text/markdown",
+            "txt" => "text/plain",
+            "html" => "text/html",
+            "css" => "text/css",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            _ => "application/octet-stream"
+        };
+        output.push_str(&format!("MIME type: {}\n", mime_hint));
+
+        let summary = format!("Info: {} ({} bytes)", file_path, size);
+        Ok(ToolOutput::text(output).with_summary_display(summary))
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::FileOps
     }
 }
 
@@ -333,6 +516,10 @@ impl Tool for WriteTool {
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::FileOps
     }
 
     fn execute(
@@ -404,6 +591,10 @@ impl Tool for GrepTool {
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::Search
     }
 
     fn execute(
@@ -512,6 +703,10 @@ impl Tool for FindTool {
 
     fn parameters(&self) -> &ToolSchema {
         &self.schema
+    }
+
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::Search
     }
 
     fn execute(
@@ -684,5 +879,410 @@ fn mime_type(path: &Path) -> String {
         Some("bmp") => "image/bmp".to_string(),
         Some("ico") => "image/x-icon".to_string(),
         _ => "application/octet-stream".to_string(),
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ============================================================
+    // ReadTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_read_tool_new() {
+        let tool = ReadTool::new();
+        
+        assert_eq!(tool.name(), "read");
+        assert_eq!(tool.label(), "Read File");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn test_read_tool_schema() {
+        let tool = ReadTool::new();
+        let schema = tool.parameters();
+        
+        assert!(schema.properties.iter().any(|p| p.name == "file_path"));
+    }
+
+    #[test]
+    fn test_read_tool_execute_valid_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Hello, World!").unwrap();
+        
+        let tool = ReadTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "file_path": "test.txt" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn test_read_tool_execute_missing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = ReadTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "file_path": "nonexistent.txt" }),
+            &ctx,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_tool_execute_with_offset() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Line 1\nLine 2\nLine 3").unwrap();
+        
+        let tool = ReadTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "file_path": "test.txt", "offset": 1 }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("Line 2"));
+    }
+
+    #[test]
+    fn test_read_tool_execute_with_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Line 1\nLine 2\nLine 3").unwrap();
+        
+        let tool = ReadTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "file_path": "test.txt", "limit": 1 }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("Line 1"));
+    }
+
+    // ============================================================
+    // BashTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_bash_tool_new() {
+        let tool = BashTool::new();
+        
+        assert_eq!(tool.name(), "bash");
+        assert_eq!(tool.label(), "Execute Bash");
+    }
+
+    #[test]
+    fn test_bash_tool_execute_simple() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = BashTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "command": "echo hello" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("hello"));
+    }
+
+    #[test]
+    fn test_bash_tool_execute_invalid_command() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = BashTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "command": "false" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bash_tool_missing_command_param() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = BashTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({}),
+            &ctx,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // WriteTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_write_tool_new() {
+        let tool = WriteTool::new();
+        
+        assert_eq!(tool.name(), "write");
+        assert_eq!(tool.label(), "Write File");
+    }
+
+    #[test]
+    fn test_write_tool_execute() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = WriteTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({
+                "file_path": "newfile.txt",
+                "content": "Hello, World!"
+            }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        
+        // Verify file was created
+        let file_path = temp_dir.path().join("newfile.txt");
+        assert!(file_path.exists());
+        
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "Hello, World!");
+    }
+
+    #[test]
+    fn test_write_tool_execute_missing_path() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = WriteTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "content": "Hello" }),
+            &ctx,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // GrepTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_grep_tool_new() {
+        let tool = GrepTool::new();
+        
+        assert_eq!(tool.name(), "grep");
+        assert_eq!(tool.label(), "Search Contents");
+    }
+
+    #[test]
+    fn test_grep_tool_execute() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Hello World\nTest Line").unwrap();
+        
+        let tool = GrepTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "pattern": "Hello", "file_path": "test.txt" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("Hello"));
+    }
+
+    #[test]
+    fn test_grep_tool_no_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Hello World").unwrap();
+        
+        let tool = GrepTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "pattern": "nonexistent", "file_path": "test.txt" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("No matches found") || output.content.is_empty());
+    }
+
+    #[test]
+    fn test_grep_tool_missing_params() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = GrepTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({}),
+            &ctx,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // FindTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_find_tool_new() {
+        let tool = FindTool::new();
+        
+        assert_eq!(tool.name(), "find");
+        assert_eq!(tool.label(), "Find Files");
+    }
+
+    #[test]
+    fn test_find_tool_execute() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("test1.txt"), "content").unwrap();
+        std::fs::write(temp_dir.path().join("test2.txt"), "content").unwrap();
+        
+        let tool = FindTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "pattern": "*.txt" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.content.contains("test1.txt"));
+        assert!(output.content.contains("test2.txt"));
+    }
+
+    #[test]
+    fn test_find_tool_no_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = FindTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({ "pattern": "*.nonexistent" }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+    }
+
+    // ============================================================
+    // EditTool Tests
+    // ============================================================
+
+    #[test]
+    fn test_edit_tool_new() {
+        let tool = EditTool::new();
+        
+        assert_eq!(tool.name(), "edit");
+        assert_eq!(tool.label(), "Edit File");
+    }
+
+    #[test]
+    fn test_edit_tool_execute() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "Hello World").unwrap();
+        
+        let tool = EditTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({
+                "file_path": "test.txt",
+                "old_text": "World",
+                "new_text": "Rust"
+            }),
+            &ctx,
+        );
+        
+        assert!(result.is_ok());
+        
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("Rust"));
+    }
+
+    #[test]
+    fn test_edit_tool_missing_params() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let tool = EditTool::new();
+        let ctx = ToolContext::new(temp_dir.path().to_path_buf());
+        
+        let result = tool.execute(
+            serde_json::json!({}),
+            &ctx,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    // ============================================================
+    // Helper Function Tests
+    // ============================================================
+
+    #[test]
+    fn test_mime_type_png() {
+        let path = Path::new("test.png");
+        assert_eq!(mime_type(path), "image/png");
+    }
+
+    #[test]
+    fn test_mime_type_jpg() {
+        let path = Path::new("test.jpg");
+        assert_eq!(mime_type(path), "image/jpeg");
+    }
+
+    #[test]
+    fn test_mime_type_unknown() {
+        let path = Path::new("test.xyz");
+        assert_eq!(mime_type(path), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_mime_type_no_extension() {
+        let path = Path::new("testfile");
+        assert_eq!(mime_type(path), "application/octet-stream");
     }
 }

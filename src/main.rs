@@ -1,10 +1,10 @@
-mod config;
-mod error;
-mod model;
-mod parser;
-mod tools;
-mod tui;
-mod tui_components;
+pub mod config;
+pub mod error;
+pub mod model;
+pub mod parser;
+pub mod tools;
+pub mod tui;
+pub mod tui_components;
 
 use clap::Parser;
 use config::Config;
@@ -44,7 +44,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_name = match &model_type {
         ModelType::OpenAI { model, .. } => model.clone(),
         ModelType::Anthropic => "claude".to_string(),
-        ModelType::Nim { model, .. } => model.clone(),
     };
 
     // Create tool registry
@@ -184,7 +183,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
 
             let mut cmd = Command::new("bash");
             cmd.arg("-c")
-                .arg(command)
+                .arg(&**command)
                 .env("PAGER", "cat")
                 .env("MANPAGER", "cat")
                 .env("LESS", "-R")
@@ -192,7 +191,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
                 .env("TQDM_DISABLE", "1");
 
             if let Some(dir) = workdir {
-                cmd.current_dir(dir);
+                cmd.current_dir(&**dir);
             }
 
             if let Some(env_vars) = env
@@ -214,7 +213,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
                 thread::spawn(move || {
                     let mut cmd = Command::new("bash");
                     cmd.arg("-c")
-                        .arg(&cmd_str)
+                        .arg(&*cmd_str)
                         .env("PAGER", "cat")
                         .env("MANPAGER", "cat")
                         .env("LESS", "-R")
@@ -222,7 +221,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
                         .env("TQDM_DISABLE", "1");
 
                     if let Some(dir) = &workdir_clone {
-                        cmd.current_dir(dir);
+                        cmd.current_dir(&**dir);
                     }
                     if let Some(env_vars) = &env_clone
                         && let Some(obj) = env_vars.as_object()
@@ -275,7 +274,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
         }
         Action::Tool { name, params } => match tool_registry.execute(name, params.clone()) {
             Ok(output) => {
-                let mut result = output.content;
+                let mut result = (*output.content).clone();
                 if !output.attachments.is_empty() {
                     result.push_str(&format!("\n[{} attachment(s)]", output.attachments.len()));
                 }
@@ -289,7 +288,7 @@ fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<Strin
             }
             Err(e) => Ok(format!("Tool error: {}", e)),
         },
-        Action::Response(response) => Ok(response.clone()),
+        Action::Response(response) => Ok(response.to_string()),
     }
 }
 
@@ -342,27 +341,35 @@ fn get_system_prompt(tools_description: &str) -> String {
         ## OUTPUT FORMAT (STRICT)\n\
         Your response MUST be in one of these two formats:\n\n\
         **Format 1 - Tool Call (for code tasks):**\n\
-        ```tool-action\n<tool_name>\n<json_params>\n```\n\
+        <codr_tool name=\"tool_name\">{{\"param\": \"value\"}}</codr_tool>\n\n\
         **Format 2 - Bash Command:**\n\
-        ```bash-action\n<command>\n```\n\
+        <codr_bash>command</codr_bash>\n\n\
         **Format 3 - Plain Text (only for questions/greetings):**\n\
         Just respond normally without any code blocks.\n\n\
         ## EXAMPLES\n\n\
-        User: List all Rust files\n\
-        Assistant: ```tool-action\nfind\n{{\"pattern\": \"*.rs\"}}\n```\n\n\
-        User: Read src/main.rs\n\
-        Assistant: ```tool-action\nread\n{{\"file_path\": \"src/main.rs\"}}\n```\n\n\
-        User: Search for \"parse\" in src/\n\
-        Assistant: ```tool-action\ngrep\n{{\"pattern\": \"parse\", \"path\": \"src\"}}\n```\n\n\
-        User: Run the tests\n\
-        Assistant: ```bash-action\ncargo test\n```\n\n\
-        User: Hello, how are you?\n\
+        User: List all Rust files\n\n\
+        Assistant: <codr_tool name=\"find\">{{\"pattern\": \"*.rs\"}}</codr_tool>\n\n\
+        User: Read src/main.rs\n\n\
+        Assistant: <codr_tool name=\"read\">{{\"file_path\": \"src/main.rs\"}}</codr_tool>\n\n\
+        User: Search for \"parse\" in src/\n\n\
+        Assistant: <codr_tool name=\"grep\">{{\"pattern\": \"parse\", \"path\": \"src\"}}</codr_tool>\n\n\
+        User: Explore the codebase\n\n\
+        Assistant: <codr_tool name=\"find\">{{\"pattern\": \"*.rs\"}}</codr_tool>\n\n\
+        (Then after seeing file list, read all important files):\n\
+        Assistant: <codr_tool name=\"read\">{{\"file_path\": \"src/main.rs\"}}</codr_tool>\n\
+        <codr_tool name=\"read\">{{\"file_path\": \"src/model.rs\"}}</codr_tool>\n\
+        <codr_tool name=\"read\">{{\"file_path\": \"src/parser.rs\"}}</codr_tool>\n\n\
+        User: Run the tests\n\n\
+        Assistant: <codr_bash>cargo test</codr_bash>\n\n\
+        User: Hello, how are you?\n\n\
         Assistant: Hello! I'm doing well, thank you. How can I help you today?\n\n\
         ## CRITICAL RULES\n\
         1. NO explanations before tool calls - output the block immediately\n\
         2. NO \"I will\" or \"Let me\" - just the tool call\n\
-        3. Wait for tool output before doing the next step\n\
-        4. Only use plain text for questions, greetings, or final answers",
+        3. When exploring codebases, read ALL relevant files - don't stop after one\n\
+        4. You can output MULTIPLE tool calls in one response (one per line)\n\
+        5. Continue making tool calls until the task is COMPLETE\n\
+        6. Only use plain text for questions, greetings, or final answers",
         tools = tools_description,
         project_context = if project_context.is_empty() { String::new() } else { format!("## Project Context\n\n{project_context}") }
     )

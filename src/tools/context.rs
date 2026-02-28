@@ -58,12 +58,6 @@ pub fn truncate_file(
     })
 }
 
-#[allow(dead_code)]
-pub fn estimate_tokens(text: &str) -> usize {
-    // Rough estimate: ~4 characters per token for English text
-    text.chars().count() / 4
-}
-
 // ============================================================
 // Path Resolution Utilities
 // ============================================================
@@ -75,12 +69,6 @@ pub fn resolve_path(cwd: &Path, path: &str) -> std::path::PathBuf {
     } else {
         cwd.join(p)
     }
-}
-
-#[allow(dead_code)]
-pub fn normalize_path(path: &Path) -> std::path::PathBuf {
-    // Use dunce to normalize paths on Windows (remove \\?\ prefix)
-    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 // ============================================================
@@ -105,26 +93,6 @@ pub fn build_walker(cwd: &Path, path: &str) -> ignore::Walk {
             .git_global(true)
             .build()
     }
-}
-
-#[allow(dead_code)]
-pub fn is_ignored(cwd: &Path, path: &Path) -> bool {
-    let walker = WalkBuilder::new(cwd)
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_global(true)
-        .build();
-
-    // Check if the path would be ignored
-    for entry in walker {
-        if let Ok(entry) = entry
-            && entry.path() == path
-        {
-            return true;
-        }
-    }
-    false
 }
 
 // ============================================================
@@ -212,50 +180,6 @@ pub fn find_project_root(start: &Path) -> std::path::PathBuf {
             _ => {
                 // Reached filesystem root, return original path
                 return start.to_path_buf();
-            }
-        }
-    }
-}
-
-// ============================================================
-// Line/Range Parsing
-// ============================================================
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct FileRange {
-    pub offset: usize,
-    pub limit: usize,
-}
-
-#[allow(dead_code)]
-impl FileRange {
-    pub fn parse(offset: Option<&str>, limit: Option<&str>) -> Result<Option<Self>, String> {
-        match (offset, limit) {
-            (None, None) => Ok(None),
-            (Some(o), Some(l)) => {
-                let offset = o
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid offset: {}", o))?;
-                let limit = l
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid limit: {}", l))?;
-                Ok(Some(Self { offset, limit }))
-            }
-            (Some(o), None) => {
-                let offset = o
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid offset: {}", o))?;
-                Ok(Some(Self {
-                    offset,
-                    limit: 5000,
-                }))
-            }
-            (None, Some(l)) => {
-                let limit = l
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid limit: {}", l))?;
-                Ok(Some(Self { offset: 0, limit }))
             }
         }
     }

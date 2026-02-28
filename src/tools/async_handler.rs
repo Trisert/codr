@@ -98,6 +98,7 @@ pub trait AsyncToolHandler: Send + Sync {
     ) -> Result<ToolOutput, ToolError>;
 
     /// Validate parameters before execution (optional override)
+    #[allow(clippy::result_large_err)]
     fn validate(&self, params: &Value) -> Result<Value, super::schema::ValidationError> {
         Ok(params.clone())
     }
@@ -142,6 +143,7 @@ impl AsyncToolRegistry {
 
     /// Validate parameters against tool schema
     #[allow(dead_code)]
+    #[allow(clippy::result_large_err)]
     pub fn validate(
         &self,
         name: &str,
@@ -272,12 +274,12 @@ impl Default for AsyncToolRegistry {
 pub fn create_async_coding_tools(cwd: PathBuf) -> AsyncToolRegistry {
     // Note: You'll need to implement AsyncToolHandler for your existing tools
     // This is a placeholder - the actual implementations would go in r#impl
-    let registry = AsyncToolRegistry::new(cwd);
+    
 
     // Register async handlers (to be implemented)
     // registry.register(std::sync::Arc::new(r#impl::AsyncReadTool::new()));
     // registry.register(std::sync::Arc::new(r#impl::AsyncBashTool::new()));
     // ...
 
-    registry
+    AsyncToolRegistry::new(cwd)
 }

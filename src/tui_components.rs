@@ -4,6 +4,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use std::sync::Arc;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -112,16 +113,16 @@ pub enum ApprovalState {
 #[derive(Clone, Debug)]
 pub struct PendingAction {
     #[allow(dead_code)]
-    pub action_type: String,
-    pub content: String,
+    pub action_type: Arc<str>,  // Shared, immutable
+    pub content: Arc<String>,  // Shared command content
 }
 
 // ── ChatMessage ──────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
+    pub role: Arc<str>,  // Shared, immutable (e.g., "user", "assistant")
+    pub content: Arc<String>,  // Shared, potentially large content
     #[allow(dead_code)]
     pub thinking: Option<String>,
     #[allow(dead_code)]
@@ -131,8 +132,8 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn new(role: &str, content: &str) -> Self {
         Self {
-            role: role.to_string(),
-            content: content.to_string(),
+            role: role.into(),
+            content: Arc::new(content.to_string()),
             thinking: None,
             timestamp: chrono_timestamp(),
         }
@@ -143,38 +144,28 @@ impl ChatMessage {
     }
     #[allow(dead_code)]
     pub fn assistant(content: &str) -> Self {
-        Self::new("assistant", content)
+        let cleaned = clean_tool_tags(content);
+        Self::new("assistant", &cleaned)
+    }
+
+    /// Create an assistant message with explicit thinking content
+    pub fn assistant_with_explicit_thinking(content: &str, thinking: Option<String>) -> Self {
+        let cleaned = clean_tool_tags(content);
+        Self {
+            role: "assistant".into(),
+            content: Arc::new(cleaned),
+            thinking,
+            timestamp: chrono_timestamp(),
+        }
     }
 
     #[allow(dead_code)]
     pub fn assistant_with_thinking(content: &str) -> Self {
         let (clean_content, thinking) = extract_thinking(content);
         Self {
-            role: "assistant".to_string(),
-            content: clean_content,
+            role: "assistant".into(),
+            content: Arc::new(clean_content),
             thinking,
-            timestamp: chrono_timestamp(),
-        }
-    }
-
-    pub fn assistant_with_thinking_and_content(content: &str, thinking: Option<String>) -> Self {
-        // Clean content by removing tool-action and bash-action blocks
-        let clean_content = clean_content(content);
-        Self {
-            role: "assistant".to_string(),
-            content: clean_content,
-            thinking,
-            timestamp: chrono_timestamp(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn clean_only(content: &str) -> Self {
-        let clean_content = clean_content(content);
-        Self {
-            role: "assistant".to_string(),
-            content: clean_content,
-            thinking: None,
             timestamp: chrono_timestamp(),
         }
     }
@@ -183,6 +174,8 @@ impl ChatMessage {
         Self::new("system", content)
     }
     pub fn action(content: &str) -> Self {
+        // Don't minify action content - it's already formatted (e.g., "bash: command")
+        // minify_xml is only needed for raw XML from LLM
         Self::new("action", content)
     }
     pub fn output(content: &str) -> Self {
@@ -196,14 +189,96 @@ impl ChatMessage {
     }
 }
 
-// ── Thinking Extraction ───────────────────────────────────────
+// ── Content Cleaning ───────────────────────────────────────────
 
-fn clean_content(content: &str) -> String {
-    let mut clean = content.to_string();
-    clean = remove_code_blocks(&clean, "tool-action");
-    clean = remove_code_blocks(&clean, "bash-action");
-    clean
+/// Remove codr tool call tags and thinking tags from content before displaying
+fn clean_tool_tags(content: &str) -> String {
+    let mut result = content.to_string();
+
+    // Remove <codr_tool>...</codr_tool> tags
+    while let Some(start) = result.find("<codr_tool") {
+        if let Some(end_tag) = result[start..].find("</codr_tool>") {
+            let end = start + end_tag + "</codr_tool>".len();
+            result.replace_range(start..end, "");
+        } else {
+            // No closing tag, remove from start to end
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove <codr_bash>...</codr_bash> tags
+    while let Some(start) = result.find("<codr_bash>") {
+        if let Some(end_tag) = result[start..].find("</codr_bash>") {
+            let end = start + end_tag + "</codr_bash>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove <thinking>...</thinking> tags
+    while let Some(start) = result.find("<thinking>") {
+        if let Some(end_tag) = result[start..].find("</thinking>") {
+            let end = start + end_tag + "</thinking>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    result.trim().to_string()
 }
+
+/// Clean content for conversation history (remove XML tags but preserve semantic meaning)
+/// This is called when adding LLM output to the conversation history for the next turn
+pub fn clean_for_conversation(content: &str) -> String {
+    let mut result = content.to_string();
+
+    // Remove <codr_tool name="XXX">params</codr_tool> tags entirely
+    while let Some(start) = result.find("<codr_tool") {
+        if let Some(end_tag) = result[start..].find("</codr_tool>") {
+            let end = start + end_tag + "</codr_tool>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove <codr_bash>command</codr_bash> tags entirely
+    while let Some(start) = result.find("<codr_bash>") {
+        if let Some(end_tag) = result[start..].find("</codr_bash>") {
+            let end = start + end_tag + "</codr_bash>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove <thinking>...</thinking> tags entirely
+    while let Some(start) = result.find("<thinking>") {
+        if let Some(end_tag) = result[start..].find("</thinking>") {
+            let end = start + end_tag + "</thinking>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Clean up extra whitespace that might result from tag removal
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
+// ── Thinking Extraction ───────────────────────────────────────
 
 #[allow(dead_code)]
 fn extract_thinking(content: &str) -> (String, Option<String>) {
@@ -235,37 +310,7 @@ fn extract_thinking(content: &str) -> (String, Option<String>) {
         }
     }
 
-    // Remove tool-action blocks (```tool-action ... ```)
-    clean_content = remove_code_blocks(&clean_content, "tool-action");
-
-    // Remove bash-action blocks (```bash-action ... ```)
-    clean_content = remove_code_blocks(&clean_content, "bash-action");
-
     (clean_content.trim().to_string(), thinking_content)
-}
-
-fn remove_code_blocks(content: &str, block_type: &str) -> String {
-    let start_pattern = format!("```{}", block_type);
-    let mut result = String::new();
-    let mut remaining = content;
-
-    while let Some(start) = remaining.find(&start_pattern) {
-        // Keep everything before the block
-        result.push_str(&remaining[..start]);
-
-        // Find the end of the block
-        let block_content = &remaining[start + start_pattern.len()..];
-        if let Some(end) = block_content.find("```") {
-            remaining = &block_content[end + 3..];
-        } else {
-            // No end found, skip the rest
-            remaining = "";
-            break;
-        }
-    }
-
-    result.push_str(remaining);
-    result.trim().to_string()
 }
 
 fn chrono_timestamp() -> String {
@@ -318,22 +363,55 @@ pub fn get_role_label(role: &str) -> &str {
     }
 }
 
+// ── Spacing System (following OpenCode design) ──────────────────
+// Tight: 0 lines (consecutive related items like tool calls)
+// Normal: 1 line (between different message types)
+// Loose: 2 lines (before user exchanges, major sections)
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum Spacing {
+    Tight,   // 0 blank lines - for consecutive tool/info messages
+    Normal,  // 1 blank line - between different message types
+    Loose,   // 2 blank lines - before user messages
+    None,    // No spacing - for first message or compact display
+}
+
 // ── Render a single ChatMessage into display Lines ───────────
 
-pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
+pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
     let t = &*THEME;
     let _style = style_role(&msg.role);
-    let prefix = role_prefix(&msg.role);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let prefix = role_prefix(msg.role.as_ref());
+    let mut lines: Vec<Line<'_>> = Vec::new();
     let markdown = MarkdownRenderer::new();
 
-    // Add subtle separator before assistant messages (but not first message)
-    // This creates better visual separation between exchanges
-    match msg.role.as_str() {
-        "assistant" => {
-            // Single blank line for spacing
-            lines.push(Line::from(""));
+    // Determine spacing based on role (following OpenCode's gap system)
+    let spacing = match &*msg.role {
+        "user" => Spacing::Loose,      // 2 lines before user (major exchange)
+        "assistant" => Spacing::Normal,  // 1 line before assistant content
+        "action" => Spacing::Tight,     // 0 lines (compact tool calls)
+        "info" => Spacing::Tight,       // 0 lines (compact info items)
+        "output" => Spacing::Normal,    // 1 line before output
+        "error" => Spacing::Normal,     // 1 line before error
+        _ => Spacing::None,
+    };
 
+    // Apply top spacing
+    match spacing {
+        Spacing::Loose => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+        }
+        Spacing::Normal => {
+            lines.push(Line::from(""));
+        }
+        Spacing::Tight | Spacing::None => {}
+    }
+
+    // Render message content
+    match &*msg.role {
+        "assistant" => {
             // Thinking content (if present) - displayed in italic
             if let Some(ref thinking) = msg.thinking {
                 let italic_style =
@@ -372,14 +450,10 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
                 }
             }
         }
-        "user" => {
-            // User messages: simple ">" prefix, no background, no top padding
-            // Just start directly with the content
-        }
         "action" => {
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), t.action),
-                Span::styled(msg.content.clone(), t.action),
+                Span::styled(&*msg.content, t.action),
             ]));
             return lines;
         }
@@ -405,9 +479,6 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
                 || msg.content.contains("No such file")
                 || msg.content.lines().count() <= 3;
             let is_file_content = has_code_patterns && !looks_like_command_output;
-
-            // Add subtle top spacing
-            lines.push(Line::from(""));
 
             if is_file_content {
                 // File content: clean, indented display
@@ -437,30 +508,25 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
                     }
                 }
             }
-            // Add subtle bottom spacing
-            lines.push(Line::from(""));
             return lines;
         }
         "error" => {
-            // More prominent error display with border
-            lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("⨯ ", t.error),
-                Span::styled(msg.content.clone(), t.error),
+                Span::styled("✕ ", t.error),
+                Span::styled(&*msg.content, t.error),
             ]));
             lines.push(Line::from(""));
             return lines;
         }
         "info" => {
-            lines.push(Line::from(vec![Span::styled(msg.content.to_string(), t.info)]));
-            lines.push(Line::from("")); // Add spacing after info
+            lines.push(Line::from(vec![Span::styled(&*msg.content, t.info)]));
             return lines;
         }
         _ => {}
     }
 
     // Render message content with padding
-    let content_lines = if msg.role == "assistant" {
+    let content_lines = if &*msg.role == "assistant" {
         markdown.render_with_width(&msg.content, width.saturating_sub(2))
     } else {
         wrap_to_width(&msg.content, width.saturating_sub(3))
@@ -472,7 +538,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     // Note: style is now applied inline per role type
 
     for (i, md_line) in content_lines.into_iter().enumerate() {
-        if msg.role == "user" {
+        if &*msg.role == "user" {
             // User messages: simple ">" prefix, no background box
             let prefix = "> ";
             let mut line_spans = vec![
@@ -487,7 +553,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
             }));
 
             lines.push(Line::from(line_spans));
-        } else if msg.role == "assistant" {
+        } else if &*msg.role == "assistant" {
             // Assistants get the `▪ ` prefix
             let line_prefix = if i == 0 { "▪ " } else { "  " };
             let mut line_spans = vec![
@@ -503,7 +569,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     }
 
     // Add bottom spacing for user messages (just one line)
-    if msg.role == "user" {
+    if &*msg.role == "user" {
         lines.push(Line::from(""));
     }
 
@@ -911,7 +977,17 @@ impl MarkdownRenderer {
         let mut header_spans = vec![Span::styled("│ ", separator_style)];
         for (idx, header) in table.headers.iter().enumerate() {
             let width = col_widths[idx];
-            let aligned = align_text(&header.content, width, header.alignment);
+            // Truncate header if needed (prevents wrapping)
+            let content = if header.content.width() > width {
+                let mut truncated = header.content.chars().take(width.saturating_sub(3)).collect::<String>();
+                if header.content.width() > width {
+                    truncated.push_str("...");
+                }
+                truncated
+            } else {
+                header.content.clone()
+            };
+            let aligned = align_text(&content, width, header.alignment);
             header_spans.push(Span::styled(aligned, header_style));
             header_spans.push(Span::styled(" │ ", separator_style));
         }
@@ -942,10 +1018,20 @@ impl MarkdownRenderer {
             for (idx, cell) in row.iter().enumerate() {
                 if idx < col_widths.len() {
                     let width = col_widths[idx];
-                    let aligned = align_text(&cell.content, width, cell.alignment);
-                    // Process inline markdown in cell content
-                    let processed = self.render_inline_span(&aligned, Style::default());
-                    row_spans.push(processed);
+                    // Truncate content if it exceeds column width (prevents wrapping)
+                    let content = if cell.content.width() > width {
+                        let mut truncated = cell.content.chars().take(width.saturating_sub(3)).collect::<String>();
+                        if cell.content.width() > width {
+                            truncated.push_str("...");
+                        }
+                        truncated
+                    } else {
+                        cell.content.clone()
+                    };
+                    let aligned = align_text(&content, width, cell.alignment);
+                    // Don't process inline markdown in tables - it breaks borders
+                    // Just use the aligned text with default style
+                    row_spans.push(Span::styled(aligned, Style::default().fg(Color::Rgb(220, 220, 220))));
                     row_spans.push(Span::styled(" │ ", separator_style));
                 }
             }
