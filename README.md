@@ -34,10 +34,8 @@ llama-server --model /path/to/your/model.gguf
 ### 2. Run codr
 
 ```bash
-# TUI mode (interactive chat)
-cargo run -- --chat
-# or shorthand
-cargo run -c
+# Interactive chat (TUI mode)
+cargo run --chat
 
 # Direct mode (single task)
 cargo run -- "List all rust files"
@@ -50,6 +48,7 @@ cargo run -- "List all rust files"
 | `Ctrl+S` | Send message |
 | `Ctrl+Q` | Quit |
 | `Shift+Tab` | Cycle roles (PLAN → SAFE → YOLO) |
+| `Ctrl+C` | Cancel agent (press twice to quit) |
 | `Ctrl+C` | Cancel agent (press twice to quit) |
 | Arrow keys | Navigate prompt history / move cursor |
 | `Enter` | Insert newline |
