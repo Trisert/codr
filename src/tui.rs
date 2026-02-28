@@ -355,8 +355,7 @@ enum AgentUpdate {
     StreamingChunk(Arc<str>),
     StreamingThinkingChunk(Arc<str>),
     ActionMessage(Arc<str>),
-    OutputMessage(Arc<String>),  // Changed from Arc<str> to Arc<String>
-    InfoMessage(Arc<String>),    // Changed from Arc<str> to Arc<String>
+    OutputMessage(Arc<String>),
     ErrorMessage(Arc<str>),
     SystemMessage(Arc<str>),
     UsageUpdate { input_tokens: u32, output_tokens: u32, cost: f64 },
@@ -498,6 +497,9 @@ async fn agent_loop(
 
             if let Action::Bash { command, .. } = &action {
                 let _ = tx.send(AgentUpdate::ActionMessage(format!("bash: {}", command).into()));
+            } else if let Action::Tool { name, params } = &action {
+                let params_str = params.to_string();
+                let _ = tx.send(AgentUpdate::ActionMessage(format!("{}: {}", name, params_str).into()));
             }
 
             // Execute the action
@@ -543,16 +545,10 @@ async fn agent_loop(
             };
 
             match result {
-                Ok((llm_output_content, ui_display)) => {
-                    // Send output to UI (use summary if available, otherwise full content)
-                    if let Action::Tool { name, .. } = &action {
-                        let display_text = ui_display.as_ref().unwrap_or(&llm_output_content);
-                        if name.as_ref() == "read" {
-                            let _ = tx.send(AgentUpdate::InfoMessage(display_text.clone()));
-                        } else {
-                            let _ = tx.send(AgentUpdate::OutputMessage(display_text.clone()));
-                        }
-                    } else if let Action::Bash { .. } = &action {
+                Ok((llm_output_content, _ui_display)) => {
+                    // Only ActionMessage is shown for tools (no summary output)
+                    // Bash commands still show output
+                    if let Action::Bash { .. } = &action {
                         let _ = tx.send(AgentUpdate::OutputMessage(llm_output_content.clone()));
                     }
 
@@ -910,13 +906,6 @@ impl App {
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
                         }
-                        AgentUpdate::InfoMessage(content) => {
-                            // Don't flush accumulator for info messages - keep them compact
-                            // This prevents gaps between consecutive info messages during tool execution
-                            self.messages.push(ChatMessage::info(&*content));
-                            self.scroll_state.scroll_to_bottom();
-                            should_clear_selection = true;
-                        }
                         AgentUpdate::ErrorMessage(content) => {
                             // Flush any accumulated content (with thinking) before showing error
                             let thinking = if !self.thinking_accumulator.is_empty() {
@@ -1003,12 +992,25 @@ impl App {
 
     /// Cancel the current processing.
     pub fn cancel_processing(&mut self) {
+        // Try to interrupt server-side generation (for llama.cpp)
+        let model = self.model.clone();
+        tokio::spawn(async move {
+            let _ = model.interrupt_generation().await;
+        });
+
         self.cancel_token.cancel();
         self.is_processing = false;
+        // Add a visible cancellation message
+        if !self.response_accumulator.is_empty() {
+            self.messages.push(ChatMessage::system("Request cancelled"));
+        }
         // Clear any pending response
         self.response_accumulator.clear();
+        self.thinking_accumulator.clear();
         // Drop the update_rx to stop processing further updates
         self.update_rx = None;
+        // Show a toast notification
+        self.show_toast("Cancelled".to_string());
     }
 
     // ── History Navigation Methods ───────────────────────────────────
@@ -1211,10 +1213,7 @@ impl App {
     }
 
     pub async fn continue_after_approval(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if !matches!(self.approval_state, ApprovalState::Pending) {
-            return Ok(());
-        }
-
+        // Take the pending action and current approval state
         let pending = self.pending_action.take();
         let approval = self.approval_state.clone();
         self.approval_state = ApprovalState::None;
@@ -1233,12 +1232,24 @@ impl App {
         match approval {
             ApprovalState::Approved => {
                 if let Some(PendingAction { content: cmd, .. }) = pending {
-                    let output = execute_bash_action(&*cmd)?;
-                    self.messages.push(ChatMessage::output(&output));
-                    conversation.push(Message {
-                        role: "user".into(),
-                        content: Arc::new(output),
-                    });
+                    // Execute bash command asynchronously to avoid blocking the event loop
+                    match execute_bash_action_async(&*cmd).await {
+                        Ok(output) => {
+                            self.messages.push(ChatMessage::output(&output));
+                            conversation.push(Message {
+                                role: "user".into(),
+                                content: Arc::new(output),
+                            });
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Error: {}", e);
+                            self.messages.push(ChatMessage::error(&error_msg));
+                            conversation.push(Message {
+                                role: "user".into(),
+                                content: Arc::new(error_msg),
+                            });
+                        }
+                    }
                 }
             }
             ApprovalState::Rejected => {
@@ -1279,6 +1290,37 @@ impl App {
         });
 
         Ok(())
+    }
+}
+
+async fn execute_bash_action_async(command: &str) -> Result<String, AgentError> {
+    if command.trim() == "exit" {
+        return Err(AgentError::Terminating(
+            "Agent requested to exit".to_string(),
+        ));
+    }
+
+    let output = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .env("PAGER", "cat")
+        .env("MANPAGER", "cat")
+        .env("LESS", "-R")
+        .env("PIP_PROGRESS_BAR", "off")
+        .env("TQDM_DISABLE", "1")
+        .output()
+        .await;
+
+    match output {
+        Ok(result) => {
+            let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&result.stderr).to_string();
+            Ok(format!("{}\n{}", stdout, stderr).trim().to_string())
+        }
+        Err(e) => Err(AgentError::Timeout(format!(
+            "Command execution failed: {}",
+            e
+        ))),
     }
 }
 
@@ -1324,7 +1366,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),    // conversation
-            Constraint::Length(1), // spacer
+            Constraint::Length(2), // spacer (2 lines for rainbow + blank line)
             Constraint::Length(2), // input
             Constraint::Length(1), // subtle footer
         ])
@@ -1339,14 +1381,13 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     // ── Footer bar ───────────────────────────────────────────
     draw_footer(f, app, zones[3]);
 
-    // ── Rainbow Working indicator (over input area) ─────────
+    // ── Rainbow Working indicator (in spacer above input) ─────────
     if app.is_processing {
-        draw_working_indicator(f, app, zones[2]);
+        draw_working_indicator(f, app, zones[1]);
     }
 }
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let t = &*THEME;
     // Clean up expired toasts
     app.cleanup_toasts();
 
@@ -1355,9 +1396,6 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Get role color
     let (role_r, role_g, role_b) = app.role.color();
-
-    // Left side: codr branding with model name and role
-    let left_text = format!("  codr {} [{}]", app.model_name, app.role.name());
 
     // Scroll indicators
     let scroll_pct = app.scroll_state.scroll_percentage();
@@ -1372,52 +1410,69 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         ""
     };
 
-    // Right side: token/cost info or processing indicator (with memory)
+    // Build footer spans incrementally to handle width constraints
+    let mut spans = Vec::new();
+
+    // Left: codr branding with model name
+    spans.push(Span::styled(
+        "codr ",
+        Style::default()
+            .fg(Color::Rgb(147, 197, 253))
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        &app.model_name,
+        Style::default()
+            .fg(Color::Rgb(147, 197, 253))
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    // Role badge
+    spans.push(Span::styled(" [", Style::default().fg(Color::Rgb(147, 197, 253))));
+    spans.push(Span::styled(
+        app.role.name(),
+        Style::default()
+            .fg(Color::Rgb(role_r, role_g, role_b))
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled("]", Style::default().fg(Color::Rgb(147, 197, 253))));
+
+    // Calculate remaining width for right side
+    let left_width: usize = spans.iter().map(|s| s.content.width()).sum();
+    let available_width = area.width.saturating_sub(left_width as u16 + 2) as usize;
+
+    // Build right side text
     let is_pending = matches!(app.approval_state, ApprovalState::Pending);
     let right_text = if is_pending || app.is_processing {
-        format!("{}MB {}  {}  ", memory_mb, scroll_indicator, lock_indicator)
+        format!("{}MB{}{}  ", memory_mb, scroll_indicator, lock_indicator)
     } else {
-        format!("in: {} out: {}  ${:.4}  {}MB{}{}  ",
+        format!("in:{} out:{} ${:.4}  {}MB{}{}  ",
             app.session_input_tokens, app.session_output_tokens, app.session_cost, memory_mb, scroll_indicator, lock_indicator)
     };
 
-    let padding = (area.width as usize).saturating_sub(left_text.len() + right_text.len());
+    // Add padding and right side (with truncation if needed)
+    let right_display = if right_text.width() > available_width {
+        // Truncate from the left (keep the cost info at the end)
+        let truncated: String = right_text.chars().rev()
+            .collect::<String>()
+            .chars().take(available_width.saturating_sub(3))
+            .collect::<String>()
+            .chars().rev()
+            .collect();
+        format!("...{}", truncated)
+    } else {
+        let padding = " ".repeat(available_width.saturating_sub(right_text.width()));
+        format!("{}{}", padding, right_text)
+    };
 
-    // Footer with subtle top border for visual separation
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "  codr ",
-            Style::default()
-                .fg(Color::Rgb(147, 197, 253)) // Sky blue branding
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            &app.model_name,
-            Style::default()
-                .fg(Color::Rgb(147, 197, 253))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " [",
-            Style::default().fg(Color::Rgb(147, 197, 253)),
-        ),
-        Span::styled(
-            app.role.name(),
-            Style::default()
-                .fg(Color::Rgb(role_r, role_g, role_b))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "]",
-            Style::default().fg(Color::Rgb(147, 197, 253)),
-        ),
-        Span::styled(" ".repeat(padding), t.dim),
-        Span::styled(
-            right_text,
-            Style::default().fg(Color::Rgb(163, 165, 170)),
-        ),
-    ]))
-    .style(Style::default().bg(Color::Rgb(28, 28, 30))); // Subtle footer background
+    // Build complete footer with right side
+    spans.push(Span::styled(
+        right_display,
+        Style::default().fg(Color::Rgb(163, 165, 170)),
+    ));
+
+    let footer = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Rgb(28, 28, 30)));
 
     f.render_widget(footer, area);
 
@@ -1476,15 +1531,13 @@ fn get_process_memory_mb() -> u64 {
     }
 }
 
-/// Draw rainbow "Working..." indicator floating over the input area
-fn draw_working_indicator(f: &mut Frame, app: &App, input_area: Rect) {
-    // Position indicator at the top line of the input area (over the prompt)
-    let y = input_area.y;
-
+/// Draw rainbow "Working..." indicator in the spacer above input
+fn draw_working_indicator(f: &mut Frame, app: &App, spacer_area: Rect) {
+    // Draw at the top of the spacer, leaving a blank line below
     let indicator_area = Rect {
-        x: input_area.x + 2,
-        y,
-        width: input_area.width.saturating_sub(4),
+        x: spacer_area.x,
+        y: spacer_area.y,
+        width: spacer_area.width,
         height: 1,
     };
 
@@ -1611,11 +1664,11 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
                         .collect::<Vec<_>>(),
                 )
             } else {
-                // Convert to owned static lines
+                // Convert to owned static lines, preserving style
                 Line::from(
                     line.spans
                         .iter()
-                        .map(|span| Span::raw(span.content.to_string()))
+                        .map(|span| Span::styled(span.content.to_string(), span.style))
                         .collect::<Vec<_>>(),
                 )
             }
@@ -1765,7 +1818,10 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 
     // Cursor positioning
     if !app.is_processing && !is_pending {
-        let cursor_offset = app.input.width().min(first_line_capacity);
+        // Calculate the display width of text up to cursor position
+        let text_before_cursor = &app.input[..app.cursor_position.min(app.input.len())];
+        let cursor_width = text_before_cursor.width();
+        let cursor_offset = cursor_width.min(first_line_capacity);
         if cursor_offset < first_line_capacity {
             // Cursor on first line
             f.set_cursor_position((
@@ -1774,7 +1830,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             ));
         } else {
             // Cursor on second line
-            let remaining_offset = app.input.width().saturating_sub(first_line_capacity);
+            let remaining_offset = cursor_width.saturating_sub(first_line_capacity);
             let second_line_capacity = available_width;
             if remaining_offset < second_line_capacity {
                 f.set_cursor_position((
@@ -1934,6 +1990,16 @@ async fn run_event_loop(
                             {
                                 app.start_processing();
                             }
+                        }
+
+                        // -- Move to start (Ctrl+A) --
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cursor_position = 0;
+                        }
+
+                        // -- Move to end (Ctrl+E) --
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cursor_position = app.input.len();
                         }
 
                         // -- Copy (Ctrl+O) --

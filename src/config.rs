@@ -17,22 +17,14 @@ enum ModelTypeConfig {
     Anthropic,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(default)]
 struct OpenAIConfig {
     base_url: String,
     model: String,
     api_key: Option<String>,
-}
-
-impl Default for OpenAIConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:8080".to_string(),
-            model: "default".to_string(),
-            api_key: None,
-        }
-    }
+    #[serde(default)]
+    extra: std::collections::HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -97,11 +89,39 @@ impl Config {
 
     /// Convert to ModelType
     pub fn to_model_type(&self) -> ModelType {
+        fn toml_to_json(v: &toml::Value) -> serde_json::Value {
+            match v {
+                toml::Value::String(s) => serde_json::Value::String(s.clone()),
+                toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+                toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+                toml::Value::Array(arr) => {
+                    serde_json::Value::Array(arr.iter().map(toml_to_json).collect())
+                }
+                toml::Value::Table(t) => serde_json::Value::Object(
+                    t.iter()
+                        .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                        .collect(),
+                ),
+                toml::Value::Datetime(_) => serde_json::Value::Null,
+            }
+        }
+
+        let extra: std::collections::HashMap<String, serde_json::Value> = self
+            .openai
+            .extra
+            .iter()
+            .map(|(k, v)| (k.clone(), toml_to_json(v)))
+            .collect();
+
         match &self.model {
             ModelTypeConfig::OpenAI => ModelType::OpenAI {
                 base_url: self.openai.base_url.clone(),
                 model: self.openai.model.clone(),
                 api_key: self.openai.api_key.clone(),
+                extra,
             },
             ModelTypeConfig::Anthropic => {
                 let api_key = self
@@ -140,9 +160,9 @@ mod tests {
         // Check default model type
         assert!(matches!(config.model, ModelTypeConfig::OpenAI));
 
-        // Check default OpenAI config
-        assert_eq!(config.openai.base_url, "http://localhost:8080");
-        assert_eq!(config.openai.model, "default");
+        // Check default OpenAI config (derived Default gives empty strings)
+        assert_eq!(config.openai.base_url, "");
+        assert_eq!(config.openai.model, "");
         assert!(config.openai.api_key.is_none());
 
         // Check default Anthropic config
@@ -159,9 +179,11 @@ mod tests {
                 base_url,
                 model,
                 api_key,
+                extra: _,
             } => {
-                assert_eq!(base_url, "http://localhost:8080");
-                assert_eq!(model, "default");
+                // derived Default gives empty strings
+                assert_eq!(base_url, "");
+                assert_eq!(model, "");
                 assert!(api_key.is_none());
             }
             _ => panic!("Expected OpenAI model type"),
@@ -319,8 +341,9 @@ api_key = "test-key"
     fn test_openai_config_default() {
         let config = OpenAIConfig::default();
 
-        assert_eq!(config.base_url, "http://localhost:8080");
-        assert_eq!(config.model, "default");
+        // derived Default gives empty strings
+        assert_eq!(config.base_url, "");
+        assert_eq!(config.model, "");
         assert!(config.api_key.is_none());
     }
 

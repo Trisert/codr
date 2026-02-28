@@ -1,6 +1,7 @@
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize, Serializer};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +19,7 @@ pub enum ModelType {
         base_url: String,
         model: String,
         api_key: Option<String>,
+        extra: std::collections::HashMap<String, serde_json::Value>,
     },
 }
 
@@ -26,6 +28,7 @@ pub struct Model {
     client: Client,
     config: ModelConfig,
     usage: Arc<Mutex<Usage>>,
+    base_url: Option<String>,  // Store base_url for interrupt requests
 }
 
 #[derive(Clone)]
@@ -113,11 +116,13 @@ pub enum ContentBlock {
 // OpenAI-Compatible API types (for llama-server)
 // ============================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub struct OpenAIRequest {
     pub model: String,
     pub messages: Vec<OpenAIMessage>,
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -146,15 +151,14 @@ pub struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIMessageResponse {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
     // Support for thinking/reasoning content from various APIs
     // DeepSeek: reasoning_content
     // Qwen/Ollama: thinking_content or thinking
-    #[serde(
-        alias = "reasoning_content",
-        alias = "thinking_content",
-        alias = "thinking"
-    )]
+    #[serde(default, alias = "reasoning_content")]
+    reasoning_content: Option<String>,
+    #[serde(default, alias = "thinking_content", alias = "thinking")]
     reasoning: Option<String>,
 }
 
@@ -164,6 +168,12 @@ struct OpenAIMessageResponse {
 
 impl Model {
     pub fn new(model_type: ModelType) -> Self {
+        // Extract base_url if available for interrupt requests
+        let base_url = match &model_type {
+            ModelType::OpenAI { base_url, .. } => Some(base_url.clone()),
+            ModelType::Anthropic => None,
+        };
+
         Self {
             client: Client::new(),
             config: ModelConfig { model_type },
@@ -172,7 +182,28 @@ impl Model {
                 completion_tokens: None,
                 cost_in_currency: None,
             })),
+            base_url,
         }
+    }
+
+    /// Interrupt the current generation on the server (for llama.cpp and compatible servers)
+    pub async fn interrupt_generation(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(base_url) = &self.base_url else {
+            return Ok(()); // No base_url available, nothing to interrupt
+        };
+
+        // Try llama.cpp's /interrupt endpoint
+        let interrupt_url = format!("{}/interrupt", base_url.trim_end_matches('/'));
+
+        // Send interrupt request with a short timeout (fire and forget)
+        let _ = self
+            .client
+            .post(&interrupt_url)
+            .timeout(std::time::Duration::from_millis(500))
+            .send()
+            .await;
+
+        Ok(())
     }
 
     pub fn get_usage(&self) -> Result<Usage, Box<dyn std::error::Error>> {
@@ -207,12 +238,12 @@ impl Model {
     }
 
     pub async fn query(&self, messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
-        let messages_with_reminder = Self::append_tool_reminder(messages);
+        let messages_with_reminder = self.append_tool_reminder(messages);
         
         match &self.config.model_type {
             ModelType::Anthropic => self.query_anthropic(&messages_with_reminder).await,
-            ModelType::OpenAI { base_url, model, api_key } => {
-                self.query_openai_compat(&messages_with_reminder, base_url, model, api_key.as_deref())
+            ModelType::OpenAI { base_url, model, api_key, extra } => {
+                self.query_openai_compat(&messages_with_reminder, base_url, model, api_key.as_deref(), extra)
                     .await
             }
         }
@@ -229,19 +260,20 @@ impl Model {
         F: FnMut(String) + Send,
         G: FnMut(String) + Send,
     {
-        let messages_with_reminder = Self::append_tool_reminder(messages);
+        let messages_with_reminder = self.append_tool_reminder(messages);
 
         match &self.config.model_type {
             ModelType::Anthropic => {
                 self.query_anthropic_streaming(&messages_with_reminder, on_text, on_thinking, cancel_token)
                     .await
             }
-            ModelType::OpenAI { base_url, model, api_key } => {
+            ModelType::OpenAI { base_url, model, api_key, extra } => {
                 self.query_openai_compat_streaming(
                     &messages_with_reminder,
                     base_url,
                     model,
                     api_key.as_deref(),
+                    extra,
                     on_text,
                     on_thinking,
                     cancel_token,
@@ -251,26 +283,30 @@ impl Model {
         }
     }
 
-    /// Appends a strict formatting reminder to the final user message to ensure generic models comply.
-    fn append_tool_reminder(messages: &[Message]) -> Vec<Message> {
+    /// Appends a formatting reminder to user messages based on model type
+    fn append_tool_reminder(&self, messages: &[Message]) -> Vec<Message> {
         let mut result = Vec::new();
         let mut reminder_added = false;
 
+        // Get model-specific reminder
+        let model_type_id = match &self.config.model_type {
+            ModelType::Anthropic => "anthropic",
+            ModelType::OpenAI { .. } => "openai-compatible",
+        };
+        let reminder = crate::prompt::get_tool_reminder(model_type_id);
+
         for msg in messages.iter() {
             if &*msg.role == "user" && !reminder_added {
-                let new_content = format!("{}{}", msg.content, "\n\n\
-                    IMPORTANT: Your response must use XML format for tool calls:\n\
-                    Use <codr_tool name=\"tool_name\">{\"param\": \"value\"}</codr_tool> for tools\n\
-                    Use <codr_bash>command</codr_bash> for bash commands\n\
-                    Examples:\n\
-                    <codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>\n\
-                    <codr_tool name=\"find\">{\"pattern\": \"*.rs\"}</codr_tool>\n\
-                    <codr_bash>ls -la</codr_bash>");
-                result.push(Message {
-                    role: msg.role.clone(),
-                    content: Arc::new(new_content),
-                });
-                reminder_added = true;
+                if let Some(ref rem) = reminder {
+                    let new_content = format!("{}\n\n{}", msg.content, rem);
+                    result.push(Message {
+                        role: msg.role.clone(),
+                        content: Arc::new(new_content),
+                    });
+                    reminder_added = true;
+                } else {
+                    result.push(msg.clone());
+                }
             } else {
                 result.push(msg.clone());
             }
@@ -367,6 +403,7 @@ impl Model {
         base_url: &str,
         model: &str,
         api_key: Option<&str>,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/v1/chat/completions", base_url);
 
@@ -382,6 +419,11 @@ impl Model {
             model: model.to_string(),
             messages: openai_messages,
             max_tokens: Some(4096),
+            extra: if extra.is_empty() {
+                None
+            } else {
+                Some(extra.clone())
+            },
         };
 
         let mut req = self
@@ -413,14 +455,16 @@ impl Model {
         // Combine reasoning + content if reasoning is present
         if let Some(choice) = openai_response.choices.first() {
             let message = &choice.message;
-            if let Some(ref reasoning) = message.reasoning {
+            let reasoning = message.reasoning.clone().or_else(|| message.reasoning_content.clone());
+            let content = message.content.as_deref().unwrap_or("");
+            if let Some(ref reasoning) = reasoning {
                 // Wrap reasoning in <thinking> tags for consistent extraction
                 Ok(format!(
                     "<thinking>{}</thinking>\n\n{}",
-                    reasoning, message.content
+                    reasoning, content
                 ))
             } else {
-                Ok(message.content.clone())
+                Ok(content.to_string())
             }
         } else {
             Ok(String::new())
@@ -471,17 +515,26 @@ impl Model {
             },
         };
 
-        let mut stream = self
+        // Wrap the response in an Option so we can explicitly drop it on cancellation
+        let response = self
             .client
             .post(ANTHROPIC_API_URL)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
+            .timeout(std::time::Duration::from_secs(60))
             .json(&request_body)
             .send()
-            .await?
-            .bytes_stream();
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(format!("Anthropic API error: {} - {}", status, error_text).into());
+        }
+
+        let mut stream = response.bytes_stream();
 
         let mut full_content = String::new();
         let mut thinking_content = String::new();
@@ -559,6 +612,7 @@ impl Model {
         base_url: &str,
         model: &str,
         api_key: Option<&str>,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
         mut on_text: F,
         mut on_thinking: G,
         cancel_token: &CancellationToken,
@@ -583,6 +637,8 @@ impl Model {
             messages: Vec<OpenAIMessage>,
             max_tokens: Option<u32>,
             stream: bool,
+            #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+            extra: std::collections::HashMap<String, serde_json::Value>,
         }
 
         let request_body = StreamingRequest {
@@ -590,6 +646,7 @@ impl Model {
             messages: openai_messages,
             max_tokens: Some(4096),
             stream: true,
+            extra: extra.clone(),
         };
 
         let mut req = self
@@ -601,7 +658,19 @@ impl Model {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
-        let mut stream = req.json(&request_body).send().await?.bytes_stream();
+        let response = req
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(format!("API error: {} - {}", status, error_text).into());
+        }
+
+        let mut stream = response.bytes_stream();
 
         let mut full_content = String::new();
         let mut thinking_content = String::new();
@@ -644,12 +713,9 @@ impl Model {
                     struct StreamingDelta {
                         #[serde(default)]
                         content: Option<String>,
-                        #[serde(
-                            default,
-                            alias = "reasoning_content",
-                            alias = "thinking_content",
-                            alias = "thinking"
-                        )]
+                        #[serde(default, alias = "reasoning_content")]
+                        reasoning_content: Option<String>,
+                        #[serde(default, alias = "thinking_content", alias = "thinking")]
                         reasoning: Option<String>,
                     }
 
@@ -672,7 +738,8 @@ impl Model {
 
                     if let Ok(response) = serde_json::from_str::<StreamResponse>(data) {
                         for choice in response.choices {
-                            if let Some(reasoning) = choice.delta.reasoning {
+                            let reasoning = choice.delta.reasoning.clone().or_else(|| choice.delta.reasoning_content.clone());
+                            if let Some(reasoning) = reasoning {
                                 thinking_content.push_str(&reasoning);
                                 on_thinking(reasoning);
                             }
@@ -767,10 +834,11 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: Some("test-key".to_string()),
+            extra: std::collections::HashMap::new(),
         };
-        
+
         match mt {
-            ModelType::OpenAI { base_url, model, api_key } => {
+            ModelType::OpenAI { base_url, model, api_key, extra: _ } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -785,12 +853,13 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: Some("test-key".to_string()),
+            extra: std::collections::HashMap::new(),
         };
-        
+
         let mt2 = mt1.clone();
-        
+
         match mt2 {
-            ModelType::OpenAI { base_url, model, api_key } => {
+            ModelType::OpenAI { base_url, model, api_key, extra: _ } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -1008,6 +1077,7 @@ mod tests {
                 }
             ],
             max_tokens: Some(2048),
+            extra: None,
         };
         
         let json = serde_json::to_string(&request).unwrap();

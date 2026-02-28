@@ -57,12 +57,24 @@ impl Tool for ReadTool {
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         let file_path = params.get_required_str("file_path")?;
+        
+        // Support both offset/limit and line_start/line_end (aliases from edit tool)
+        // line_start/line_end are treated as 1-indexed (user-friendly), convert to 0-indexed
+        let line_start = params.get_str("line_start")?.and_then(|s| s.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
+        let line_end = params.get_str("line_end")?.and_then(|s| s.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
+        
         let offset = params
             .get_str("offset")?
+            .or_else(|| line_start.map(|s| s.to_string()))
             .and_then(|s| s.parse::<usize>().ok());
-        let limit = params
-            .get_str("limit")?
-            .and_then(|s| s.parse::<usize>().ok());
+            
+        // If line_end is provided with line_start, compute limit from range
+        // Otherwise use limit directly
+        let limit = if let (Some(start), Some(end)) = (line_start, line_end) {
+            Some(end.saturating_sub(start) + 1)
+        } else {
+            params.get_str("limit")?.and_then(|s| s.parse::<usize>().ok())
+        };
 
         let path = ctx.resolve_path(&file_path);
 
@@ -105,7 +117,13 @@ impl Tool for ReadTool {
         )?;
 
         // Create display summary for TUI (minimal, clean)
-        let display_summary = format!("Reading {}", file_path);
+        let display_summary = if let (Some(off), Some(lim)) = (offset, limit) {
+            format!("Reading {}:{}-{}", file_path, off + 1, off + lim)
+        } else if let Some(off) = offset {
+            format!("Reading {}:{}-", file_path, off + 1)
+        } else {
+            format!("Reading {}", file_path)
+        };
 
         // Full content goes to LLM, but we mark it with metadata for clean TUI display
         let mut output = ToolOutput::text(result.content).with_metadata(super::OutputMetadata {
@@ -746,7 +764,7 @@ impl Tool for FindTool {
                 let mut sorted = matches;
                 sorted.sort();
                 let content = sorted.join("\n");
-                let summary = format!("Found {} files matching '{}'", sorted.len(), pattern);
+                let summary = format!("Glob '{}' ({} found)", pattern, sorted.len());
                 Ok(ToolOutput::text(content)
                     .with_metadata(super::OutputMetadata {
                         display_summary: Some(summary.clone()),
@@ -755,7 +773,7 @@ impl Tool for FindTool {
                     .with_summary_display(summary))
             }
             _ => {
-                let summary = "No files found".to_string();
+                let summary = format!("glob '{}' (0 found)", pattern);
                 Ok(ToolOutput::text("No files found".to_string())
                     .with_metadata(super::OutputMetadata {
                         display_summary: Some(summary.clone()),

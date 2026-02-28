@@ -332,15 +332,38 @@ fn parse_single_tool_call(content: &str) -> Option<Action> {
     None
 }
 
+/// Strip thinking blocks from content to avoid interference with XML parsing
+fn strip_thinking_blocks(content: &str) -> String {
+    let mut result = content.to_string();
+
+    // Remove <thinking>...</thinking> blocks (Claude format)
+    while let Some(start) = result.find("<thinking>") {
+        if let Some(end) = result[start..].find("</thinking>") {
+            let end = start + end + "</thinking>".len();
+            result.replace_range(start..end, "");
+        } else {
+            break;
+        }
+    }
+
+    // TODO: Add Qwen/Ollama thinking block removal when tag format is known
+    // The previous implementation had missing/empty tag names causing infinite loop
+
+    result
+}
+
 /// Parse all tool calls from a response
 fn parse_all_tool_calls(content: &str) -> Vec<Action> {
     let mut actions = Vec::new();
+
+    // Remove thinking blocks to avoid interference with XML parsing
+    let content = strip_thinking_blocks(content);
 
     // Regex patterns for various formats
 
     // 0. XML format: <codr_tool name="...">...</codr_tool>
     let xml_tool_re = Regex::new(r#"(?s)<codr_tool\s+name="([^"]+)">.*?</codr_tool>"#).unwrap();
-    for cap in xml_tool_re.captures_iter(content) {
+    for cap in xml_tool_re.captures_iter(&content) {
         if let Some(name) = cap.get(1)
             && let Some(body) = cap.get(0) {
                 let body_content = body.as_str();
@@ -369,7 +392,7 @@ fn parse_all_tool_calls(content: &str) -> Vec<Action> {
 
     // 0b. XML format: <codr_bash>...</codr_bash>
     let xml_bash_re = Regex::new(r"(?s)<codr_bash>(.*?)</codr_bash>").unwrap();
-    for cap in xml_bash_re.captures_iter(content) {
+    for cap in xml_bash_re.captures_iter(&content) {
         if let Some(cmd) = cap.get(1) {
             let command = cmd.as_str().trim();
             if !command.is_empty() {
@@ -388,7 +411,7 @@ fn parse_all_tool_calls(content: &str) -> Vec<Action> {
 
     // 1. Standard tool-action blocks: ```tool-action\n...\n```
     let tool_re = Regex::new(r"(?s)```\s*tool-action\s*\n(.*?)\n```").unwrap();
-    for cap in tool_re.captures_iter(content) {
+    for cap in tool_re.captures_iter(&content) {
         if let Some(action) = parse_single_tool_call(cap.get(1).unwrap().as_str())
             && !actions.iter().any(|a| action_equals(a, &action)) {
                 actions.push(action);
@@ -397,7 +420,7 @@ fn parse_all_tool_calls(content: &str) -> Vec<Action> {
 
     // 2. Bash-action blocks: ```bash-action\n...\n```
     let bash_re = Regex::new(r"(?s)```\s*bash-action\s*\n(.*?)\n```").unwrap();
-    for cap in bash_re.captures_iter(content) {
+    for cap in bash_re.captures_iter(&content) {
         let action = parse_bash_action(cap.get(1).unwrap().as_str());
         if !actions.iter().any(|a| action_equals(a, &action)) {
             actions.push(action);
@@ -406,7 +429,7 @@ fn parse_all_tool_calls(content: &str) -> Vec<Action> {
 
     // 5. Try to find JSON array of tool calls: [{"name": "...", "arguments": {...}}, ...]
     if actions.is_empty()
-        && let Ok(value) = serde_json::from_str::<Value>(content)
+        && let Ok(value) = serde_json::from_str::<Value>(&content)
             && let Some(arr) = value.as_array() {
                 for item in arr {
                     if let Some(action) = parse_single_tool_call(&item.to_string()) {
@@ -419,6 +442,7 @@ fn parse_all_tool_calls(content: &str) -> Vec<Action> {
 }
 
 /// Check if two actions are equivalent (for deduplication)
+/// Uses semantic comparison for tool params to handle JSON formatting differences
 fn action_equals(a: &Action, b: &Action) -> bool {
     match (a, b) {
         (
@@ -430,10 +454,24 @@ fn action_equals(a: &Action, b: &Action) -> bool {
                 name: n2,
                 params: p2,
             },
-        ) => n1 == n2 && p1 == p2,
+        ) => {
+            if n1 != n2 {
+                return false;
+            }
+            // Compare params semantically by converting to canonical JSON
+            // This handles whitespace and formatting differences
+            canonical_json_eq(p1, p2)
+        }
         (Action::Bash { command: c1, .. }, Action::Bash { command: c2, .. }) => c1 == c2,
         _ => false,
     }
+}
+
+/// Compare two JSON values semantically by converting to canonical form
+fn canonical_json_eq(a: &Value, b: &Value) -> bool {
+    // Convert both to compact JSON strings and compare
+    // This normalizes whitespace, key ordering (for objects), etc.
+    serde_json::to_string(a).ok() == serde_json::to_string(b).ok()
 }
 
 /// Check if all actions are read-only (can be parallelized)
@@ -925,10 +963,22 @@ ls -la
         let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
 <codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>"#;
         let result = parse_actions(input);
-        
+
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.actions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_actions_deduplication_different_formatting() {
+        // Same action with different JSON formatting should be deduplicated
+        let input = r#"<codr_tool name="read">{"file_path":"src/main.rs","line_start":1}</codr_tool>
+<codr_tool name="read">{ "file_path": "src/main.rs", "line_start": 1 }</codr_tool>"#;
+        let result = parse_actions(input);
+
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.actions.len(), 1, "Actions with different formatting should be deduplicated");
     }
 
     #[test]

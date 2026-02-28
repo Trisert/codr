@@ -218,14 +218,17 @@ fn clean_tool_tags(content: &str) -> String {
         }
     }
 
-    // Remove <thinking>...</thinking> tags
-    while let Some(start) = result.find("<thinking>") {
-        if let Some(end_tag) = result[start..].find("</thinking>") {
-            let end = start + end_tag + "</thinking>".len();
-            result.replace_range(start..end, "");
-        } else {
-            result.truncate(start);
-            break;
+    // Remove thinking tags
+    let thinking_tags = [("<thinking>", "</thinking>"), ("<think>", "</think>")];
+    for (start_tag, end_tag) in thinking_tags {
+        while let Some(start) = result.find(start_tag) {
+            if let Some(end_offset) = result[start..].find(end_tag) {
+                let end = start + end_offset + end_tag.len();
+                result.replace_range(start..end, "");
+            } else {
+                result.truncate(start);
+                break;
+            }
         }
     }
 
@@ -259,14 +262,17 @@ pub fn clean_for_conversation(content: &str) -> String {
         }
     }
 
-    // Remove <thinking>...</thinking> tags entirely
-    while let Some(start) = result.find("<thinking>") {
-        if let Some(end_tag) = result[start..].find("</thinking>") {
-            let end = start + end_tag + "</thinking>".len();
-            result.replace_range(start..end, "");
-        } else {
-            result.truncate(start);
-            break;
+    // Remove thinking tags entirely
+    let thinking_tags = [("<thinking>", "</thinking>"), ("<think>", "</think>")];
+    for (start_tag, end_tag) in thinking_tags {
+        while let Some(start) = result.find(start_tag) {
+            if let Some(end_offset) = result[start..].find(end_tag) {
+                let end = start + end_offset + end_tag.len();
+                result.replace_range(start..end, "");
+            } else {
+                result.truncate(start);
+                break;
+            }
         }
     }
 
@@ -287,10 +293,7 @@ fn extract_thinking(content: &str) -> (String, Option<String>) {
     // - Qwen and others:
     let thinking_patterns = [
         ("<thinking>", "</thinking>"),
-        (
-            "
-", "",
-        ),
+        ("<think>", "</think>"),
     ];
 
     let mut clean_content = content.to_string();
@@ -343,10 +346,10 @@ pub fn style_role(role: &str) -> Style {
 pub fn role_prefix(role: &str) -> &'static str {
     match role {
         "user" => "",
-        "assistant" => "▪ ",  // More refined than "› "
-        "action" => "⟳ ",    // Keep the cyclic arrow for actions
+        "assistant" => "▪ ",
+        "action" => "",
         "output" => "  ",
-        "error" => "✕ ",     // Cleaner than "⨯ "
+        "error" => "✕ ",
         _ => "",
     }
 }
@@ -373,7 +376,6 @@ pub fn get_role_label(role: &str) -> &str {
 enum Spacing {
     Tight,   // 0 blank lines - for consecutive tool/info messages
     Normal,  // 1 blank line - between different message types
-    Loose,   // 2 blank lines - before user messages
     None,    // No spacing - for first message or compact display
 }
 
@@ -388,21 +390,17 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
 
     // Determine spacing based on role (following OpenCode's gap system)
     let spacing = match &*msg.role {
-        "user" => Spacing::Loose,      // 2 lines before user (major exchange)
-        "assistant" => Spacing::Normal,  // 1 line before assistant content
-        "action" => Spacing::Tight,     // 0 lines (compact tool calls)
-        "info" => Spacing::Tight,       // 0 lines (compact info items)
-        "output" => Spacing::Normal,    // 1 line before output
-        "error" => Spacing::Normal,     // 1 line before error
+        "user" => Spacing::Normal,       // 1 line - half blank before user
+        "assistant" => Spacing::Normal,   // 1 line - half blank after thinking
+        "action" => Spacing::Tight,      // 0 lines - no gap between sequential tool calls
+        "info" => Spacing::Tight,        // 0 lines - no gap between sequential tool calls
+        "output" => Spacing::Tight,      // 0 lines - no gap between action and output
+        "error" => Spacing::Normal,       // 1 line before error
         _ => Spacing::None,
     };
 
     // Apply top spacing
     match spacing {
-        Spacing::Loose => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(""));
-        }
         Spacing::Normal => {
             lines.push(Line::from(""));
         }
@@ -427,7 +425,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
                         if i == 0 {
                             lines.push(Line::from(vec![
                                 Span::styled("▪ ", t.dim),
-                                Span::styled("Thinking: ", t.dim.add_modifier(Modifier::BOLD)),
+                                Span::styled("Thinking: ", Style::default().fg(Color::Rgb(92, 92, 97)).add_modifier(Modifier::BOLD | Modifier::ITALIC)),
                                 Span::styled(wrapped_line, italic_style),
                             ]));
                         } else {
@@ -448,6 +446,8 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
                         }
                     }
                 }
+                // Add spacing after thinking
+                lines.push(Line::from(""));
             }
         }
         "action" => {
@@ -519,7 +519,10 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
             return lines;
         }
         "info" => {
-            lines.push(Line::from(vec![Span::styled(&*msg.content, t.info)]));
+            lines.push(Line::from(vec![
+                Span::styled("-> ", t.info),
+                Span::styled(&*msg.content, t.info),
+            ]));
             return lines;
         }
         _ => {}
@@ -539,11 +542,10 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
 
     for (i, md_line) in content_lines.into_iter().enumerate() {
         if &*msg.role == "user" {
-            // User messages: simple ">" prefix, no background box
+            // User messages: simple ">" prefix
             let prefix = "> ";
             let mut line_spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::Rgb(147, 197, 253)).add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
             ];
 
             // Add content spans with soft white color
@@ -568,11 +570,7 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
         }
     }
 
-    // Add bottom spacing for user messages (just one line)
-    if &*msg.role == "user" {
-        lines.push(Line::from(""));
-    }
-
+    // No bottom spacing - let the next message's top spacing handle it
     lines
 }
 
@@ -1063,7 +1061,8 @@ impl MarkdownRenderer {
     fn render_code_block(&self, code: &str, language: &str) -> Vec<Line<'static>> {
         let border_color = Color::Rgb(82, 82, 92);
         let border_style = Style::default().fg(border_color);
-        let _bg_style = Style::default().bg(Color::Rgb(36, 36, 40));
+        let bg_color = Color::Rgb(36, 36, 40);
+        let bg_style = Style::default().bg(bg_color);
 
         let mut result = Vec::new();
 
@@ -1081,25 +1080,31 @@ impl MarkdownRenderer {
             Span::styled(top_line.clone(), border_style),
             Span::styled(
                 "─".repeat(80usize.saturating_sub(top_line.len())),
-                border_style.bg(Color::Rgb(36, 36, 40)),
+                bg_style,
             ),
         ]));
 
-        // Syntax-highlighted content
+        // Syntax-highlighted content - fill remaining width with background
         let highlighted = self.highlight_code(code, language);
         for line in highlighted {
-            let mut spans = vec![Span::styled("│ ", border_style.bg(Color::Rgb(36, 36, 40)))];
+            // Calculate line content width
+            let content_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            let padding = 80usize.saturating_sub(content_width + 2); // 2 for "│ "
+
+            let mut spans = vec![Span::styled("│ ", bg_style)];
             spans.extend(line.spans.into_iter().map(|mut s| {
-                s.style = s.style.bg(Color::Rgb(36, 36, 40));
+                s.style = s.style.bg(bg_color);
                 s
             }));
+            // Add padding span to extend background to full width
+            spans.push(Span::styled(" ".repeat(padding), bg_style));
             result.push(Line::from(spans));
         }
 
         // Bottom border
         result.push(Line::from(Span::styled(
             "└────────────────────────────────────────────────────────────────────────────────",
-            border_style.bg(Color::Rgb(36, 36, 40)),
+            bg_style,
         )));
 
         // Add spacing after code block

@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod model;
 pub mod parser;
+pub mod prompt;
 pub mod tools;
 pub mod tui;
 pub mod tui_components;
@@ -11,6 +12,7 @@ use config::Config;
 use error::AgentError;
 use model::{Model, ModelType};
 use parser::{Action, parse_actions};
+use prompt::{build_system_prompt, get_model_type_identifier, get_recommended_style, PromptStyle};
 use tools::{ToolRegistry, create_coding_tools};
 
 /// codr - AI coding agent harness
@@ -57,8 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if use_tui {
         // TUI mode (interactive chat - default)
+        let model_type_id = get_model_type_identifier(&model_type);
+        let prompt_style = get_recommended_style(model_type_id);
+        let system_prompt = build_system_prompt(
+            &tools_description,
+            &load_project_context().unwrap_or_default(),
+            prompt_style,
+        );
         let mut app = tui::App::new(model, tool_registry, model_name, cli.yolo);
-        app.set_system_prompt(&get_system_prompt(&tools_description));
+        app.set_system_prompt(&system_prompt);
 
         // If task provided, use it as initial message
         if !cli.task.is_empty() {
@@ -76,7 +85,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error: --direct mode requires a task to execute");
             std::process::exit(1);
         }
-        run_direct(model, &tool_registry, &tools_description, &initial_task).await?;
+        let model_type_id = get_model_type_identifier(&model_type);
+        let prompt_style = get_recommended_style(model_type_id);
+        let project_context = load_project_context().unwrap_or_default();
+        run_direct(
+            model,
+            &tool_registry,
+            &tools_description,
+            &project_context,
+            prompt_style,
+            &initial_task,
+        )
+        .await?;
     }
 
     Ok(())
@@ -90,11 +110,14 @@ async fn run_direct(
     model: Model,
     tool_registry: &ToolRegistry,
     tools_description: &str,
+    project_context: &str,
+    prompt_style: PromptStyle,
     initial_task: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize messages with system prompt and user task
+    let system_prompt = build_system_prompt(tools_description, project_context, prompt_style);
     let mut messages = model.create_messages(vec![
-        ("system", &get_system_prompt(tools_description)),
+        ("system", &system_prompt),
         ("user", initial_task),
     ]);
 
@@ -328,49 +351,4 @@ fn load_project_context() -> Option<String> {
         .join("\n");
 
     Some(cleaned)
-}
-
-fn get_system_prompt(tools_description: &str) -> String {
-    // Load project-specific context if available
-    let project_context = load_project_context().unwrap_or_default();
-
-    format!(
-        "You are codr, a coding assistant. You have tools to inspect and modify code.\n\n\
-        {tools}\n\n\
-        {project_context}\n\n\
-        ## OUTPUT FORMAT (STRICT)\n\
-        Your response MUST be in one of these two formats:\n\n\
-        **Format 1 - Tool Call (for code tasks):**\n\
-        <codr_tool name=\"tool_name\">{{\"param\": \"value\"}}</codr_tool>\n\n\
-        **Format 2 - Bash Command:**\n\
-        <codr_bash>command</codr_bash>\n\n\
-        **Format 3 - Plain Text (only for questions/greetings):**\n\
-        Just respond normally without any code blocks.\n\n\
-        ## EXAMPLES\n\n\
-        User: List all Rust files\n\n\
-        Assistant: <codr_tool name=\"find\">{{\"pattern\": \"*.rs\"}}</codr_tool>\n\n\
-        User: Read src/main.rs\n\n\
-        Assistant: <codr_tool name=\"read\">{{\"file_path\": \"src/main.rs\"}}</codr_tool>\n\n\
-        User: Search for \"parse\" in src/\n\n\
-        Assistant: <codr_tool name=\"grep\">{{\"pattern\": \"parse\", \"path\": \"src\"}}</codr_tool>\n\n\
-        User: Explore the codebase\n\n\
-        Assistant: <codr_tool name=\"find\">{{\"pattern\": \"*.rs\"}}</codr_tool>\n\n\
-        (Then after seeing file list, read all important files):\n\
-        Assistant: <codr_tool name=\"read\">{{\"file_path\": \"src/main.rs\"}}</codr_tool>\n\
-        <codr_tool name=\"read\">{{\"file_path\": \"src/model.rs\"}}</codr_tool>\n\
-        <codr_tool name=\"read\">{{\"file_path\": \"src/parser.rs\"}}</codr_tool>\n\n\
-        User: Run the tests\n\n\
-        Assistant: <codr_bash>cargo test</codr_bash>\n\n\
-        User: Hello, how are you?\n\n\
-        Assistant: Hello! I'm doing well, thank you. How can I help you today?\n\n\
-        ## CRITICAL RULES\n\
-        1. NO explanations before tool calls - output the block immediately\n\
-        2. NO \"I will\" or \"Let me\" - just the tool call\n\
-        3. When exploring codebases, read ALL relevant files - don't stop after one\n\
-        4. You can output MULTIPLE tool calls in one response (one per line)\n\
-        5. Continue making tool calls until the task is COMPLETE\n\
-        6. Only use plain text for questions, greetings, or final answers",
-        tools = tools_description,
-        project_context = if project_context.is_empty() { String::new() } else { format!("## Project Context\n\n{project_context}") }
-    )
 }
