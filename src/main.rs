@@ -1,5 +1,8 @@
+pub mod commands;
 pub mod config;
 pub mod error;
+pub mod fuzzy;
+pub mod logo;
 pub mod model;
 pub mod parser;
 pub mod prompt;
@@ -13,7 +16,7 @@ use error::AgentError;
 use model::{Model, ModelType};
 use parser::{Action, parse_actions};
 use prompt::{build_system_prompt, get_model_type_identifier, get_recommended_style, PromptStyle};
-use tools::{ToolRegistry, create_coding_tools};
+use tools::{ToolRegistry, create_coding_tools, Role};
 
 /// codr - AI coding agent harness
 #[derive(Parser, Debug)]
@@ -123,8 +126,14 @@ async fn run_direct(
 
     // Main agent loop - exits when a plain text response is received
     'agent_loop: loop {
-        // Query the LM
-        let lm_output = model.query(&messages).await?;
+        // Use native tool calling if the model supports it (direct mode uses Yolo role)
+        let lm_output = if model.supports_native_tools() {
+            let tools_for_role = tool_registry.get_tools_for_role(Role::Yolo);
+            let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
+            model.query_with_tools(&messages, &tools_refs).await?
+        } else {
+            model.query(&messages).await?
+        };
         println!("LM output:\n{}", lm_output);
         println!("\n{}", "─".repeat(60));
 

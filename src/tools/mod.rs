@@ -298,26 +298,40 @@ impl From<&str> for ToolError {
 
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    tool_map: std::collections::HashMap<String, usize>,
     cwd: std::path::PathBuf,
+    descriptions_cache: std::sync::RwLock<Option<String>>,
+    descriptions_for_role_cache: std::sync::RwLock<std::collections::HashMap<Role, String>>,
 }
 
 impl ToolRegistry {
     pub fn new(cwd: std::path::PathBuf) -> Self {
         Self {
             tools: Vec::new(),
+            tool_map: std::collections::HashMap::new(),
             cwd,
+            descriptions_cache: std::sync::RwLock::new(None),
+            descriptions_for_role_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) -> &mut Self {
+        let idx = self.tools.len();
+        self.tool_map.insert(tool.name().to_string(), idx);
         self.tools.push(tool);
+        self.invalidate_cache();
         self
     }
 
+    fn invalidate_cache(&mut self) {
+        *self.descriptions_cache.write().unwrap() = None;
+        self.descriptions_for_role_cache.write().unwrap().clear();
+    }
+
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
+        self.tool_map
+            .get(name)
+            .and_then(|&idx| self.tools.get(idx))
             .map(|t| t.as_ref())
     }
 
@@ -510,61 +524,51 @@ impl ToolRegistry {
         results.into_iter().map(|(_, r)| r).collect()
     }
 
-    /// Get tool descriptions for AI context, organized by category
+    /// Get tool descriptions for AI context, organized by category (cached)
     pub fn descriptions(&self) -> String {
-        let mut by_category: std::collections::HashMap<ToolCategory, Vec<&str>> =
-            std::collections::HashMap::new();
-
-        for tool in &self.tools {
-            by_category
-                .entry(tool.category())
-                .or_insert_with(Vec::new)
-                .push(tool.name());
-        }
-
-        let mut result = String::new();
-
-        // Add File Operations tools
-        if let Some(tools) = by_category.get(&ToolCategory::FileOps) {
-            result.push_str(&format!("## {}\n", ToolCategory::FileOps.name()));
-            for &name in tools {
-                if let Some(tool) = self.get(name) {
-                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
-                }
-            }
-            result.push('\n');
-        }
-
-        // Add Search tools
-        if let Some(tools) = by_category.get(&ToolCategory::Search) {
-            result.push_str(&format!("## {}\n", ToolCategory::Search.name()));
-            for &name in tools {
-                if let Some(tool) = self.get(name) {
-                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
-                }
-            }
-            result.push('\n');
-        }
-
-        // Add System tools
-        if let Some(tools) = by_category.get(&ToolCategory::System) {
-            result.push_str(&format!("## {}\n", ToolCategory::System.name()));
-            for &name in tools {
-                if let Some(tool) = self.get(name) {
-                    result.push_str(&format!("- {}: {}\n", tool.name(), tool.description()));
-                }
+        if let Ok(cache) = self.descriptions_cache.read() {
+            if let Some(cached) = cache.as_ref() {
+                return cached.clone();
             }
         }
 
-        result.trim_end().to_string()
+        let result = self.build_descriptions(None);
+        
+        if let Ok(mut cache) = self.descriptions_cache.write() {
+            *cache = Some(result.clone());
+        }
+        
+        result
     }
 
-    /// Get tool descriptions for AI context, filtered by role
+    /// Get tool descriptions for AI context, filtered by role (cached)
     pub fn descriptions_for_role(&self, role: Role) -> String {
+        if let Ok(cache) = self.descriptions_for_role_cache.read() {
+            if let Some(cached) = cache.get(&role) {
+                return cached.clone();
+            }
+        }
+
+        let result = self.build_descriptions(Some(role));
+        
+        if let Ok(mut cache) = self.descriptions_for_role_cache.write() {
+            cache.insert(role, result.clone());
+        }
+        
+        result
+    }
+
+    fn build_descriptions(&self, role: Option<Role>) -> String {
+        let tools: Vec<&dyn Tool> = if let Some(r) = role {
+            self.get_tools_for_role(r)
+        } else {
+            self.list()
+        };
+
         let mut by_category: std::collections::HashMap<ToolCategory, Vec<&str>> =
             std::collections::HashMap::new();
 
-        for tool in self.get_tools_for_role(role) {
+        for tool in &tools {
             by_category
                 .entry(tool.category())
                 .or_insert_with(Vec::new)
@@ -573,7 +577,6 @@ impl ToolRegistry {
 
         let mut result = String::new();
 
-        // Add File Operations tools
         if let Some(tools) = by_category.get(&ToolCategory::FileOps) {
             result.push_str(&format!("## {}\n", ToolCategory::FileOps.name()));
             for &name in tools {
@@ -584,7 +587,6 @@ impl ToolRegistry {
             result.push('\n');
         }
 
-        // Add Search tools
         if let Some(tools) = by_category.get(&ToolCategory::Search) {
             result.push_str(&format!("## {}\n", ToolCategory::Search.name()));
             for &name in tools {
@@ -595,7 +597,6 @@ impl ToolRegistry {
             result.push('\n');
         }
 
-        // Add System tools
         if let Some(tools) = by_category.get(&ToolCategory::System) {
             result.push_str(&format!("## {}\n", ToolCategory::System.name()));
             for &name in tools {
@@ -605,16 +606,17 @@ impl ToolRegistry {
             }
         }
 
-        // Add role-specific note
-        match role {
-            Role::Planning => {
-                result.push_str("\nNote: In Planning mode, write and edit tools are not available. Use bash for read-only operations.\n");
-            }
-            Role::Safe => {
-                result.push_str("\nNote: In Safe mode, write, edit, and bash operations require approval.\n");
-            }
-            Role::Yolo => {
-                result.push_str("\nNote: In YOLO mode, all operations are auto-approved.\n");
+        if let Some(r) = role {
+            match r {
+                Role::Planning => {
+                    result.push_str("\nNote: In Planning mode, write and edit tools are not available. Use bash for read-only operations.\n");
+                }
+                Role::Safe => {
+                    result.push_str("\nNote: In Safe mode, write, edit, and bash operations require approval.\n");
+                }
+                Role::Yolo => {
+                    result.push_str("\nNote: In YOLO mode, all operations are auto-approved.\n");
+                }
             }
         }
 

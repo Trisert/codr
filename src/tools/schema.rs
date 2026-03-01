@@ -158,6 +158,90 @@ impl Default for ToolSchema {
 }
 
 // ============================================================
+// JSON Schema Conversion for Native Tool Calling
+// ============================================================
+
+impl ToolSchema {
+    /// Convert to JSON Schema format for native tool calling
+    /// Returns the input_schema JSON value for tool definitions
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        let mut properties_map = serde_json::Map::new();
+
+        for prop in &self.properties {
+            let schema = match &prop.property_type {
+                PropertyType::String => {
+                    json_schema_type("string", &prop.description, prop.required, &prop.default)
+                }
+                PropertyType::Number => {
+                    json_schema_type("number", &prop.description, prop.required, &prop.default)
+                }
+                PropertyType::Integer => {
+                    json_schema_type("integer", &prop.description, prop.required, &prop.default)
+                }
+                PropertyType::Boolean => {
+                    json_schema_type("boolean", &prop.description, prop.required, &prop.default)
+                }
+                PropertyType::Array(inner) => {
+                    let item_type = match inner.as_ref() {
+                        PropertyType::String => "string",
+                        _ => "any",
+                    };
+                    serde_json::json!({
+                        "type": "array",
+                        "description": prop.description,
+                        "items": {"type": item_type}
+                    })
+                }
+                PropertyType::Object => {
+                    serde_json::json!({
+                        "type": "object",
+                        "description": prop.description
+                    })
+                }
+                PropertyType::OneOf(types) => {
+                    let type_list: Vec<&str> = types.iter().map(|t| match t {
+                        PropertyType::String => "string",
+                        PropertyType::Number => "number",
+                        PropertyType::Integer => "integer",
+                        PropertyType::Boolean => "boolean",
+                        _ => "string",
+                    }).collect();
+                    serde_json::json!({
+                        "description": prop.description,
+                        "oneOf": type_list.iter().map(|t| serde_json::json!({"type": t})).collect::<Vec<_>>()
+                    })
+                }
+            };
+            properties_map.insert(prop.name.clone(), schema);
+        }
+
+        serde_json::json!({
+            "type": "object",
+            "properties": properties_map,
+            "required": self.required
+        })
+    }
+}
+
+fn json_schema_type(
+    type_name: &str,
+    description: &str,
+    _required: bool,
+    default: &Option<Value>,
+) -> Value {
+    let mut result = serde_json::json!({
+        "type": type_name,
+        "description": description
+    });
+
+    if let Some(default_val) = default {
+        result["default"] = default_val.clone();
+    }
+
+    result
+}
+
+// ============================================================
 // Validation Error
 // ============================================================
 

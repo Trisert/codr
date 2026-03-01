@@ -2,6 +2,49 @@
 // Model-Agnostic System Prompt Generation
 // ============================================================
 
+use once_cell::sync::Lazy;
+
+/// Cached tool reminders for each model type
+static TOOL_REMINDERS: Lazy<std::collections::HashMap<&'static str, String>> = Lazy::new(|| {
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "anthropic",
+        "Use <codr_tool name=\"tool\">{params}</codr_tool> for tools, <codr_bash>cmd</codr_bash> for bash.".to_string(),
+    );
+    m.insert(
+        "claude",
+        "Use <codr_tool name=\"tool\">{params}</codr_tool> for tools, <codr_bash>cmd</codr_bash> for bash.".to_string(),
+    );
+    m.insert(
+        "openai",
+        "IMPORTANT: Use XML format for tool calls:\n\
+            - Tools: <codr_tool name=\"tool_name\">{\"param\": \"value\"}</codr_tool>\n\
+            - Bash: <codr_bash>command</codr_bash>\n\
+            Examples: <codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>"
+            .to_string(),
+    );
+    m.insert(
+        "openai-compatible",
+        "IMPORTANT: Use XML format for tool calls:\n\
+            - Tools: <codr_tool name=\"tool_name\">{\"param\": \"value\"}</codr_tool>\n\
+            - Bash: <codr_bash>command</codr_bash>\n\
+            Examples: <codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>"
+            .to_string(),
+    );
+    m
+});
+
+/// Cached prompt styles for each model type
+static PROMPT_STYLES: Lazy<std::collections::HashMap<&'static str, PromptStyle>> =
+    Lazy::new(|| {
+        let mut m = std::collections::HashMap::new();
+        m.insert("anthropic", PromptStyle::Standard);
+        m.insert("claude", PromptStyle::Standard);
+        m.insert("openai", PromptStyle::Detailed);
+        m.insert("openai-compatible", PromptStyle::Detailed);
+        m
+    });
+
 /// System prompt style - different models respond better to different styles
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptStyle {
@@ -138,43 +181,16 @@ fn build_minimal_prompt(tools_section: &str, context_section: &str) -> String {
 }
 
 /// Get the tool reminder that's appended to user messages
-/// This can be customized based on model type
+/// This can be customized based on model type (cached)
 pub fn get_tool_reminder(model_type: &str) -> Option<String> {
-    match model_type {
-        // Anthropic Claude - understands tool calling well, minimal reminder
-        "anthropic" | "claude" => Some(
-            "Use <codr_tool name=\"tool\">{params}</codr_tool> for tools, <codr_bash>cmd</codr_bash> for bash."
-                .to_string()
-        ),
-        // OpenAI-compatible - may need more explicit guidance
-        "openai" | "openai-compatible" => Some(
-            "IMPORTANT: Use XML format for tool calls:\n\
-            - Tools: <codr_tool name=\"tool_name\">{\"param\": \"value\"}</codr_tool>\n\
-            - Bash: <codr_bash>command</codr_bash>\n\
-            Examples: <codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>"
-                .to_string()
-        ),
-        // Other models - provide full reminder
-        _ => Some(
-            "IMPORTANT: Your response must use XML format for tool calls:\n\
-            Use <codr_tool name=\"tool_name\">{\"param\": \"value\"}</codr_tool> for tools\n\
-            Use <codr_bash>command</codr_bash> for bash commands\n\
-            Examples:\n\
-            <codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>\n\
-            <codr_tool name=\"find\">{\"pattern\": \"*.rs\"}</codr_tool>\n\
-            <codr_bash>ls -la</codr_bash>"
-                .to_string()
-        ),
-    }
+    TOOL_REMINDERS.get(model_type).cloned()
 }
 
-/// Get recommended prompt style for a model type
+/// Get recommended prompt style for a model type (cached)
 pub fn get_recommended_style(model_type: &str) -> PromptStyle {
-    match model_type {
-        "anthropic" | "claude" => PromptStyle::Standard,
-        "openai" | "openai-compatible" => PromptStyle::Detailed,
-        _ => PromptStyle::Standard,
-    }
+    *PROMPT_STYLES
+        .get(model_type)
+        .unwrap_or(&PromptStyle::Standard)
 }
 
 /// Get model type identifier from ModelType (for prompt selection)

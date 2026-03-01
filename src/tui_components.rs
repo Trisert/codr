@@ -1057,57 +1057,28 @@ impl MarkdownRenderer {
         lines
     }
 
-    /// Render a code block with syntax highlighting
+    /// Render a code block with syntax highlighting (no borders/backticks)
     fn render_code_block(&self, code: &str, language: &str) -> Vec<Line<'static>> {
-        let border_color = Color::Rgb(82, 82, 92);
-        let border_style = Style::default().fg(border_color);
-        let bg_color = Color::Rgb(36, 36, 40);
+        let bg_color = Color::Rgb(30, 30, 35);
         let bg_style = Style::default().bg(bg_color);
 
         let mut result = Vec::new();
 
-        // Add spacing before code block
+        // Add subtle spacing before code block
         result.push(Line::from(""));
 
-        // Top border with language label
-        let lang_label = if language.is_empty() {
-            "code".to_string()
-        } else {
-            language.to_string()
-        };
-        let top_line = format!("┌─ {} ", lang_label);
-        result.push(Line::from(vec![
-            Span::styled(top_line.clone(), border_style),
-            Span::styled(
-                "─".repeat(80usize.saturating_sub(top_line.len())),
-                bg_style,
-            ),
-        ]));
-
-        // Syntax-highlighted content - fill remaining width with background
+        // Syntax-highlighted content with background
         let highlighted = self.highlight_code(code, language);
         for line in highlighted {
-            // Calculate line content width
-            let content_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
-            let padding = 80usize.saturating_sub(content_width + 2); // 2 for "│ "
-
-            let mut spans = vec![Span::styled("│ ", bg_style)];
+            let mut spans = Vec::new();
             spans.extend(line.spans.into_iter().map(|mut s| {
                 s.style = s.style.bg(bg_color);
                 s
             }));
-            // Add padding span to extend background to full width
-            spans.push(Span::styled(" ".repeat(padding), bg_style));
-            result.push(Line::from(spans));
+            result.push(Line::from(spans).style(bg_style));
         }
 
-        // Bottom border
-        result.push(Line::from(Span::styled(
-            "└────────────────────────────────────────────────────────────────────────────────",
-            bg_style,
-        )));
-
-        // Add spacing after code block
+        // Add subtle spacing after code block
         result.push(Line::from(""));
 
         result
@@ -1190,17 +1161,18 @@ impl MarkdownRenderer {
             content,
             Style::default().fg(Color::Rgb(180, 180, 180)).italic(),
         );
-        Line::from(vec![
-            Span::styled("│ ", Style::default().fg(Color::Rgb(150, 150, 150))),
-            processed,
-        ])
+        let mut line = Line::from(Span::styled("│ ", Style::default().fg(Color::Rgb(150, 150, 150))));
+        line.spans.extend(processed.spans);
+        line
     }
 
     /// Render a list item
     fn render_list_item(&self, content: &str, _ordered: bool) -> Line<'static> {
         let bullet = Span::styled("• ", Style::default().fg(Color::Rgb(255, 180, 100)));
         let processed = self.render_inline_span(content, Style::default());
-        Line::from(vec![bullet, processed])
+        let mut line = Line::from(bullet);
+        line.spans.extend(processed.spans);
+        line
     }
 
     /// Parse an ordered list item
@@ -1252,23 +1224,54 @@ impl MarkdownRenderer {
         };
 
         let processed = self.render_inline_span(&content, style);
-        Line::from(vec![checkbox, processed])
+        let mut line = Line::from(checkbox);
+        line.spans.extend(processed.spans);
+        line
     }
 
     /// Render a line with inline markdown
     fn render_inline_line(&self, line: &str) -> Line<'static> {
-        let processed = self.render_inline_span(line, Style::default());
-        Line::from(processed)
+        self.render_inline_span(line, Style::default())
     }
 
     /// Render inline markdown within a span
-    fn render_inline_span(&self, text: &str, base_style: Style) -> Span<'static> {
+    fn render_inline_span(&self, text: &str, base_style: Style) -> Line<'static> {
         let elements = self.parse_inline_elements(text);
 
-        // For now, we'll just return the styled text
-        // In a full implementation, we'd build composite spans
-        let plain_text = self.elements_to_plain_text(&elements);
-        Span::styled(plain_text, base_style)
+        // Build composite spans with proper styling for each element
+        let mut spans = Vec::new();
+        for element in &elements {
+            match element {
+                InlineElement::Code(code_content) => {
+                    // Code gets a distinct style with a subtle background
+                    let code_style = Style::default()
+                        .fg(Color::Rgb(251, 191, 36))  // Amber/yellow for code
+                        .bg(Color::Rgb(40, 40, 45));
+                    spans.push(Span::styled(format!("`{}`", code_content), code_style));
+                }
+                InlineElement::Bold(content) => {
+                    let bold_style = base_style.add_modifier(Modifier::BOLD);
+                    spans.push(Span::styled(content.clone(), bold_style));
+                }
+                InlineElement::Italic(content) => {
+                    let italic_style = base_style.add_modifier(Modifier::ITALIC);
+                    spans.push(Span::styled(content.clone(), italic_style));
+                }
+                InlineElement::Strikethrough(content) => {
+                    let strike_style = base_style.add_modifier(Modifier::CROSSED_OUT);
+                    spans.push(Span::styled(content.clone(), strike_style));
+                }
+                InlineElement::Link { text, .. } => {
+                    let link_style = base_style.fg(Color::Rgb(147, 197, 253)).add_modifier(Modifier::UNDERLINED);
+                    spans.push(Span::styled(text.clone(), link_style));
+                }
+                InlineElement::Text(s) => {
+                    spans.push(Span::styled(s.clone(), base_style));
+                }
+            }
+        }
+        
+        Line::from(spans)
     }
 
     /// Parse inline markdown elements from text

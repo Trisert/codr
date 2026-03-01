@@ -1,4 +1,5 @@
 use crate::error::AgentError;
+use crate::logo;
 use crate::model::{Message, Model};
 use crate::parser::{Action, parse_actions};
 use crate::tools::{ToolRegistry, Role};
@@ -387,25 +388,52 @@ async fn agent_loop(
         let cancel_token_thinking = cancel_token.clone();
         let tx_thinking = tx.clone();
         let cancel_token_for_query = cancel_token.clone();
-        let lm_output = match model
-            .query_streaming(
-                &conversation,
-                move |chunk| {
-                    if cancel_token_clone.is_cancelled() {
-                        return;
-                    }
-                    let _ = tx_clone.send(AgentUpdate::StreamingChunk(chunk.into()));
-                },
-                move |thinking| {
-                    if cancel_token_thinking.is_cancelled() {
-                        return;
-                    }
-                    let _ = tx_thinking.send(AgentUpdate::StreamingThinkingChunk(thinking.into()));
-                },
-                &cancel_token_for_query,
-            )
-            .await
-        {
+
+        // Use native tool calling if the model supports it
+        let lm_output = if model.supports_native_tools() {
+            let tools_for_role = tool_registry.get_tools_for_role(role);
+            let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
+            model
+                .query_streaming_with_tools(
+                    &conversation,
+                    &tools_refs,
+                    move |chunk| {
+                        if cancel_token_clone.is_cancelled() {
+                            return;
+                        }
+                        let _ = tx_clone.send(AgentUpdate::StreamingChunk(chunk.into()));
+                    },
+                    move |thinking| {
+                        if cancel_token_thinking.is_cancelled() {
+                            return;
+                        }
+                        let _ = tx_thinking.send(AgentUpdate::StreamingThinkingChunk(thinking.into()));
+                    },
+                    &cancel_token_for_query,
+                )
+                .await
+        } else {
+            model
+                .query_streaming(
+                    &conversation,
+                    move |chunk| {
+                        if cancel_token_clone.is_cancelled() {
+                            return;
+                        }
+                        let _ = tx_clone.send(AgentUpdate::StreamingChunk(chunk.into()));
+                    },
+                    move |thinking| {
+                        if cancel_token_thinking.is_cancelled() {
+                            return;
+                        }
+                        let _ = tx_thinking.send(AgentUpdate::StreamingThinkingChunk(thinking.into()));
+                    },
+                    &cancel_token_for_query,
+                )
+                .await
+        };
+
+        let lm_output = match lm_output {
             Ok(output) => output,
             Err(e) => {
                 // Check if error is due to cancellation
@@ -448,6 +476,7 @@ async fn agent_loop(
                 conversation.push(Message {
                     role: "user".into(),
                     content: Arc::new(msg),
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -522,10 +551,12 @@ async fn agent_loop(
                         conversation.push(Message {
                             role: "assistant".into(),
                             content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+                            images: Vec::new(),
                         });
                         conversation.push(Message {
                             role: "user".into(),
                             content: Arc::new(error_msg),
+                            images: Vec::new(),
                         });
                         continue;
                     }
@@ -558,10 +589,12 @@ async fn agent_loop(
                     conversation.push(Message {
                         role: "assistant".into(),
                         content: Arc::new(cleaned_output),
+                        images: Vec::new(),
                     });
                     conversation.push(Message {
                         role: "user".into(),
                         content: Arc::new(format!("Tool result:\n{}", &*llm_output_content)),
+                        images: Vec::new(),
                     });
 
                     // Reset retry count on success
@@ -588,6 +621,7 @@ async fn agent_loop(
                         conversation.push(Message {
                             role: "assistant".into(),
                             content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+                            images: Vec::new(),
                         });
                         conversation.push(Message {
                             role: "user".into(),
@@ -595,6 +629,7 @@ async fn agent_loop(
                                 "Error: {}\n\n{}",
                                 error_json, "Please fix the parameters and try again."
                             )),
+                            images: Vec::new(),
                         });
                     } else {
                         // Max retries exceeded
@@ -605,6 +640,7 @@ async fn agent_loop(
                         conversation.push(Message {
                             role: "assistant".into(),
                             content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+                            images: Vec::new(),
                         });
                         conversation.push(Message {
                             role: "user".into(),
@@ -612,6 +648,7 @@ async fn agent_loop(
                                 "Tool execution failed after {} retries: {}",
                                 max_retries, error_msg
                             )),
+                            images: Vec::new(),
                         });
                     }
                 }
@@ -625,10 +662,12 @@ async fn agent_loop(
             conversation.push(Message {
                 role: "assistant".into(),
                 content: Arc::new(crate::tui_components::clean_for_conversation(&lm_output)),
+                images: Vec::new(),
             });
             conversation.push(Message {
                 role: "user".into(),
                 content: response.clone(),
+                images: Vec::new(),
             });
             return;
         }
@@ -687,6 +726,11 @@ pub struct App {
     animation_frame: usize,
     // Track parallel tool execution
     parallel_tool_count: usize,
+    // File picker state for @ symbol file injection
+    file_picker_active: bool,
+    file_picker_query: String,
+    file_picker_results: Vec<String>,
+    file_picker_selected: usize,
 }
 
 impl App {
@@ -732,6 +776,10 @@ impl App {
             history_index: None,
             animation_frame: 0,
             parallel_tool_count: 0,
+            file_picker_active: false,
+            file_picker_query: String::new(),
+            file_picker_results: Vec::new(),
+            file_picker_selected: 0,
         }
     }
 
@@ -739,6 +787,7 @@ impl App {
         self.system_messages = vec![Message {
             role: "system".into(),
             content: Arc::new(system_prompt.to_string()),
+            images: Vec::new(),
         }];
     }
 
@@ -770,6 +819,7 @@ impl App {
                     messages.push(Message {
                         role: if &*chat_msg.role == "output" { "user".into() } else { chat_msg.role.clone() },
                         content: chat_msg.content.clone(),
+                        images: Vec::new(),
                     });
                 }
                 _ => {}
@@ -1064,6 +1114,94 @@ impl App {
         self.history_index = None;
     }
 
+    // ── File Picker Methods ───────────────────────────────────────────
+
+    /// Activate file picker and populate with files from current directory
+    pub fn activate_file_picker(&mut self, query: String) {
+        self.file_picker_active = true;
+        self.file_picker_query = query.clone();
+        self.file_picker_selected = 0;
+
+        // Get files from current directory
+        let files = self.get_files_in_current_dir();
+
+        // Filter by query if provided
+        if query.is_empty() {
+            self.file_picker_results = files;
+        } else {
+            self.file_picker_results = crate::fuzzy::fuzzy_filter(&files, &query)
+                .into_iter()
+                .map(|(idx, _)| files[idx].clone())
+                .collect();
+        }
+    }
+
+    /// Get list of files in current directory (recursive)
+    fn get_files_in_current_dir(&self) -> Vec<String> {
+        use std::fs;
+
+        let mut files = Vec::new();
+
+        // Recursive directory walk
+        if let Ok(_entries) = fs::read_dir(".") {
+            fn visit_dir(path: std::path::PathBuf, files: &mut Vec<String>) {
+                if let Ok(entries) = fs::read_dir(&path) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let entry_path = entry.path();
+                        let name = entry.file_name().to_string_lossy().to_string();
+
+                        // Skip hidden files and common ignore patterns
+                        if name.starts_with('.') {
+                            continue;
+                        }
+
+                        if entry_path.is_dir() {
+                            files.push(format!("{}/", name));
+                            visit_dir(entry_path, files);
+                        } else {
+                            files.push(name);
+                        }
+                    }
+                }
+            }
+
+            visit_dir(std::path::PathBuf::from("."), &mut files);
+        }
+
+        files
+    }
+
+    /// Deactivate file picker
+    pub fn deactivate_file_picker(&mut self) {
+        self.file_picker_active = false;
+        self.file_picker_query.clear();
+        self.file_picker_results.clear();
+        self.file_picker_selected = 0;
+    }
+
+    /// Select next file in picker (with wrapping)
+    pub fn file_picker_next(&mut self) {
+        if !self.file_picker_results.is_empty() {
+            self.file_picker_selected = (self.file_picker_selected + 1) % self.file_picker_results.len();
+        }
+    }
+
+    /// Select previous file in picker (with wrapping)
+    pub fn file_picker_prev(&mut self) {
+        if !self.file_picker_results.is_empty() {
+            self.file_picker_selected = if self.file_picker_selected == 0 {
+                self.file_picker_results.len() - 1
+            } else {
+                self.file_picker_selected - 1
+            };
+        }
+    }
+
+    /// Get the currently selected file from picker
+    pub fn get_selected_file(&self) -> Option<String> {
+        self.file_picker_results.get(self.file_picker_selected).cloned()
+    }
+
     // ── Selection & Copy Methods ─────────────────────────────────────
 
     /// Clear the current selection
@@ -1226,6 +1364,7 @@ impl App {
             conversation.push(Message {
                 role: "assistant".into(),
                 content: last_msg.content.clone(),
+                images: Vec::new(),
             });
         }
 
@@ -1239,6 +1378,7 @@ impl App {
                             conversation.push(Message {
                                 role: "user".into(),
                                 content: Arc::new(output),
+                                images: Vec::new(),
                             });
                         }
                         Err(e) => {
@@ -1247,6 +1387,7 @@ impl App {
                             conversation.push(Message {
                                 role: "user".into(),
                                 content: Arc::new(error_msg),
+                                images: Vec::new(),
                             });
                         }
                     }
@@ -1258,6 +1399,7 @@ impl App {
                 conversation.push(Message {
                     role: "user".into(),
                     content: Arc::new("Action rejected".to_string()),
+                    images: Vec::new(),
                 });
             }
             _ => {}
@@ -1356,36 +1498,162 @@ fn execute_bash_action(command: &str) -> Result<String, AgentError> {
     }
 }
 
+fn draw_banner(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(logo_lines) = logo::get_logo() {
+        // Get the actual display width (columns) of the logo, not just character count
+        let logo_width = logo_lines.first()
+            .map(|l| l.width())
+            .unwrap_or(0);
+        let logo_height = logo_lines.len();
+
+        // Get directory name in "parent/current" format
+        let current_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| {
+                let parent = p.parent().and_then(|par| par.file_name().and_then(|n| n.to_str()));
+                let current = p.file_name().and_then(|n| n.to_str());
+                match (parent, current) {
+                    (Some(p), Some(c)) => Some(format!("{}/{}", p, c)),
+                    (_, Some(c)) => Some(c.to_string()),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| "~".to_string());
+
+        // Build all text lines (4 lines total)
+        let text_lines = vec![
+            Line::from(vec![
+                Span::styled("codr", Style::default().fg(Color::Rgb(147, 197, 253)).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("v0.1.0", Style::default().fg(Color::Rgb(100, 100, 110))),
+            ]),
+            Line::from(vec![
+                Span::styled(&app.model_name, Style::default().fg(Color::Rgb(180, 180, 190))),
+            ]),
+            Line::from(vec![
+                Span::styled(&current_dir, Style::default().fg(Color::Rgb(120, 120, 140))),
+            ]),
+        ];
+
+        // Split: logo (left) | gap (1 col) | text (right)
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(logo_width as u16),  // logo exact width
+                Constraint::Length(1),                   // 1 column gap
+                Constraint::Min(0),                      // text
+            ])
+            .split(area);
+
+        // Draw logo (top-aligned, full height)
+        let logo_area = ratatui::layout::Rect {
+            x: chunks[0].x,
+            y: chunks[0].y,
+            width: logo_width as u16,
+            height: (logo_height as u16).min(chunks[0].height),
+        };
+
+        let logo_content: Vec<Line> = logo_lines.iter()
+            .take(logo_area.height as usize)
+            .map(|line| Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(Color::Rgb(180, 100, 255)),
+            )))
+            .collect();
+
+        let logo_widget = Paragraph::new(logo_content);
+        f.render_widget(logo_widget, logo_area);
+
+        // Draw text (moved down by 1 line)
+        let text_area = ratatui::layout::Rect {
+            x: chunks[2].x,
+            y: chunks[2].y + 1,  // Move down by 1 line
+            width: chunks[2].width,
+            height: chunks[2].height.saturating_sub(1),
+        };
+
+        let text_widget = Paragraph::new(text_lines);
+        f.render_widget(text_widget, text_area);
+    }
+}
+
 // ── UI Drawing ───────────────────────────────────────────────
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    // Responsive split: conversation | input area | subtle footer status line
-    let zones = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),    // conversation
-            Constraint::Length(2), // spacer (2 lines for rainbow + blank line)
-            Constraint::Length(2), // input
-            Constraint::Length(1), // subtle footer
-        ])
-        .split(area);
+    // Check if logo exists and we should show banner (no messages yet)
+    let logo_dims = logo::get_logo_dimensions();
+    let show_banner = logo_dims.is_some() && app.messages.is_empty();
 
-    // ── Conversation area ────────────────────────────────────
-    draw_conversation(f, app, zones[0]);
+    // Calculate banner height: max of logo height or 4 (text lines)
+    let banner_height = logo_dims
+        .map(|(_, h)| h as u16)
+        .unwrap_or(0)
+        .max(4);
 
-    // ── Input area ───────────────────────────────────────────
-    draw_input(f, app, zones[2]);
+    // Responsive split: banner (optional) | conversation | input area | subtle footer status line
+    let zones = if show_banner {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(banner_height), // banner (logo + text)
+                Constraint::Min(1),    // conversation
+                Constraint::Length(2), // spacer (2 lines for rainbow + blank line)
+                Constraint::Length(2), // input
+                Constraint::Length(1), // subtle footer
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),    // conversation
+                Constraint::Length(2), // spacer (2 lines for rainbow + blank line)
+                Constraint::Length(2), // input
+                Constraint::Length(1), // subtle footer
+            ])
+            .split(area)
+    };
 
-    // ── Footer bar ───────────────────────────────────────────
-    draw_footer(f, app, zones[3]);
+    // ── Banner (shown only on initial screen with logo) ───────
+    if show_banner {
+        draw_banner(f, app, zones[0]);
+        // ── Conversation area ────────────────────────────────────
+        draw_conversation(f, app, zones[1]);
+        // ── Input area ───────────────────────────────────────────
+        draw_input(f, app, zones[3]);
+        // ── Footer bar ───────────────────────────────────────────
+        draw_footer(f, app, zones[4]);
+        // ── Rainbow Working indicator (in spacer above input) ─────────
+        if app.is_processing {
+            draw_working_indicator(f, app, zones[2]);
+        }
 
-    // ── Rainbow Working indicator (in spacer above input) ─────────
-    if app.is_processing {
-        draw_working_indicator(f, app, zones[1]);
+        // ── File Picker Popup (if active) ─────────────────────────────
+        if app.file_picker_active {
+            draw_file_picker(f, app);
+        }
+    } else {
+        // ── Conversation area ────────────────────────────────────
+        draw_conversation(f, app, zones[0]);
+        // ── Input area ───────────────────────────────────────────
+        draw_input(f, app, zones[2]);
+        // ── Footer bar ───────────────────────────────────────────
+        draw_footer(f, app, zones[3]);
+        // ── Rainbow Working indicator (in spacer above input) ─────────
+        if app.is_processing {
+            draw_working_indicator(f, app, zones[1]);
+        }
+
+        // ── File Picker Popup (if active) ─────────────────────────────
+        if app.file_picker_active {
+            draw_file_picker(f, app);
+        }
     }
 }
+
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     // Clean up expired toasts
@@ -1965,7 +2233,24 @@ async fn run_event_loop(
 
                         // -- Selection --
                         KeyCode::Enter => {
-                            if app.selection.is_active() {
+                            if app.file_picker_active {
+                                // Select file from picker
+                                if let Some(file_path) = app.get_selected_file() {
+                                    // Find position of last @ in input
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(at_pos) = before_cursor.rfind('@') {
+                                        // Remove from @ to cursor
+                                        let new_input: String = app.input.chars().take(at_pos).collect();
+                                        app.input = new_input;
+                                        app.cursor_position = at_pos;
+
+                                        // Insert selected file path
+                                        app.input.insert_str(app.cursor_position, &file_path);
+                                        app.cursor_position += file_path.len();
+                                    }
+                                    app.deactivate_file_picker();
+                                }
+                            } else if app.selection.is_active() {
                                 // Copy selection
                                 app.copy_selection();
                             } else if !app.is_processing
@@ -1976,7 +2261,10 @@ async fn run_event_loop(
                             }
                         }
                         KeyCode::Esc => {
-                            if app.selection.is_active() {
+                            if app.file_picker_active {
+                                // Cancel file picker
+                                app.deactivate_file_picker();
+                            } else if app.selection.is_active() {
                                 app.clear_selection();
                             }
                         }
@@ -2088,9 +2376,37 @@ async fn run_event_loop(
                                 // Exit history mode when typing
                                 app.exit_history_mode();
 
-                                let cursor = app.cursor_position;
-                                app.input.insert(cursor, c);
-                                app.cursor_position += 1;
+                                // Check for @ symbol to activate file picker
+                                if c == '@' && !app.file_picker_active {
+                                    // Insert @ and activate picker
+                                    let cursor = app.cursor_position;
+                                    app.input.insert(cursor, c);
+                                    app.cursor_position += 1;
+
+                                    app.activate_file_picker(String::new());
+                                    app.show_toast(format!("File picker: {} files", app.file_picker_results.len()));
+                                } else if app.file_picker_active {
+                                    // Update query and insert character
+                                    let cursor = app.cursor_position;
+                                    app.input.insert(cursor, c);
+                                    app.cursor_position += 1;
+
+                                    // Update picker query
+                                    let before_at: String = app.input.chars().take(app.cursor_position).collect();
+                                    let query_start = before_at.rfind('@').map(|i| i + 1).unwrap_or(0);
+                                    let query: String = before_at.chars().skip(query_start).collect();
+
+                                    if !query.is_empty() {
+                                        app.activate_file_picker(query);
+                                    } else {
+                                        // Show all files when query is empty
+                                        app.activate_file_picker(String::new());
+                                    }
+                                } else {
+                                    let cursor = app.cursor_position;
+                                    app.input.insert(cursor, c);
+                                    app.cursor_position += 1;
+                                }
                             }
                         }
                         KeyCode::Backspace => {
@@ -2104,15 +2420,45 @@ async fn run_event_loop(
                                 let cursor = app.cursor_position - 1;
                                 app.input.remove(cursor);
                                 app.cursor_position = cursor;
+
+                                // Update file picker if active
+                                if app.file_picker_active {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+
+                                    // Check if @ was deleted
+                                    if !before_cursor.contains('@') {
+                                        app.deactivate_file_picker();
+                                    } else {
+                                        // Update picker query
+                                        let query_start = before_cursor.rfind('@').map(|i| i + 1).unwrap_or(0);
+                                        let query: String = before_cursor.chars().skip(query_start).collect();
+
+                                        if !query.is_empty() {
+                                            app.activate_file_picker(query);
+                                        } else {
+                                            app.activate_file_picker(String::new());
+                                        }
+                                    }
+                                }
                             }
                         }
                         KeyCode::Up => {
-                            // Navigate history
-                            app.history_prev();
+                            // File picker navigation
+                            if app.file_picker_active {
+                                app.file_picker_prev();
+                            } else {
+                                // Navigate history
+                                app.history_prev();
+                            }
                         }
                         KeyCode::Down => {
-                            // Navigate history
-                            app.history_next();
+                            // File picker navigation
+                            if app.file_picker_active {
+                                app.file_picker_next();
+                            } else {
+                                // Navigate history
+                                app.history_next();
+                            }
                         }
                         KeyCode::Left => {
                             if app.cursor_position > 0 {
@@ -2156,4 +2502,75 @@ async fn run_event_loop(
     }
 
     Ok(())
+}
+// ── File Picker Popup ─────────────────────────────────────────────
+
+fn draw_file_picker(f: &mut Frame, app: &App) {
+    let results = &app.file_picker_results;
+
+    if results.is_empty() {
+        return;
+    }
+
+    // Calculate popup position and size
+    let popup_width = 50u16;
+    let max_height = 10u16;
+    let total_height = results.len() as u16;
+    let popup_height = total_height.min(max_height);
+
+    // Calculate scroll offset to show selected item
+    let scroll_offset = if app.file_picker_selected >= max_height as usize {
+        app.file_picker_selected - (max_height as usize - 1)
+    } else {
+        0
+    };
+
+    // Position popup above input area
+    let popup_area = ratatui::layout::Rect {
+        x: 2,
+        y: f.area().height.saturating_sub(popup_height + 3), // Above input (3 lines for padding)
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Get visible items (with scrolling)
+    let visible_results: Vec<_> = results
+        .iter()
+        .skip(scroll_offset)
+        .take(popup_height as usize)
+        .enumerate()
+        .collect();
+
+    // Create popup items
+    let items: Vec<Line> = visible_results
+        .iter()
+        .map(|(relative_i, file)| {
+            let actual_index = scroll_offset + relative_i;
+            let is_selected = actual_index == app.file_picker_selected;
+
+            if is_selected {
+                Line::from(vec![
+                    Span::styled(
+                        format!("> {}", file),
+                        Style::default()
+                            .fg(Color::Rgb(200, 200, 200))
+                            .bg(Color::Rgb(60, 60, 80))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {}", file),
+                        Style::default().fg(Color::Rgb(180, 180, 190)),
+                    ),
+                ])
+            }
+        })
+        .collect();
+
+    let popup = Paragraph::new(items);
+
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+    f.render_widget(popup, popup_area);
 }

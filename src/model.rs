@@ -41,9 +41,33 @@ struct ModelConfig {
 // ============================================================
 
 #[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    /// Base64 encoded image data (without data URI prefix)
+    pub data: Arc<String>,
+    /// MIME type (e.g., "image/png", "image/jpeg")
+    pub media_type: Arc<str>,
+}
+
+// Custom Serialize for ImageAttachment to handle Arc types
+impl Serialize for ImageAttachment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ImageAttachment", 2)?;
+        state.serialize_field("data", &self.data.as_str())?;
+        state.serialize_field("media_type", &self.media_type.as_ref())?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Message {
     pub role: Arc<str>,  // Shared, immutable
     pub content: Arc<String>,  // Shared, potentially large
+    /// Optional image attachments for vision support
+    pub images: Vec<ImageAttachment>,
 }
 
 // Custom Serialize for Message that converts Arc to owned strings
@@ -53,11 +77,38 @@ impl Serialize for Message {
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Message", 2)?;
+        let mut state = serializer.serialize_struct("Message", 3)?;
         state.serialize_field("role", &self.role.to_string())?;
         state.serialize_field("content", &self.content.as_str())?;
+        state.serialize_field("images", &self.images)?;
         state.end()
     }
+}
+
+// ============================================================
+// Native Tool Calling Types
+// ============================================================
+
+/// Tool definition for Anthropic API
+#[derive(Debug, Clone, Serialize)]
+pub struct AnthropicToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Tool definition for OpenAI API
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIToolDefinition {
+    pub r#type: String,
+    pub function: OpenAIFunctionDefinition,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIFunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 // ============================================================
@@ -73,6 +124,8 @@ pub struct AnthropicRequest {
     pub messages: Vec<AnthropicMessage>,
     pub system: Option<String>,
     pub thinking: AnthropicThinking,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AnthropicToolDefinition>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +163,12 @@ pub enum ContentBlock {
         #[allow(dead_code)]
         id: String,
     },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 // ============================================================
@@ -123,6 +182,10 @@ pub struct OpenAIRequest {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<OpenAIToolDefinition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -217,6 +280,7 @@ impl Model {
             .map(|(role, content)| Message {
                 role: role.into(),
                 content: Arc::new(content.to_string()),
+                images: Vec::new(),
             })
             .collect()
     }
@@ -225,6 +289,7 @@ impl Model {
         messages.push(Message {
             role: "user".into(),
             content: Arc::new(content.to_string()),
+            images: Vec::new(),
         });
         messages
     }
@@ -233,17 +298,83 @@ impl Model {
         messages.push(Message {
             role: "assistant".into(),
             content: Arc::new(content.to_string()),
+            images: Vec::new(),
         });
         messages
     }
 
+    /// Check if this model supports native tool calling
+    pub fn supports_native_tools(&self) -> bool {
+        match &self.config.model_type {
+            ModelType::Anthropic => true,
+            ModelType::OpenAI { .. } => {
+                // Enable native tools for all OpenAI-compatible endpoints
+                // Most modern local LLM servers (Ollama, LM Studio, llama.cpp, vLLM, etc.)
+                // support OpenAI-compatible tool calling APIs
+                true
+            }
+        }
+    }
+
+    /// Create Anthropic tool definitions from a tool registry
+    pub fn create_anthropic_tools(
+        &self,
+        tools: &[&dyn crate::tools::Tool],
+    ) -> Vec<AnthropicToolDefinition> {
+        tools
+            .iter()
+            .map(|t| AnthropicToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.parameters().to_json_schema(),
+            })
+            .collect()
+    }
+
+    /// Create OpenAI tool definitions from a tool registry
+    pub fn create_openai_tools(
+        &self,
+        tools: &[&dyn crate::tools::Tool],
+    ) -> Vec<OpenAIToolDefinition> {
+        tools
+            .iter()
+            .map(|t| OpenAIToolDefinition {
+                r#type: "function".to_string(),
+                function: OpenAIFunctionDefinition {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters().to_json_schema(),
+                },
+            })
+            .collect()
+    }
+
     pub async fn query(&self, messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
         let messages_with_reminder = self.append_tool_reminder(messages);
-        
+
         match &self.config.model_type {
-            ModelType::Anthropic => self.query_anthropic(&messages_with_reminder).await,
+            ModelType::Anthropic => self.query_anthropic(&messages_with_reminder, None).await,
             ModelType::OpenAI { base_url, model, api_key, extra } => {
                 self.query_openai_compat(&messages_with_reminder, base_url, model, api_key.as_deref(), extra)
+                    .await
+            }
+        }
+    }
+
+    /// Query with native tool calling support
+    pub async fn query_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[&dyn crate::tools::Tool],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        match &self.config.model_type {
+            ModelType::Anthropic => {
+                let tool_defs = self.create_anthropic_tools(tools);
+                self.query_anthropic(messages, Some(&tool_defs)).await
+            }
+            ModelType::OpenAI { base_url, model, api_key, extra } => {
+                let tool_defs = self.create_openai_tools(tools);
+                self.query_openai_compat_with_tools(messages, base_url, model, api_key.as_deref(), extra, Some(&tool_defs))
                     .await
             }
         }
@@ -264,7 +395,7 @@ impl Model {
 
         match &self.config.model_type {
             ModelType::Anthropic => {
-                self.query_anthropic_streaming(&messages_with_reminder, on_text, on_thinking, cancel_token)
+                self.query_anthropic_streaming(&messages_with_reminder, None, on_text, on_thinking, cancel_token)
                     .await
             }
             ModelType::OpenAI { base_url, model, api_key, extra } => {
@@ -274,6 +405,43 @@ impl Model {
                     model,
                     api_key.as_deref(),
                     extra,
+                    on_text,
+                    on_thinking,
+                    cancel_token,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Query with native tool calling support (streaming)
+    pub async fn query_streaming_with_tools<F, G>(
+        &self,
+        messages: &[Message],
+        tools: &[&dyn crate::tools::Tool],
+        on_text: F,
+        on_thinking: G,
+        cancel_token: &CancellationToken,
+    ) -> Result<String, Box<dyn std::error::Error>>
+    where
+        F: FnMut(String) + Send,
+        G: FnMut(String) + Send,
+    {
+        match &self.config.model_type {
+            ModelType::Anthropic => {
+                let tool_defs = self.create_anthropic_tools(tools);
+                self.query_anthropic_streaming(messages, Some(&tool_defs), on_text, on_thinking, cancel_token)
+                    .await
+            }
+            ModelType::OpenAI { base_url, model, api_key, extra } => {
+                let tool_defs = self.create_openai_tools(tools);
+                self.query_openai_compat_streaming_with_tools(
+                    messages,
+                    base_url,
+                    model,
+                    api_key.as_deref(),
+                    extra,
+                    Some(&tool_defs),
                     on_text,
                     on_thinking,
                     cancel_token,
@@ -302,6 +470,7 @@ impl Model {
                     result.push(Message {
                         role: msg.role.clone(),
                         content: Arc::new(new_content),
+                        images: Vec::new(),
                     });
                     reminder_added = true;
                 } else {
@@ -321,6 +490,7 @@ impl Model {
     async fn query_anthropic(
         &self,
         messages: &[Message],
+        tools: Option<&[AnthropicToolDefinition]>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY environment variable not set");
@@ -350,6 +520,7 @@ impl Model {
             thinking: AnthropicThinking {
                 thinking_type: "enabled".to_string(),
             },
+            tools: tools.map(|t| t.to_vec()),
         };
 
         let response = self
@@ -388,6 +559,11 @@ impl Model {
                 ContentBlock::Thinking { thinking, .. } => {
                     format!("<thinking>{}</thinking>", thinking)
                 }
+                ContentBlock::ToolUse { id: _, name, input } => {
+                    // Convert native tool use to XML format for parser compatibility
+                    let input_json = serde_json::to_string(input).unwrap_or_default();
+                    format!("<codr_tool name=\"{}\">{}</codr_tool>", name, input_json)
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"))
@@ -424,6 +600,8 @@ impl Model {
             } else {
                 Some(extra.clone())
             },
+            tools: None,
+            tool_choice: None,
         };
 
         let mut req = self
@@ -471,6 +649,81 @@ impl Model {
         }
     }
 
+    async fn query_openai_compat_with_tools(
+        &self,
+        messages: &[Message],
+        base_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+        tools: Option<&[OpenAIToolDefinition]>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!("{}/v1/chat/completions", base_url);
+
+        let openai_messages: Vec<OpenAIMessage> = messages
+            .iter()
+            .map(|msg| OpenAIMessage {
+                role: msg.role.to_string(),
+                content: msg.content.to_string(),
+            })
+            .collect();
+
+        let request_body = OpenAIRequest {
+            model: model.to_string(),
+            messages: openai_messages,
+            max_tokens: Some(4096),
+            extra: if extra.is_empty() { None } else { Some(extra.clone()) },
+            tools: tools.map(|t| t.to_vec()),
+            tool_choice: None,
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json");
+
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = req.json(&request_body).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(format!("API error: {} - {}", status, error_text).into());
+        }
+
+        let openai_response: OpenAIResponse = response.json().await?;
+
+        if let Some(usage_data) = openai_response.usage {
+            let mut usage = self.usage.lock().unwrap();
+            usage.prompt_tokens = Some(usage_data.prompt_tokens);
+            usage.completion_tokens = Some(usage_data.completion_tokens);
+            usage.cost_in_currency = Some(usage_data.total_tokens as f64 * 0.000001);
+        }
+
+        // Handle tool calls in response
+        if let Some(choice) = openai_response.choices.first() {
+            let message = &choice.message;
+            let reasoning = message.reasoning.clone().or_else(|| message.reasoning_content.clone());
+            let content = message.content.as_deref().unwrap_or("");
+
+            // TODO: Parse tool_calls from response when available
+            // For now, just return content + reasoning
+            if let Some(ref reasoning) = reasoning {
+                Ok(format!(
+                    "<thinking>{}</thinking>\n\n{}",
+                    reasoning, content
+                ))
+            } else {
+                Ok(content.to_string())
+            }
+        } else {
+            Ok(String::new())
+        }
+    }
+
     // ============================================================
     // Anthropic Streaming API
     // ============================================================
@@ -478,6 +731,7 @@ impl Model {
     async fn query_anthropic_streaming<F, G>(
         &self,
         messages: &[Message],
+        tools: Option<&[AnthropicToolDefinition]>,
         mut on_text: F,
         mut on_thinking: G,
         cancel_token: &CancellationToken,
@@ -513,6 +767,7 @@ impl Model {
             thinking: AnthropicThinking {
                 thinking_type: "enabled".to_string(),
             },
+            tools: tools.map(|t| t.to_vec()),
         };
 
         // Wrap the response in an Option so we can explicitly drop it on cancellation
@@ -575,6 +830,13 @@ impl Model {
                                 ContentBlock::Thinking { thinking, .. } => {
                                     thinking_content.push_str(&thinking);
                                     on_thinking(thinking);
+                                }
+                                ContentBlock::ToolUse { id: _, name, input } => {
+                                    // Convert native tool use to XML format for parser compatibility
+                                    let input_json = serde_json::to_string(&input).unwrap_or_default();
+                                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, input_json);
+                                    full_content.push_str(&tool_xml);
+                                    on_text(tool_xml);
                                 }
                             }
                         }
@@ -717,6 +979,27 @@ impl Model {
                         reasoning_content: Option<String>,
                         #[serde(default, alias = "thinking_content", alias = "thinking")]
                         reasoning: Option<String>,
+                        #[serde(default)]
+                        tool_calls: Option<Vec<StreamingToolCall>>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamingToolCall {
+                        #[serde(default)]
+                        _index: Option<usize>,
+                        #[serde(default)]
+                        _id: Option<String>,
+                        #[serde(default)]
+                        _type: Option<String>,
+                        function: Option<StreamingFunction>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamingFunction {
+                        #[serde(default)]
+                        name: Option<String>,
+                        #[serde(default)]
+                        arguments: Option<String>,
                     }
 
                     #[derive(Deserialize)]
@@ -746,6 +1029,236 @@ impl Model {
                             if let Some(content) = choice.delta.content {
                                 full_content.push_str(&content);
                                 on_text(content);
+                            }
+                            // Handle tool calls (accumulate and convert to XML format)
+                            if let Some(tool_calls) = choice.delta.tool_calls {
+                                for tool_call in tool_calls {
+                                    if let Some(function) = tool_call.function {
+                                        let name = function.name.unwrap_or_default();
+                                        let arguments = function.arguments.unwrap_or_default();
+
+                                        // Arguments stream in chunks, accumulate them
+                                        // For now, we'll accumulate and emit at the end
+                                        if !arguments.is_empty() {
+                                            if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                                                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
+                                                    name, serde_json::to_string(&args_json).unwrap_or_default());
+                                                full_content.push_str(&tool_xml);
+                                                on_text(tool_xml);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(usage) = response.usage {
+                            let total = usage.total_tokens.unwrap_or(0);
+                            let mut usage_lock = self.usage.lock().unwrap();
+                            usage_lock.prompt_tokens = usage.prompt_tokens;
+                            usage_lock.completion_tokens = usage.completion_tokens;
+                            usage_lock.cost_in_currency = Some(total as f64 * 0.000001);
+                        }
+                    } else if !data.is_empty() {
+                        // Sometimes the event is just an empty string or generic message we don't care about,
+                        // but if we fail to parse a non-empty payload, we just ignore it.
+                    }
+                }
+            }
+        }
+
+        if !thinking_content.is_empty() {
+            Ok(format!(
+                "<thinking>{}</thinking>\n\n{}",
+                thinking_content, full_content
+            ))
+        } else {
+            Ok(full_content)
+        }
+    }
+
+    async fn query_openai_compat_streaming_with_tools<F, G>(
+        &self,
+        messages: &[Message],
+        base_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+        tools: Option<&[OpenAIToolDefinition]>,
+        mut on_text: F,
+        mut on_thinking: G,
+        cancel_token: &CancellationToken,
+    ) -> Result<String, Box<dyn std::error::Error>>
+    where
+        F: FnMut(String) + Send,
+        G: FnMut(String) + Send,
+    {
+        let url = format!("{}/v1/chat/completions", base_url);
+
+        let openai_messages: Vec<OpenAIMessage> = messages
+            .iter()
+            .map(|msg| OpenAIMessage {
+                role: msg.role.to_string(),
+                content: msg.content.to_string(),
+            })
+            .collect();
+
+        #[derive(Serialize)]
+        struct StreamingRequest {
+            model: String,
+            messages: Vec<OpenAIMessage>,
+            max_tokens: Option<u32>,
+            stream: bool,
+            #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+            extra: std::collections::HashMap<String, serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<Vec<OpenAIToolDefinition>>,
+        }
+
+        let request_body = StreamingRequest {
+            model: model.to_string(),
+            messages: openai_messages,
+            max_tokens: Some(4096),
+            stream: true,
+            extra: extra.clone(),
+            tools: tools.map(|t| t.to_vec()),
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json");
+
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = req
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(format!("API error: {} - {}", status, error_text).into());
+        }
+
+        let mut stream = response.bytes_stream();
+
+        let mut full_content = String::new();
+        let mut thinking_content = String::new();
+        let mut buffer = String::new();
+
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err("Request cancelled by user".into());
+            }
+
+            let chunk = tokio::select! {
+                chunk = stream.next() => chunk,
+                _ = cancel_token.cancelled() => return Err("Request cancelled by user".into()),
+            };
+
+            let Some(bytes) = chunk else {
+                break;
+            };
+            let bytes = bytes?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim_end().to_string();
+                buffer.drain(..=pos);
+
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    #[derive(Deserialize)]
+                    #[allow(dead_code)]
+                    struct StreamingChoice {
+                        delta: StreamingDelta,
+                        #[serde(default)]
+                        finish_reason: Option<String>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamingDelta {
+                        #[serde(default)]
+                        content: Option<String>,
+                        #[serde(default, alias = "reasoning_content")]
+                        reasoning_content: Option<String>,
+                        #[serde(default, alias = "thinking_content", alias = "thinking")]
+                        reasoning: Option<String>,
+                        #[serde(default)]
+                        tool_calls: Option<Vec<StreamingToolCall>>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamingToolCall {
+                        #[serde(default)]
+                        _index: Option<usize>,
+                        #[serde(default)]
+                        _id: Option<String>,
+                        #[serde(default)]
+                        _type: Option<String>,
+                        function: Option<StreamingFunction>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamingFunction {
+                        #[serde(default)]
+                        name: Option<String>,
+                        #[serde(default)]
+                        arguments: Option<String>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamResponse {
+                        choices: Vec<StreamingChoice>,
+                        #[serde(default)]
+                        usage: Option<StreamUsage>,
+                    }
+
+                    #[derive(Deserialize)]
+                    struct StreamUsage {
+                        #[serde(default)]
+                        prompt_tokens: Option<u32>,
+                        #[serde(default)]
+                        completion_tokens: Option<u32>,
+                        #[serde(default)]
+                        total_tokens: Option<u32>,
+                    }
+
+                    if let Ok(response) = serde_json::from_str::<StreamResponse>(data) {
+                        for choice in response.choices {
+                            let reasoning = choice.delta.reasoning.clone().or_else(|| choice.delta.reasoning_content.clone());
+                            if let Some(reasoning) = reasoning {
+                                thinking_content.push_str(&reasoning);
+                                on_thinking(reasoning);
+                            }
+                            if let Some(content) = choice.delta.content {
+                                full_content.push_str(&content);
+                                on_text(content);
+                            }
+                            // Handle tool calls (accumulate and convert to XML format)
+                            if let Some(tool_calls) = choice.delta.tool_calls {
+                                for tool_call in tool_calls {
+                                    if let Some(function) = tool_call.function {
+                                        let name = function.name.unwrap_or_default();
+                                        let arguments = function.arguments.unwrap_or_default();
+
+                                        // Arguments stream in chunks, accumulate them
+                                        if !arguments.is_empty() {
+                                            if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                                                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
+                                                    name, serde_json::to_string(&args_json).unwrap_or_default());
+                                                full_content.push_str(&tool_xml);
+                                                on_text(tool_xml);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         if let Some(usage) = response.usage {
@@ -877,6 +1390,7 @@ mod tests {
         let msg = Message {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
+            images: Vec::new(),
         };
 
         assert_eq!(&*msg.role, "user");
@@ -888,6 +1402,7 @@ mod tests {
         let msg = Message {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
+            images: Vec::new(),
         };
 
         let cloned = msg.clone();
@@ -902,6 +1417,7 @@ mod tests {
         let msg2 = Message {
             role: "assistant".into(),
             content: Arc::new("Hi there".to_string()),
+            images: Vec::new(),
         };
 
         assert_eq!(&*msg.role, "user");
@@ -913,6 +1429,7 @@ mod tests {
         let msg = Message {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
+            images: Vec::new(),
         };
 
         let debug_str = format!("{:?}", msg);
@@ -979,6 +1496,7 @@ mod tests {
             thinking: AnthropicThinking {
                 thinking_type: "enabled".to_string(),
             },
+            tools: None,
         };
         
         let json = serde_json::to_string(&request).unwrap();
@@ -1078,6 +1596,8 @@ mod tests {
             ],
             max_tokens: Some(2048),
             extra: None,
+            tools: None,
+            tool_choice: None,
         };
         
         let json = serde_json::to_string(&request).unwrap();
