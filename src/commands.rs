@@ -197,8 +197,8 @@ fn copy_to_clipboard(text: &str) -> bool {
 
     // Method 1: On Wayland, prefer wl-copy directly (more reliable)
     #[cfg(target_os = "linux")]
-    if is_wayland {
-        if Command::new("wl-copy")
+    if is_wayland
+        && Command::new("wl-copy")
             .arg(text)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -206,9 +206,8 @@ fn copy_to_clipboard(text: &str) -> bool {
             .spawn()
             .map(|p| p.id() > 0)
             .unwrap_or(false)
-        {
-            return true;
-        }
+    {
+        return true;
     }
 
     // Method 2: Try clipboard crate

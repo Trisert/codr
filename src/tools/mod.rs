@@ -16,11 +16,12 @@ use std::sync::Arc;
 // ============================================================
 
 /// Role determines which tools are available and whether they require approval
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Role {
     /// Yolo mode: Full access, all tools auto-approved
     Yolo,
     /// Safe mode: All tools available, write/edit/bash require approval
+    #[default]
     Safe,
     /// Planning mode: Read + bash only, no write/edit tools available
     Planning,
@@ -59,12 +60,6 @@ impl Role {
             Self::Safe => true,  // All tools available, some require approval
             Self::Planning => matches!(tool_name, "read" | "bash" | "grep" | "find" | "file_info"),
         }
-    }
-}
-
-impl Default for Role {
-    fn default() -> Self {
-        Self::Safe
     }
 }
 
@@ -526,10 +521,10 @@ impl ToolRegistry {
 
     /// Get tool descriptions for AI context, organized by category (cached)
     pub fn descriptions(&self) -> String {
-        if let Ok(cache) = self.descriptions_cache.read() {
-            if let Some(cached) = cache.as_ref() {
-                return cached.clone();
-            }
+        if let Ok(cache) = self.descriptions_cache.read()
+            && let Some(cached) = cache.as_ref()
+        {
+            return cached.clone();
         }
 
         let result = self.build_descriptions(None);
@@ -543,10 +538,10 @@ impl ToolRegistry {
 
     /// Get tool descriptions for AI context, filtered by role (cached)
     pub fn descriptions_for_role(&self, role: Role) -> String {
-        if let Ok(cache) = self.descriptions_for_role_cache.read() {
-            if let Some(cached) = cache.get(&role) {
-                return cached.clone();
-            }
+        if let Ok(cache) = self.descriptions_for_role_cache.read()
+            && let Some(cached) = cache.get(&role)
+        {
+            return cached.clone();
         }
 
         let result = self.build_descriptions(Some(role));
@@ -571,7 +566,7 @@ impl ToolRegistry {
         for tool in &tools {
             by_category
                 .entry(tool.category())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(tool.name());
         }
 

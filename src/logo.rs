@@ -14,17 +14,17 @@ fn load_pixel_art_logo() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let img = image::open(icon_path)?;
 
     // Make it smaller - 12 characters width for better detail
-    let target_width = 24;  // 24 pixels = 12 braille characters
+    let target_width = 24; // 24 pixels = 12 braille characters
     let ratio = target_width as f32 / img.width() as f32;
     let mut target_height = (img.height() as f32 * ratio) as u32;
 
     // Ensure height is multiple of 4 for braille patterns
-    target_height = ((target_height + 3) / 4) * 4;
+    target_height = target_height.div_ceil(4) * 4;
 
     let resized = img.resize_exact(
         target_width,
         target_height,
-        image::imageops::FilterType::Nearest,  // Nearest for sharper edges
+        image::imageops::FilterType::Nearest, // Nearest for sharper edges
     );
 
     let mut lines = Vec::new();
@@ -47,13 +47,34 @@ fn load_pixel_art_logo() -> Result<Vec<String>, Box<dyn std::error::Error>> {
             // Collect all 8 pixels first
             let pixels = [
                 resized.get_pixel(x.min(resized.width() - 1), y.min(resized.height() - 1)),
-                resized.get_pixel((x + 1).min(resized.width() - 1), y.min(resized.height() - 1)),
-                resized.get_pixel(x.min(resized.width() - 1), (y + 1).min(resized.height() - 1)),
-                resized.get_pixel((x + 1).min(resized.width() - 1), (y + 1).min(resized.height() - 1)),
-                resized.get_pixel(x.min(resized.width() - 1), (y + 2).min(resized.height() - 1)),
-                resized.get_pixel((x + 1).min(resized.width() - 1), (y + 2).min(resized.height() - 1)),
-                resized.get_pixel(x.min(resized.width() - 1), (y + 3).min(resized.height() - 1)),
-                resized.get_pixel((x + 1).min(resized.width() - 1), (y + 3).min(resized.height() - 1)),
+                resized.get_pixel(
+                    (x + 1).min(resized.width() - 1),
+                    y.min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    x.min(resized.width() - 1),
+                    (y + 1).min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    (x + 1).min(resized.width() - 1),
+                    (y + 1).min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    x.min(resized.width() - 1),
+                    (y + 2).min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    (x + 1).min(resized.width() - 1),
+                    (y + 2).min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    x.min(resized.width() - 1),
+                    (y + 3).min(resized.height() - 1),
+                ),
+                resized.get_pixel(
+                    (x + 1).min(resized.width() - 1),
+                    (y + 3).min(resized.height() - 1),
+                ),
             ];
 
             // Map pixels to braille dots
@@ -90,9 +111,8 @@ fn is_pixel_significant(pixel: &Rgba<u8>) -> bool {
     }
 
     // Calculate perceived brightness using luminance formula
-    let brightness = (pixel[0] as f32 * 0.299
-                    + pixel[1] as f32 * 0.587
-                    + pixel[2] as f32 * 0.114) as u32;
+    let brightness =
+        (pixel[0] as f32 * 0.299 + pixel[1] as f32 * 0.587 + pixel[2] as f32 * 0.114) as u32;
 
     // For a black hole: we want bright areas (accretion disk) to show
     // Higher threshold = less detail, more contrast

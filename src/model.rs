@@ -36,6 +36,23 @@ struct ModelConfig {
     model_type: ModelType,
 }
 
+/// Parameters for OpenAI-compatible streaming queries
+struct OpenAICompatParams<'a> {
+    base_url: &'a str,
+    model: &'a str,
+    api_key: Option<&'a str>,
+    extra: &'a std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Parameters for OpenAI-compatible streaming queries with tools
+struct OpenAICompatParamsWithTools<'a> {
+    base_url: &'a str,
+    model: &'a str,
+    api_key: Option<&'a str>,
+    extra: &'a std::collections::HashMap<String, serde_json::Value>,
+    tools: Option<&'a [OpenAIToolDefinition]>,
+}
+
 // ============================================================
 // Message types - Generic representation
 // ============================================================
@@ -401,10 +418,12 @@ impl Model {
             ModelType::OpenAI { base_url, model, api_key, extra } => {
                 self.query_openai_compat_streaming(
                     &messages_with_reminder,
-                    base_url,
-                    model,
-                    api_key.as_deref(),
-                    extra,
+                    OpenAICompatParams {
+                        base_url,
+                        model,
+                        api_key: api_key.as_deref(),
+                        extra,
+                    },
                     on_text,
                     on_thinking,
                     cancel_token,
@@ -437,11 +456,13 @@ impl Model {
                 let tool_defs = self.create_openai_tools(tools);
                 self.query_openai_compat_streaming_with_tools(
                     messages,
-                    base_url,
-                    model,
-                    api_key.as_deref(),
-                    extra,
-                    Some(&tool_defs),
+                    OpenAICompatParamsWithTools {
+                        base_url,
+                        model,
+                        api_key: api_key.as_deref(),
+                        extra,
+                        tools: Some(&tool_defs),
+                    },
                     on_text,
                     on_thinking,
                     cancel_token,
@@ -871,10 +892,7 @@ impl Model {
     async fn query_openai_compat_streaming<F, G>(
         &self,
         messages: &[Message],
-        base_url: &str,
-        model: &str,
-        api_key: Option<&str>,
-        extra: &std::collections::HashMap<String, serde_json::Value>,
+        params: OpenAICompatParams<'_>,
         mut on_text: F,
         mut on_thinking: G,
         cancel_token: &CancellationToken,
@@ -883,7 +901,7 @@ impl Model {
         F: FnMut(String) + Send,
         G: FnMut(String) + Send,
     {
-        let url = format!("{}/v1/chat/completions", base_url);
+        let url = format!("{}/v1/chat/completions", params.base_url);
 
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
@@ -904,11 +922,11 @@ impl Model {
         }
 
         let request_body = StreamingRequest {
-            model: model.to_string(),
+            model: params.model.to_string(),
             messages: openai_messages,
             max_tokens: Some(4096),
             stream: true,
-            extra: extra.clone(),
+            extra: params.extra.clone(),
         };
 
         let mut req = self
@@ -916,7 +934,7 @@ impl Model {
             .post(&url)
             .header("content-type", "application/json");
 
-        if let Some(key) = api_key {
+        if let Some(key) = params.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
@@ -1039,13 +1057,13 @@ impl Model {
 
                                         // Arguments stream in chunks, accumulate them
                                         // For now, we'll accumulate and emit at the end
-                                        if !arguments.is_empty() {
-                                            if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments) {
-                                                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
-                                                    name, serde_json::to_string(&args_json).unwrap_or_default());
-                                                full_content.push_str(&tool_xml);
-                                                on_text(tool_xml);
-                                            }
+                                        if !arguments.is_empty()
+                                            && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments)
+                                        {
+                                            let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
+                                                name, serde_json::to_string(&args_json).unwrap_or_default());
+                                            full_content.push_str(&tool_xml);
+                                            on_text(tool_xml);
                                         }
                                     }
                                 }
@@ -1079,11 +1097,7 @@ impl Model {
     async fn query_openai_compat_streaming_with_tools<F, G>(
         &self,
         messages: &[Message],
-        base_url: &str,
-        model: &str,
-        api_key: Option<&str>,
-        extra: &std::collections::HashMap<String, serde_json::Value>,
-        tools: Option<&[OpenAIToolDefinition]>,
+        params: OpenAICompatParamsWithTools<'_>,
         mut on_text: F,
         mut on_thinking: G,
         cancel_token: &CancellationToken,
@@ -1092,7 +1106,7 @@ impl Model {
         F: FnMut(String) + Send,
         G: FnMut(String) + Send,
     {
-        let url = format!("{}/v1/chat/completions", base_url);
+        let url = format!("{}/v1/chat/completions", params.base_url);
 
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
@@ -1115,12 +1129,12 @@ impl Model {
         }
 
         let request_body = StreamingRequest {
-            model: model.to_string(),
+            model: params.model.to_string(),
             messages: openai_messages,
             max_tokens: Some(4096),
             stream: true,
-            extra: extra.clone(),
-            tools: tools.map(|t| t.to_vec()),
+            extra: params.extra.clone(),
+            tools: params.tools.map(|t| t.to_vec()),
         };
 
         let mut req = self
@@ -1128,7 +1142,7 @@ impl Model {
             .post(&url)
             .header("content-type", "application/json");
 
-        if let Some(key) = api_key {
+        if let Some(key) = params.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
@@ -1249,13 +1263,13 @@ impl Model {
                                         let arguments = function.arguments.unwrap_or_default();
 
                                         // Arguments stream in chunks, accumulate them
-                                        if !arguments.is_empty() {
-                                            if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments) {
-                                                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
-                                                    name, serde_json::to_string(&args_json).unwrap_or_default());
-                                                full_content.push_str(&tool_xml);
-                                                on_text(tool_xml);
-                                            }
+                                        if !arguments.is_empty()
+                                            && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments)
+                                        {
+                                            let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
+                                                name, serde_json::to_string(&args_json).unwrap_or_default());
+                                            full_content.push_str(&tool_xml);
+                                            on_text(tool_xml);
                                         }
                                     }
                                 }

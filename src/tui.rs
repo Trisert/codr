@@ -1,3 +1,4 @@
+use crate::commands::{CommandRegistry, create_command_registry};
 use crate::error::AgentError;
 use crate::logo;
 use crate::model::{Message, Model};
@@ -70,6 +71,12 @@ pub struct SelectionState {
     pub anchor_line: usize, // For extending selection
 }
 
+impl Default for SelectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SelectionState {
     pub fn new() -> Self {
         Self {
@@ -110,6 +117,12 @@ pub struct ScrollState {
     pub total_lines: usize, // Total rendered lines
     pub viewport_height: usize,
     pub auto_scroll: bool, // Auto-scroll to bottom on new content
+}
+
+impl Default for ScrollState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScrollState {
@@ -472,7 +485,7 @@ async fn agent_loop(
                 return;
             }
             Err(AgentError::Timeout(msg)) => {
-                let _ = tx.send(AgentUpdate::ErrorMessage((&*msg).to_string().into()));
+                let _ = tx.send(AgentUpdate::ErrorMessage((*msg).to_string().into()));
                 conversation.push(Message {
                     role: "user".into(),
                     content: Arc::new(msg),
@@ -509,7 +522,7 @@ async fn agent_loop(
             }
 
             let action_key = match action {
-                Action::Bash { command, .. } => (&*command).to_string(),
+                Action::Bash { command, .. } => (*command).to_string(),
                 Action::Tool { name, params } => format!("{}:{}", name, params),
                 Action::Response(_) => continue,
             };
@@ -535,7 +548,7 @@ async fn agent_loop(
             let result: Result<(Arc<String>, Option<Arc<String>>), String> = match action {
                 Action::Bash { command, .. } => {
                     if !needs_approval {
-                        execute_bash_action(&*command)
+                        execute_bash_action(command)
                             .map(|o| (Arc::new(o), None))
                             .map_err(|e| e.to_string())
                     } else {
@@ -731,6 +744,13 @@ pub struct App {
     file_picker_query: String,
     file_picker_results: Vec<String>,
     file_picker_selected: usize,
+    // Command picker state for / symbol command execution
+    command_picker_active: bool,
+    command_picker_query: String,
+    command_picker_results: Vec<(String, String)>,
+    command_picker_selected: usize,
+    command_picker_explicit: bool,
+    command_registry: CommandRegistry,
 }
 
 impl App {
@@ -780,6 +800,12 @@ impl App {
             file_picker_query: String::new(),
             file_picker_results: Vec::new(),
             file_picker_selected: 0,
+            command_picker_active: false,
+            command_picker_query: String::new(),
+            command_picker_results: Vec::new(),
+            command_picker_selected: 0,
+            command_picker_explicit: false,
+            command_registry: create_command_registry(),
         }
     }
 
@@ -952,7 +978,7 @@ impl App {
                                 self.response_accumulator.clear();
                                 self.thinking_accumulator.clear();
                             }
-                            self.messages.push(ChatMessage::output(&*content));
+                            self.messages.push(ChatMessage::output(&content));
                             self.scroll_state.scroll_to_bottom();
                             should_clear_selection = true;
                         }
@@ -1202,6 +1228,82 @@ impl App {
         self.file_picker_results.get(self.file_picker_selected).cloned()
     }
 
+    // ── Command Picker Methods ───────────────────────────────────────────
+
+    /// Activate command picker and populate with commands
+    pub fn activate_command_picker(&mut self, query: String) {
+        self.command_picker_active = true;
+        self.command_picker_query = query.clone();
+        self.command_picker_selected = 0;
+        self.command_picker_explicit = false;
+
+        let all_commands = self.command_registry.all_commands();
+
+        if query.is_empty() {
+            self.command_picker_results = all_commands;
+        } else {
+            let query_lower = query.to_lowercase();
+            self.command_picker_results = all_commands
+                .into_iter()
+                .filter(|(name, _)| name.to_lowercase().contains(&query_lower))
+                .collect();
+        }
+    }
+
+    /// Deactivate command picker
+    pub fn deactivate_command_picker(&mut self) {
+        self.command_picker_active = false;
+        self.command_picker_query.clear();
+        self.command_picker_results.clear();
+        self.command_picker_selected = 0;
+        self.command_picker_explicit = false;
+    }
+
+    /// Mark that user has explicitly selected a command (via arrow keys or Tab)
+    pub fn command_picker_mark_explicit(&mut self) {
+        self.command_picker_explicit = true;
+    }
+
+    /// Select next command in picker (with wrapping)
+    pub fn command_picker_next(&mut self) {
+        if !self.command_picker_results.is_empty() {
+            self.command_picker_selected = (self.command_picker_selected + 1) % self.command_picker_results.len();
+        }
+    }
+
+    /// Select previous command in picker (with wrapping)
+    pub fn command_picker_prev(&mut self) {
+        if !self.command_picker_results.is_empty() {
+            self.command_picker_selected = if self.command_picker_selected == 0 {
+                self.command_picker_results.len() - 1
+            } else {
+                self.command_picker_selected - 1
+            };
+        }
+    }
+
+    /// Get the currently selected command name
+    pub fn get_selected_command(&self) -> Option<(String, String)> {
+        self.command_picker_results.get(self.command_picker_selected).cloned()
+    }
+
+    /// Execute the selected command - only if user explicitly selected
+    pub fn execute_selected_command(&mut self) -> Option<Result<String, String>> {
+        // Only execute if user explicitly selected (via arrow keys or Tab)
+        if !self.command_picker_explicit {
+            return None;
+        }
+        let name = self.command_picker_results.get(self.command_picker_selected).map(|(n, _)| n.clone())?;
+        if let Some(cmd) = self.command_registry.get(&name) {
+            let result = cmd.execute(self);
+            self.deactivate_command_picker();
+            Some(result)
+        } else {
+            self.deactivate_command_picker();
+            Some(Err(format!("Unknown command: {}", name)))
+        }
+    }
+
     // ── Selection & Copy Methods ─────────────────────────────────────
 
     /// Clear the current selection
@@ -1372,7 +1474,7 @@ impl App {
             ApprovalState::Approved => {
                 if let Some(PendingAction { content: cmd, .. }) = pending {
                     // Execute bash command asynchronously to avoid blocking the event loop
-                    match execute_bash_action_async(&*cmd).await {
+                    match execute_bash_action_async(&cmd).await {
                         Ok(output) => {
                             self.messages.push(ChatMessage::output(&output));
                             conversation.push(Message {
@@ -1635,6 +1737,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         if app.file_picker_active {
             draw_file_picker(f, app);
         }
+
+        // ── Command Picker Popup (if active) ─────────────────────────────
+        if app.command_picker_active {
+            draw_command_picker(f, app);
+        }
     } else {
         // ── Conversation area ────────────────────────────────────
         draw_conversation(f, app, zones[0]);
@@ -1650,6 +1757,11 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
         // ── File Picker Popup (if active) ─────────────────────────────
         if app.file_picker_active {
             draw_file_picker(f, app);
+        }
+
+        // ── Command Picker Popup (if active) ─────────────────────────────
+        if app.command_picker_active {
+            draw_command_picker(f, app);
         }
     }
 }
@@ -1679,31 +1791,30 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     // Build footer spans incrementally to handle width constraints
-    let mut spans = Vec::new();
-
-    // Left: codr branding with model name
-    spans.push(Span::styled(
-        "codr ",
-        Style::default()
-            .fg(Color::Rgb(147, 197, 253))
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        &app.model_name,
-        Style::default()
-            .fg(Color::Rgb(147, 197, 253))
-            .add_modifier(Modifier::BOLD),
-    ));
-
-    // Role badge
-    spans.push(Span::styled(" [", Style::default().fg(Color::Rgb(147, 197, 253))));
-    spans.push(Span::styled(
-        app.role.name(),
-        Style::default()
-            .fg(Color::Rgb(role_r, role_g, role_b))
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled("]", Style::default().fg(Color::Rgb(147, 197, 253))));
+    let mut spans = vec![
+        // Left: codr branding with model name
+        Span::styled(
+            "codr ",
+            Style::default()
+                .fg(Color::Rgb(147, 197, 253))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            &app.model_name,
+            Style::default()
+                .fg(Color::Rgb(147, 197, 253))
+                .add_modifier(Modifier::BOLD),
+        ),
+        // Role badge
+        Span::styled(" [", Style::default().fg(Color::Rgb(147, 197, 253))),
+        Span::styled(
+            app.role.name(),
+            Style::default()
+                .fg(Color::Rgb(role_r, role_g, role_b))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("]", Style::default().fg(Color::Rgb(147, 197, 253))),
+    ];
 
     // Calculate remaining width for right side
     let left_width: usize = spans.iter().map(|s| s.content.width()).sum();
@@ -1781,10 +1892,10 @@ fn get_process_memory_mb() -> u64 {
             for line in status.lines() {
                 if line.starts_with("VmRSS:") {
                     // VmRSS:     12345 kB
-                    if let Some(kb_str) = line.split_whitespace().nth(1) {
-                        if let Ok(kb) = kb_str.parse::<u64>() {
-                            return kb / 1024; // Convert to MB
-                        }
+                    if let Some(kb_str) = line.split_whitespace().nth(1)
+                        && let Ok(kb) = kb_str.parse::<u64>()
+                    {
+                        return kb / 1024; // Convert to MB
                     }
                 }
             }
@@ -2087,7 +2198,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     // Cursor positioning
     if !app.is_processing && !is_pending {
         // Calculate the display width of text up to cursor position
-        let text_before_cursor = &app.input[..app.cursor_position.min(app.input.len())];
+        let text_before_cursor: String = app.input.chars().take(app.cursor_position).collect();
         let cursor_width = text_before_cursor.width();
         let cursor_offset = cursor_width.min(first_line_capacity);
         if cursor_offset < first_line_capacity {
@@ -2245,10 +2356,26 @@ async fn run_event_loop(
                                         app.cursor_position = at_pos;
 
                                         // Insert selected file path
-                                        app.input.insert_str(app.cursor_position, &file_path);
-                                        app.cursor_position += file_path.len();
+                                        let mut new_chars: Vec<char> = app.input.chars().collect();
+                                        for (i, c) in file_path.chars().enumerate() {
+                                            new_chars.insert(app.cursor_position + i, c);
+                                        }
+                                        app.input = new_chars.into_iter().collect();
+                                        app.cursor_position += file_path.chars().count();
                                     }
                                     app.deactivate_file_picker();
+                                }
+                            } else if app.command_picker_active {
+                                // Execute selected command
+                                if let Some(result) = app.execute_selected_command() {
+                                    match result {
+                                        Ok(msg) => {
+                                            app.show_toast(msg);
+                                        }
+                                        Err(msg) => {
+                                            app.messages.push(ChatMessage::error(&msg));
+                                        }
+                                    }
                                 }
                             } else if app.selection.is_active() {
                                 // Copy selection
@@ -2264,6 +2391,9 @@ async fn run_event_loop(
                             if app.file_picker_active {
                                 // Cancel file picker
                                 app.deactivate_file_picker();
+                            } else if app.command_picker_active {
+                                // Cancel command picker
+                                app.deactivate_command_picker();
                             } else if app.selection.is_active() {
                                 app.clear_selection();
                             }
@@ -2322,9 +2452,13 @@ async fn run_event_loop(
                         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             match paste_from_clipboard() {
                                 Some(content) => {
-                                    app.input.insert_str(app.cursor_position, &content);
-                                    app.cursor_position += content.len();
-                                    app.show_toast(format!("Pasted {} chars", content.len()));
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    for (i, c) in content.chars().enumerate() {
+                                        new_chars.insert(app.cursor_position + i, c);
+                                    }
+                                    app.input = new_chars.into_iter().collect();
+                                    app.cursor_position += content.chars().count();
+                                    app.show_toast(format!("Pasted {} chars", content.chars().count()));
                                 }
                                 None => {
                                     app.show_toast(
@@ -2339,9 +2473,13 @@ async fn run_event_loop(
                         {
                             match paste_from_clipboard() {
                                 Some(content) => {
-                                    app.input.insert_str(app.cursor_position, &content);
-                                    app.cursor_position += content.len();
-                                    app.show_toast(format!("Pasted {} chars", content.len()));
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    for (i, c) in content.chars().enumerate() {
+                                        new_chars.insert(app.cursor_position + i, c);
+                                    }
+                                    app.input = new_chars.into_iter().collect();
+                                    app.cursor_position += content.chars().count();
+                                    app.show_toast(format!("Pasted {} chars", content.chars().count()));
                                 }
                                 None => {
                                     app.show_toast(
@@ -2380,7 +2518,9 @@ async fn run_event_loop(
                                 if c == '@' && !app.file_picker_active {
                                     // Insert @ and activate picker
                                     let cursor = app.cursor_position;
-                                    app.input.insert(cursor, c);
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    new_chars.insert(cursor, c);
+                                    app.input = new_chars.into_iter().collect();
                                     app.cursor_position += 1;
 
                                     app.activate_file_picker(String::new());
@@ -2388,7 +2528,9 @@ async fn run_event_loop(
                                 } else if app.file_picker_active {
                                     // Update query and insert character
                                     let cursor = app.cursor_position;
-                                    app.input.insert(cursor, c);
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    new_chars.insert(cursor, c);
+                                    app.input = new_chars.into_iter().collect();
                                     app.cursor_position += 1;
 
                                     // Update picker query
@@ -2402,9 +2544,39 @@ async fn run_event_loop(
                                         // Show all files when query is empty
                                         app.activate_file_picker(String::new());
                                     }
+                                } else if c == '/' && !app.command_picker_active {
+                                    // Insert / and activate command picker
+                                    let cursor = app.cursor_position;
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    new_chars.insert(cursor, c);
+                                    app.input = new_chars.into_iter().collect();
+                                    app.cursor_position += 1;
+
+                                    app.activate_command_picker(String::new());
+                                    app.show_toast(format!("Commands: {} items", app.command_picker_results.len()));
+                                } else if app.command_picker_active {
+                                    // Update query and insert character
+                                    let cursor = app.cursor_position;
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    new_chars.insert(cursor, c);
+                                    app.input = new_chars.into_iter().collect();
+                                    app.cursor_position += 1;
+
+                                    // Update command picker query
+                                    let before_slash: String = app.input.chars().take(app.cursor_position).collect();
+                                    let query_start = before_slash.rfind('/').map(|i| i + 1).unwrap_or(0);
+                                    let query: String = before_slash.chars().skip(query_start).collect();
+
+                                    if !query.is_empty() {
+                                        app.activate_command_picker(query);
+                                    } else {
+                                        app.activate_command_picker(String::new());
+                                    }
                                 } else {
                                     let cursor = app.cursor_position;
-                                    app.input.insert(cursor, c);
+                                    let mut new_chars: Vec<char> = app.input.chars().collect();
+                                    new_chars.insert(cursor, c);
+                                    app.input = new_chars.into_iter().collect();
                                     app.cursor_position += 1;
                                 }
                             }
@@ -2418,7 +2590,9 @@ async fn run_event_loop(
                                 app.exit_history_mode();
 
                                 let cursor = app.cursor_position - 1;
-                                app.input.remove(cursor);
+                                let mut new_chars: Vec<char> = app.input.chars().collect();
+                                new_chars.remove(cursor);
+                                app.input = new_chars.into_iter().collect();
                                 app.cursor_position = cursor;
 
                                 // Update file picker if active
@@ -2440,12 +2614,52 @@ async fn run_event_loop(
                                         }
                                     }
                                 }
+
+                                // Update command picker if active
+                                if app.command_picker_active {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+
+                                    // Check if / was deleted
+                                    if !before_cursor.contains('/') {
+                                        app.deactivate_command_picker();
+                                    } else {
+                                        let query_start = before_cursor.rfind('/').map(|i| i + 1).unwrap_or(0);
+                                        let query: String = before_cursor.chars().skip(query_start).collect();
+
+                                        if !query.is_empty() {
+                                            app.activate_command_picker(query);
+                                        } else {
+                                            app.activate_command_picker(String::new());
+                                        }
+                                    }
+                                }
                             }
                         }
                         KeyCode::Up => {
                             // File picker navigation
                             if app.file_picker_active {
                                 app.file_picker_prev();
+                                // Fill input with selected file
+                                if let Some(file_path) = app.get_selected_file() {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(at_pos) = before_cursor.rfind('@') {
+                                        let prefix: String = app.input.chars().take(at_pos + 1).collect();
+                                        app.input = format!("{}{}", prefix, file_path);
+                                        app.cursor_position = app.input.len();
+                                    }
+                                }
+                            } else if app.command_picker_active {
+                                app.command_picker_prev();
+                                app.command_picker_mark_explicit();
+                                // Fill input with selected command
+                                if let Some((name, _)) = app.get_selected_command() {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(slash_pos) = before_cursor.rfind('/') {
+                                        let prefix: String = app.input.chars().take(slash_pos + 1).collect();
+                                        app.input = format!("{}{}", prefix, name);
+                                        app.cursor_position = app.input.len();
+                                    }
+                                }
                             } else {
                                 // Navigate history
                                 app.history_prev();
@@ -2455,6 +2669,27 @@ async fn run_event_loop(
                             // File picker navigation
                             if app.file_picker_active {
                                 app.file_picker_next();
+                                // Fill input with selected file
+                                if let Some(file_path) = app.get_selected_file() {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(at_pos) = before_cursor.rfind('@') {
+                                        let prefix: String = app.input.chars().take(at_pos + 1).collect();
+                                        app.input = format!("{}{}", prefix, file_path);
+                                        app.cursor_position = app.input.len();
+                                    }
+                                }
+                            } else if app.command_picker_active {
+                                app.command_picker_next();
+                                app.command_picker_mark_explicit();
+                                // Fill input with selected command
+                                if let Some((name, _)) = app.get_selected_command() {
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(slash_pos) = before_cursor.rfind('/') {
+                                        let prefix: String = app.input.chars().take(slash_pos + 1).collect();
+                                        app.input = format!("{}{}", prefix, name);
+                                        app.cursor_position = app.input.len();
+                                    }
+                                }
                             } else {
                                 // Navigate history
                                 app.history_next();
@@ -2466,7 +2701,7 @@ async fn run_event_loop(
                             }
                         }
                         KeyCode::Right => {
-                            if app.cursor_position < app.input.len() {
+                            if app.cursor_position < app.input.chars().count() {
                                 app.cursor_position += 1;
                             }
                         }
@@ -2474,6 +2709,39 @@ async fn run_event_loop(
                         KeyCode::BackTab => {
                             app.cycle_role();
                             app.show_toast(format!("Role: {}", app.role.name()));
+                        }
+                        // -- Tab completion for / and @ pickers --
+                        KeyCode::Tab => {
+                            if app.command_picker_active {
+                                // Complete to first matching command
+                                if !app.command_picker_results.is_empty() {
+                                    if let Some((name, _)) = app.command_picker_results.first() {
+                                        // Find position of / in input
+                                        let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                        if let Some(slash_pos) = before_cursor.rfind('/') {
+                                            // Include the / in prefix
+                                            let prefix: String = app.input.chars().take(slash_pos + 1).collect();
+                                            app.input = format!("{}{}", prefix, name);
+                                            app.cursor_position = app.input.len();
+                                        }
+                                    }
+                                    app.command_picker_mark_explicit();
+                                }
+                            } else if app.file_picker_active {
+                                // Complete to first matching file
+                                if !app.file_picker_results.is_empty()
+                                    && let Some(file_path) = app.file_picker_results.first()
+                                {
+                                    // Find position of @ in input
+                                    let before_cursor: String = app.input.chars().take(app.cursor_position).collect();
+                                    if let Some(at_pos) = before_cursor.rfind('@') {
+                                        // Include the @ in prefix
+                                        let prefix: String = app.input.chars().take(at_pos + 1).collect();
+                                        app.input = format!("{}{}", prefix, file_path);
+                                        app.cursor_position = app.input.len();
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -2563,6 +2831,89 @@ fn draw_file_picker(f: &mut Frame, app: &App) {
                     Span::styled(
                         format!("  {}", file),
                         Style::default().fg(Color::Rgb(180, 180, 190)),
+                    ),
+                ])
+            }
+        })
+        .collect();
+
+    let popup = Paragraph::new(items);
+
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+    f.render_widget(popup, popup_area);
+}
+
+// ── Command Picker Popup ───────────────────────────────────────────
+
+fn draw_command_picker(f: &mut Frame, app: &App) {
+    let results = &app.command_picker_results;
+
+    if results.is_empty() {
+        return;
+    }
+
+    // Calculate popup position and size
+    let popup_width = 60u16;
+    let max_height = 10u16;
+    let total_height = results.len() as u16;
+    let popup_height = total_height.min(max_height);
+
+    // Calculate scroll offset to show selected item
+    let scroll_offset = if app.command_picker_selected >= max_height as usize {
+        app.command_picker_selected - (max_height as usize - 1)
+    } else {
+        0
+    };
+
+    // Position popup above input area
+    let popup_area = ratatui::layout::Rect {
+        x: 2,
+        y: f.area().height.saturating_sub(popup_height + 3), // Above input (3 lines for padding)
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Get visible items (with scrolling)
+    let visible_results: Vec<_> = results
+        .iter()
+        .skip(scroll_offset)
+        .take(popup_height as usize)
+        .enumerate()
+        .collect();
+
+    // Create popup items - show command name and description
+    let items: Vec<Line> = visible_results
+        .iter()
+        .map(|(relative_i, (name, desc))| {
+            let actual_index = scroll_offset + relative_i;
+            let is_selected = actual_index == app.command_picker_selected;
+
+            if is_selected {
+                Line::from(vec![
+                    Span::styled(
+                        format!("/{} ", name),
+                        Style::default()
+                            .fg(Color::Rgb(100, 200, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        desc,
+                        Style::default()
+                            .fg(Color::Rgb(180, 180, 190))
+                            .bg(Color::Rgb(60, 60, 80)),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("/{} ", name),
+                        Style::default()
+                            .fg(Color::Rgb(100, 200, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        desc,
+                        Style::default().fg(Color::Rgb(140, 140, 150)),
                     ),
                 ])
             }

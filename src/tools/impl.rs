@@ -18,6 +18,12 @@ pub struct ReadTool {
     schema: ToolSchema,
 }
 
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReadTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
@@ -135,7 +141,7 @@ impl Tool for ReadTool {
         });
 
         // For display purposes, override content with just the summary
-        output.content_for_display = Some(Arc::new(display_summary.into()));
+        output.content_for_display = Some(Arc::new(display_summary));
 
         Ok(output)
     }
@@ -148,6 +154,12 @@ impl Tool for ReadTool {
 #[allow(dead_code)]
 pub struct BashTool {
     schema: ToolSchema,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BashTool {
@@ -255,6 +267,12 @@ impl Tool for BashTool {
 #[allow(dead_code)]
 pub struct EditTool {
     schema: ToolSchema,
+}
+
+impl Default for EditTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EditTool {
@@ -385,6 +403,12 @@ pub struct FileInfoTool {
     schema: ToolSchema,
 }
 
+impl Default for FileInfoTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileInfoTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
@@ -507,6 +531,12 @@ pub struct WriteTool {
     schema: ToolSchema,
 }
 
+impl Default for WriteTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WriteTool {
     pub fn new() -> Self {
         let schema = ToolSchema::new()
@@ -576,6 +606,12 @@ impl Tool for WriteTool {
 #[allow(dead_code)]
 pub struct GrepTool {
     schema: ToolSchema,
+}
+
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GrepTool {
@@ -685,6 +721,12 @@ impl Tool for GrepTool {
 #[allow(dead_code)]
 pub struct FindTool {
     schema: ToolSchema,
+}
+
+impl Default for FindTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FindTool {

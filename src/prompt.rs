@@ -46,9 +46,10 @@ static PROMPT_STYLES: Lazy<std::collections::HashMap<&'static str, PromptStyle>>
     });
 
 /// System prompt style - different models respond better to different styles
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PromptStyle {
     /// Standard prompt with clear XML format instructions
+    #[default]
     Standard,
     /// Concise prompt for models that prefer brevity
     Concise,
@@ -56,12 +57,6 @@ pub enum PromptStyle {
     Detailed,
     /// Minimal prompt - assumes model understands tool calling
     Minimal,
-}
-
-impl Default for PromptStyle {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// Build a system prompt that works across different LLM families
