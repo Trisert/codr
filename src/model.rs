@@ -591,7 +591,7 @@ impl Model {
     }
 
     // ============================================================
-    // OpenAI-compatible API (llama-server, NVIDIA NIM, etc.)
+    // OpenAI-compatible API (llama-server, etc.)
     // ============================================================
 
     async fn query_openai_compat(

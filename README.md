@@ -16,7 +16,6 @@ codr runs directly in your terminal and provides an interactive interface for co
 - Multi-Provider Support: Works out of the box with:
   - OpenAI-compatible endpoints, which makes it perfect for local models running on llama.cpp.
   - Anthropic API for models like Claude.
-  - NVIDIA NIM endpoints.
 - Safety Roles: You control how much freedom the agent has. You can cycle between these roles using Shift+Tab:
   - SAFE (Default): The agent can read and search freely, but needs your explicit approval before modifying files or running shell commands.
   - PLAN: Strictly read-only mode. Perfect for exploring large codebases or planning architectures without risking accidental changes.
@@ -50,7 +49,7 @@ codr looks for its configuration file in the following order:
 Here is an example `codr.toml` configuration:
 
 ```toml
-# Choose your active provider: "openai", "anthropic", or "nim"
+# Choose your active provider: "openai" or "anthropic"
 model = "openai"
 
 [openai]
@@ -60,11 +59,6 @@ model = "default"
 
 [anthropic]
 api_key = "sk-ant-..." # Alternatively, set the ANTHROPIC_API_KEY environment variable
-
-[nim]
-base_url = "https://integrate.api.nvidia.com"
-model = "meta/llama-3.1-70b-instruct"
-api_key = "..." # Alternatively, set the NVIDIA_API_KEY environment variable
 ```
 
 ## Usage

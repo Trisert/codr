@@ -27,7 +27,7 @@ cargo run -- --yolo --chat
 
 ## Architecture Overview
 
-codr is a terminal-based AI agent (~400 lines of core implementation) that supports multiple LLM providers (OpenAI-compatible/llama.cpp, Anthropic Claude, NVIDIA NIM) and uses a tool-calling approach for codebase interaction.
+codr is a terminal-based AI agent (~400 lines of core implementation) that supports multiple LLM providers (OpenAI-compatible/llama.cpp, Anthropic Claude) and uses a tool-calling approach for codebase interaction.
 
 ### Core Components
 
@@ -163,7 +163,6 @@ The parser uses regex with `(?s)` dotall flag to capture multi-line blocks.
 `ModelType` enum supports multiple providers:
 - **OpenAI** - OpenAI-compatible API (defaults to local llama.cpp at localhost:8080)
 - **Anthropic** - Claude API with extended thinking support
-- **Nim** - NVIDIA NIM endpoints
 
 Each provider implements:
 - Non-streaming `query()` for simple requests
@@ -184,7 +183,7 @@ Config loading priority:
 
 **Example `codr.toml`:**
 ```toml
-model = "openai"  # or "anthropic" or "nim"
+model = "openai"  # or "anthropic"
 
 [openai]
 base_url = "http://localhost:8080"  # llama.cpp default
@@ -193,11 +192,6 @@ api_key = "..."  # optional, for remote APIs
 
 [anthropic]
 api_key = "sk-ant-..."  # or set ANTHROPIC_API_KEY env var
-
-[nim]
-base_url = "https://integrate.api.nvidia.com"
-model = "meta/llama-3.1-70b-instruct"
-api_key = "..."  # or set NVIDIA_API_KEY env var
 ```
 
 For local llama.cpp usage, start the server first:
