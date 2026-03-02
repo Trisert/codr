@@ -68,9 +68,9 @@ api_key = "sk-ant-..." # Alternatively, set the ANTHROPIC_API_KEY environment va
 To start the chat interface, run:
 
 ```bash
-codr --chat
-# or
-codr -c
+codr
+# or run in direct mode for a single task
+codr -d "Your task here"
 ```
 
 Basic keybindings in the TUI:
