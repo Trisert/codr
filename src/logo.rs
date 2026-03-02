@@ -2,10 +2,14 @@ use once_cell::sync::Lazy;
 
 static ASCII_LOGO: Lazy<Vec<String>> = Lazy::new(|| {
     vec![
-        " _ __ ___  ___ ".to_string(),
-        "| '_ ` _ \\/ __|".to_string(),
-        "| | | | | \\__ \\".to_string(),
-        "|_| |_| |_|___/".to_string(),
+        r"                          $$\           ".to_string(),
+        r"                          $$ |          ".to_string(),
+        r" $$$$$$$\  $$$$$$\   $$$$$$$ | $$$$$$\  ".to_string(),
+        r"$$  _____|$$  __$$\ $$  __$$ |$$  __$$\ ".to_string(),
+        r"$$ /      $$ /  $$ |$$ /  $$ |$$ |  \__|".to_string(),
+        r"$$ |      $$ |  $$ |$$ |  $$ |$$ |      ".to_string(),
+        r"\$$$$$$$\ \$$$$$$  |\$$$$$$$ |$$ |      ".to_string(),
+        r" \_______| \______/  \_______|\__|      ".to_string(),
     ]
 });
 
