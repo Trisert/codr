@@ -11,16 +11,14 @@ cargo build
 # Build release version
 cargo build --release
 
-# Run in TUI mode (interactive chat)
-cargo run -- --chat
-# or shorthand
-cargo run -c
+# Run in TUI mode (interactive chat) - this is the default
+cargo run --
 
 # Run in direct mode (single task, non-interactive)
-cargo run -- "your task here"
+cargo run -- -d "your task here"
 
 # Run with YOLO mode (auto-approve bash commands)
-cargo run -- --yolo --chat
+cargo run -- --yolo
 ```
 
 **Note:** There are no tests in this project currently.
@@ -40,6 +38,10 @@ src/
 ├── error.rs         # Custom error types (Timeout, Terminating)
 ├── tui.rs           # Terminal UI with background agent loop pattern
 ├── tui_components.rs # Message rendering, markdown, themes
+├── commands.rs      # Slash command system (/copychat, etc.)
+├── fuzzy.rs         # Fuzzy filtering for file/command pickers
+├── logo.rs          # ASCII logo rendering
+├── prompt.rs        # System prompt builder
 └── tools/
     ├── mod.rs       # Tool trait, registry, context, output types
     ├── impl.rs      # Tool implementations (read, bash, edit, write, grep, find)
@@ -228,16 +230,22 @@ Cancellation (`Ctrl+C`) works by:
 ### TUI Keybindings
 
 **Input Navigation:**
-- `Up/Down` - Navigate prompt history
+- `Up/Down` - Navigate prompt history (or command/file picker when active)
 - `Left/Right` - Move cursor
-- `Enter` - Insert newline
+- `Enter` - Insert newline (or execute command when picker active)
 - `Backspace` - Delete character
+- `Tab` - Complete command/file name in picker
+- `Escape` - Close picker or clear selection
 - Typing exits history mode
 
 **Sending Messages:**
 - `Ctrl+S` - Send message (when not approving)
 - `[a]` - Approve bash command (when pending)
 - `[r]` - Reject bash command (when pending)
+
+**Pickers:**
+- `/` - Open command picker (type to filter, arrows to navigate, Tab to complete, Enter to execute)
+- `@` - Open file picker (type to filter, arrows to navigate, Tab to complete, Enter to select)
 
 **Other:**
 - `Shift+Tab` - Cycle roles (PLAN → SAFE → YOLO → PLAN)
@@ -251,7 +259,6 @@ Cancellation (`Ctrl+C`) works by:
 - `Page Up/Down` - Page scroll
 - `Mouse wheel` - Scroll
 - `Mouse click+drag` - Select text for copying
-- `Escape` - Clear selection
 
 ### Message Rendering
 
