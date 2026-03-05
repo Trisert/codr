@@ -89,10 +89,22 @@ impl<'a> Widget for ConversationWidget<'a> {
         let x = area.x + pad;
         let available_height = area.height.saturating_sub(4); // 2 for banner, 2 for input
 
-        // When scroll_offset is 0, show messages from the end (newest first, auto-scroll)
-        // Show messages (skip scroll_offset from start)
+        // Calculate which messages to show
+        // When scroll_offset = 0, show last N messages that fit (auto-scroll to bottom)
+        // When scroll_offset > 0, skip that many from start (scroll up to see older messages)
+        let total_messages = self.messages.len();
+        let max_visible = (available_height / 2) as usize; // Approx messages that fit (2 lines per message average)
+
+        let start_idx = if self.scroll_offset == 0 {
+            // Auto-scroll: show last N messages
+            total_messages.saturating_sub(max_visible)
+        } else {
+            // Scrolled up: skip scroll_offset from start
+            self.scroll_offset.min(total_messages.saturating_sub(max_visible))
+        };
+
         let messages: Vec<&Message> = self.messages.iter()
-            .skip(self.scroll_offset)
+            .skip(start_idx)
             .collect();
 
         // Render messages in order (oldest first in viewport)
@@ -145,7 +157,7 @@ impl<'a> Widget for ConversationWidget<'a> {
         }
 
         // Scroll indicator
-        if self.scroll_offset > 0 {
+        if start_idx > 0 {
             let scroll_text = "↑ more";
             let scroll_style = Style::default().fg(self.theme.dimmed);
             buf.set_string(area.right() - scroll_text.len() as u16, area.y, scroll_text, scroll_style);
