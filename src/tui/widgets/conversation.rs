@@ -87,30 +87,23 @@ impl<'a> Widget for ConversationWidget<'a> {
         let mut y = area.y;
         let pad = 2;
         let x = area.x + pad;
-        let available_height = area.height.saturating_sub(4); // 2 for banner, 2 for input
 
-        // Calculate which messages to show
-        // When scroll_offset = 0, show last N messages that fit (auto-scroll to bottom)
-        // When scroll_offset > 0, skip that many from start (scroll up to see older messages)
-        let total_messages = self.messages.len();
-        let max_visible = (available_height / 2) as usize; // Approx messages that fit (2 lines per message average)
-
-        let start_idx = if self.scroll_offset == 0 {
-            // Auto-scroll: show last N messages
-            total_messages.saturating_sub(max_visible)
-        } else {
-            // Scrolled up: skip scroll_offset from start
-            self.scroll_offset.min(total_messages.saturating_sub(max_visible))
-        };
-
+        // Simple scroll logic:
+        // - When scroll_offset = 0, show all messages (auto-scroll to bottom)
+        // - When scroll_offset > 0, skip that many messages from start (scroll up to see older)
         let messages: Vec<&Message> = self.messages.iter()
-            .skip(start_idx)
+            .skip(self.scroll_offset)
             .collect();
 
-        // Render messages in order (oldest first in viewport)
+        // Render messages from top to bottom
+        // Stop when we reach the bottom of the viewport (area.bottom() - 2 for input area)
         for message in messages {
-            // Estimate height before rendering
-            let lines = message.content.lines().count().max(1);
+            // Check if we've reached the bottom of the viewport
+            if y >= area.bottom() - 2 {
+                break;
+            }
+
+            // Calculate spacing for this message type
             let (spacing, add_bottom) = match &*message.role {
                 "user" => (1, false),
                 "assistant" => (1, false),
@@ -120,32 +113,21 @@ impl<'a> Widget for ConversationWidget<'a> {
                 _ => (0, false),
             };
 
-            let mut height: usize = lines + spacing;
-            if add_bottom {
-                height += 1;
-            }
-            if &*message.role == "thinking" && spacing == 0 {
-                height += 1;
-            }
-
-            // Check if this message would exceed viewport
-            if y as usize + height > area.y as usize + available_height as usize {
-                break;
-            }
-
-            if y >= area.bottom() - 2 {
-                break;
-            }
-
-            // Add spacing for thinking messages
+            // Add spacing before thinking messages
             if &*message.role == "thinking" && spacing == 0 {
                 y += 1;
             }
 
+            // Add spacing for this message
             y += spacing as u16;
 
-            // Render message based on role
+            // Render the message
             y = self.render_message(message, x, y, area, buf, add_bottom);
+
+            // Add bottom spacing for output messages (which have borders)
+            if add_bottom {
+                y += 1;
+            }
         }
 
         // Render pending action (approve/reject workflow) at bottom
@@ -156,8 +138,8 @@ impl<'a> Widget for ConversationWidget<'a> {
             }
         }
 
-        // Scroll indicator
-        if start_idx > 0 {
+        // Scroll indicator - show when we've scrolled up (skip > 0)
+        if self.scroll_offset > 0 {
             let scroll_text = "↑ more";
             let scroll_style = Style::default().fg(self.theme.dimmed);
             buf.set_string(area.right() - scroll_text.len() as u16, area.y, scroll_text, scroll_style);
