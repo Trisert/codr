@@ -80,7 +80,7 @@ pub trait AsyncToolHandler: Send + Sync {
     fn description(&self) -> &str;
 
     /// Get JSON schema for parameters
-    fn parameters(&self) -> &super::schema::ToolSchema;
+    fn parameters_schema(&self) -> Value;
 
     /// Check if this invocation is mutating (would be unsafe to parallelize)
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {

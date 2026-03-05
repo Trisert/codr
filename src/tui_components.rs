@@ -55,48 +55,42 @@ pub struct Theme {
 }
 
 pub static THEME: Lazy<Theme> = Lazy::new(|| {
-    // We assume a standard dark terminal background (e.g., 30, 30, 30) for the blended background,
-    // since we can't cleanly query actual terminal BG sync here without a termcap/crossterm query wrapper.
-    let user_bg = get_user_message_bg((30, 30, 30));
-
     Theme {
-        // User messages: distinctive background with bright text
+        // User messages: bright white text
         user: Style::default()
-            .fg(Color::Rgb(252, 252, 252)) // Crisp white
-            .bg(user_bg),
-        // Assistant: soft, readable gray with slight blue tint
+            .fg(Color::Rgb(232, 232, 232)),
+        // Assistant: clean near-white
         assistant: Style::default()
-            .fg(Color::Rgb(226, 226, 232)), // Soft white with blue tint
-        // Action: warm amber for better visibility
+            .fg(Color::Rgb(224, 224, 224)),
+        // Action: muted gray for tool calls
         action: Style::default()
-            .fg(Color::Rgb(255, 200, 100)) // Bright amber/gold
+            .fg(Color::Rgb(139, 139, 139))
             .add_modifier(Modifier::ITALIC),
-        // Output: subtle but visible
-        output: Style::default().fg(Color::Rgb(163, 165, 170)), // Medium gray
-        // Error: urgent red
+        // Output: slightly lighter gray
+        output: Style::default().fg(Color::Rgb(158, 158, 158)),
+        // Error: sharp red
         error: Style::default()
-            .fg(Color::Rgb(248, 113, 113)) // Bright red
+            .fg(Color::Rgb(248, 113, 113))
             .add_modifier(Modifier::BOLD),
-        // System: very subtle
-        system: Style::default().fg(Color::Rgb(82, 82, 86)),
-        // Info: calm teal
+        // System: very dim
+        system: Style::default().fg(Color::Rgb(92, 92, 92)),
+        // Info: cool gray-blue
         info: Style::default()
-            .fg(Color::Rgb(103, 232, 189)) // Teal/cyan
-            .add_modifier(Modifier::ITALIC),
-        // Dim: for subtle text
-        dim: Style::default().fg(Color::Rgb(92, 92, 97)),
-        // Separator: subtle divider
-        separator: Style::default().fg(Color::Rgb(46, 46, 48)),
-        // Header: for emphasis
+            .fg(Color::Rgb(139, 157, 195)),
+        // Dim: dark gray
+        dim: Style::default().fg(Color::Rgb(74, 74, 74)),
+        // Separator: near-invisible
+        separator: Style::default().fg(Color::Rgb(42, 42, 46)),
+        // Header: clean white bold
         header: Style::default()
-            .fg(Color::Rgb(203, 213, 245)) // Soft blue-white
+            .fg(Color::Rgb(232, 232, 232))
             .add_modifier(Modifier::BOLD),
-        // Prompt: inviting blue
+        // Prompt: terra-cotta accent
         prompt: Style::default()
-            .fg(Color::Rgb(147, 197, 253)) // Sky blue
+            .fg(Color::Rgb(212, 165, 116))
             .add_modifier(Modifier::BOLD),
-        // Status: subtle footer
-        status: Style::default().fg(Color::Rgb(115, 115, 120)),
+        // Status: muted gray
+        status: Style::default().fg(Color::Rgb(107, 107, 107)),
     }
 });
 
@@ -112,9 +106,9 @@ pub enum ApprovalState {
 
 #[derive(Clone, Debug)]
 pub struct PendingAction {
-    #[allow(dead_code)]
-    pub action_type: Arc<str>,  // Shared, immutable
-    pub content: Arc<String>,  // Shared command content
+    pub action_type: Arc<str>,  // "bash" or tool name
+    pub content: Arc<String>,  // For bash: command, for tools: params as JSON string
+    pub is_tool: bool,  // true if this is a tool action, false if bash
 }
 
 // ── ChatMessage ──────────────────────────────────────────────
@@ -192,7 +186,7 @@ impl ChatMessage {
 // ── Content Cleaning ───────────────────────────────────────────
 
 /// Remove codr tool call tags and thinking tags from content before displaying
-fn clean_tool_tags(content: &str) -> String {
+pub fn clean_tool_tags(content: &str) -> String {
     let mut result = content.to_string();
 
     // Remove <codr_tool>...</codr_tool> tags
@@ -345,11 +339,12 @@ pub fn style_role(role: &str) -> Style {
 
 pub fn role_prefix(role: &str) -> &'static str {
     match role {
-        "user" => "",
-        "assistant" => "▪ ",
-        "action" => "",
-        "output" => "  ",
-        "error" => "✕ ",
+        "user" => "❯ ",
+        "assistant" => "",
+        "action" => "  ⎿ ",
+        "output" => "    ",
+        "error" => "✗ ",
+        "info" => "  → ",
         _ => "",
     }
 }
@@ -362,6 +357,7 @@ pub fn get_role_label(role: &str) -> &str {
         "action" => "Tool",
         "output" => "Output",
         "error" => "Error",
+        "info" => "Info",
         _ => role,
     }
 }
@@ -388,13 +384,13 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
     let mut lines: Vec<Line<'_>> = Vec::new();
     let markdown = MarkdownRenderer::new();
 
-    // Determine spacing based on role (following OpenCode's gap system)
+    // Determine spacing based on role (Claude Code: compact, minimal gaps)
     let spacing = match &*msg.role {
-        "user" => Spacing::Normal,       // 1 line - half blank before user
-        "assistant" => Spacing::Normal,   // 1 line - half blank after thinking
-        "action" => Spacing::Tight,      // 0 lines - no gap between sequential tool calls
-        "info" => Spacing::Tight,        // 0 lines - no gap between sequential tool calls
-        "output" => Spacing::Tight,      // 0 lines - no gap between action and output
+        "user" => Spacing::Normal,       // 1 line before user messages
+        "assistant" => Spacing::Normal,   // 1 line before assistant
+        "action" => Spacing::Tight,      // No gap — tool calls are compact
+        "info" => Spacing::Tight,        // No gap — info is compact
+        "output" => Spacing::Tight,      // No gap — output follows action
         "error" => Spacing::Normal,       // 1 line before error
         _ => Spacing::None,
     };
@@ -410,47 +406,51 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
     // Render message content
     match &*msg.role {
         "assistant" => {
-            // Thinking content (if present) - displayed in italic
+            // Thinking content (if present) - dim italic, unobtrusive
             if let Some(ref thinking) = msg.thinking {
-                let italic_style =
+                let thinking_style =
                     Style::default()
                         .add_modifier(Modifier::ITALIC)
-                        .fg(Color::Rgb(163, 165, 170));
+                        .fg(Color::Rgb(92, 92, 92));
+                let label_style =
+                    Style::default()
+                        .fg(Color::Rgb(74, 74, 74))
+                        .add_modifier(Modifier::ITALIC);
 
                 let mut thinking_lines = thinking.lines().collect::<Vec<_>>();
                 if !thinking_lines.is_empty() {
                     let first_line = thinking_lines.remove(0);
-                    let wrapped = wrap_to_width(first_line, width.saturating_sub(14));
+                    let wrapped = wrap_to_width(first_line, width.saturating_sub(12));
                     for (i, wrapped_line) in wrapped.into_iter().enumerate() {
                         if i == 0 {
                             lines.push(Line::from(vec![
-                                Span::styled("▪ ", t.dim),
-                                Span::styled("Thinking: ", Style::default().fg(Color::Rgb(92, 92, 97)).add_modifier(Modifier::BOLD | Modifier::ITALIC)),
-                                Span::styled(wrapped_line, italic_style),
+                                Span::styled("  thinking: ", label_style),
+                                Span::styled(wrapped_line, thinking_style),
                             ]));
                         } else {
                             lines.push(Line::from(vec![
-                                Span::raw("  "),
-                                Span::styled(wrapped_line, italic_style),
+                                Span::raw("            "),
+                                Span::styled(wrapped_line, thinking_style),
                             ]));
                         }
                     }
 
                     for line in thinking_lines {
-                        let wrapped = wrap_to_width(line, width.saturating_sub(4));
+                        let wrapped = wrap_to_width(line, width.saturating_sub(12));
                         for wrapped_line in wrapped {
                             lines.push(Line::from(vec![
-                                Span::raw("  "),
-                                Span::styled(wrapped_line, italic_style),
+                                Span::raw("            "),
+                                Span::styled(wrapped_line, thinking_style),
                             ]));
                         }
                     }
                 }
-                // Add spacing after thinking
+                // Spacing after thinking
                 lines.push(Line::from(""));
             }
         }
         "action" => {
+            // Tool calls: indented with ⎿ hook in muted gray
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), t.action),
                 Span::styled(&*msg.content, t.action),
@@ -481,46 +481,82 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
             let is_file_content = has_code_patterns && !looks_like_command_output;
 
             if is_file_content {
-                // File content: clean, indented display
+                // File content: bordered block
+                let border_style = Style::default().fg(Color::Rgb(58, 58, 66));
+                let content_style = Style::default().fg(Color::Rgb(180, 180, 180));
+
+                // Top border
+                lines.push(Line::from(vec![Span::styled("┌─", border_style), Span::styled(
+                    "─".repeat(width.saturating_sub(4)),
+                    border_style,
+                )]));
+
                 for line in msg.content.lines() {
-                    let wrapped = wrap_to_width(line, width.saturating_sub(4));
+                    let wrapped = wrap_to_width(line, width.saturating_sub(8));
                     for wrapped_line in wrapped {
-                        lines.push(Line::from(vec![Span::styled(
-                            format!("  {}", wrapped_line),
-                            Style::default().fg(Color::Rgb(203, 213, 245)),
-                        )]));
-                    }
-                }
-            } else {
-                // Command output: subtle background for better visibility
-                let output_style =
-                    Style::default().fg(Color::Rgb(226, 232, 240)).bg(Color::Rgb(38, 38, 42));
-                for line in msg.content.lines() {
-                    let wrapped = wrap_to_width(line, width.saturating_sub(4));
-                    for wrapped_line in wrapped {
-                        let current_width = wrapped_line.width();
-                        let padding = width.saturating_sub(current_width + 2);
+                        let content_len = wrapped_line.width();
+                        let padding = width.saturating_sub(content_len + 4);
                         lines.push(Line::from(vec![
-                            Span::styled("  ", output_style),
-                            Span::styled(wrapped_line, output_style),
-                            Span::styled(" ".repeat(padding), output_style),
+                            Span::styled("│ ", border_style),
+                            Span::styled(wrapped_line, content_style),
+                            Span::styled(format!("{} │", " ".repeat(padding)), border_style),
                         ]));
                     }
                 }
+
+                // Bottom border
+                lines.push(Line::from(vec![Span::styled("└─", border_style), Span::styled(
+                    "─".repeat(width.saturating_sub(4)),
+                    border_style,
+                )]));
+            } else {
+                // Command output: subtle dark bg with border
+                let output_style =
+                    Style::default().fg(Color::Rgb(180, 180, 180)).bg(Color::Rgb(25, 25, 30));
+                let border_style = Style::default().fg(Color::Rgb(58, 58, 66));
+
+                // Top border
+                lines.push(Line::from(vec![
+                    Span::styled(" ", output_style),
+                    Span::styled("┌─", border_style),
+                    Span::styled("─".repeat(width.saturating_sub(6)), border_style),
+                ]));
+
+                for line in msg.content.lines() {
+                    let wrapped = wrap_to_width(line, width.saturating_sub(8));
+                    for wrapped_line in wrapped {
+                        let content_len = wrapped_line.width();
+                        let padding = width.saturating_sub(content_len + 6);
+                        lines.push(Line::from(vec![
+                            Span::styled(" ", output_style),
+                            Span::styled("│ ", border_style),
+                            Span::styled(wrapped_line, output_style),
+                            Span::styled(format!("{} │", " ".repeat(padding)), border_style),
+                        ]));
+                    }
+                }
+
+                // Bottom border
+                lines.push(Line::from(vec![
+                    Span::styled(" ", output_style),
+                    Span::styled("└─", border_style),
+                    Span::styled("─".repeat(width.saturating_sub(6)), border_style),
+                ]));
             }
             return lines;
         }
         "error" => {
+            // Error: red ✗ prefix
             lines.push(Line::from(vec![
-                Span::styled("✕ ", t.error),
+                Span::styled("✗ ", t.error),
                 Span::styled(&*msg.content, t.error),
             ]));
-            lines.push(Line::from(""));
             return lines;
         }
         "info" => {
+            // Info: dim arrow
             lines.push(Line::from(vec![
-                Span::styled("-> ", t.info),
+                Span::styled("  → ", t.info),
                 Span::styled(&*msg.content, t.info),
             ]));
             return lines;
@@ -528,9 +564,9 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
         _ => {}
     }
 
-    // Render message content with padding
+    // Render message content with markdown
     let content_lines = if &*msg.role == "assistant" {
-        markdown.render_with_width(&msg.content, width.saturating_sub(2))
+        markdown.render_with_width(&msg.content, width)
     } else {
         wrap_to_width(&msg.content, width.saturating_sub(3))
             .into_iter()
@@ -538,31 +574,28 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
             .collect()
     };
 
-    // Note: style is now applied inline per role type
-
     for (i, md_line) in content_lines.into_iter().enumerate() {
         if &*msg.role == "user" {
-            // User messages: simple ">" prefix
-            let prefix = "> ";
+            // User messages: ❯ prefix in terra-cotta accent
+            let pfx = if i == 0 { "❯ " } else { "  " };
             let mut line_spans = vec![
-                Span::styled(prefix, Style::default().fg(Color::Rgb(147, 197, 253)).add_modifier(Modifier::BOLD)),
+                if i == 0 {
+                    Span::styled(pfx, t.prompt)
+                } else {
+                    Span::raw(pfx)
+                },
             ];
 
-            // Add content spans with soft white color
+            // Content in bright white
             line_spans.extend(md_line.spans.into_iter().map(|mut s| {
-                s.style = s.style.fg(Color::Rgb(226, 232, 240));
+                s.style = s.style.fg(Color::Rgb(232, 232, 232));
                 s
             }));
 
             lines.push(Line::from(line_spans));
         } else if &*msg.role == "assistant" {
-            // Assistants get the `▪ ` prefix
-            let line_prefix = if i == 0 { "▪ " } else { "  " };
-            let mut line_spans = vec![
-                if i == 0 { Span::styled(line_prefix, t.dim.add_modifier(Modifier::BOLD)) } else { Span::raw(line_prefix) }
-            ];
-            line_spans.extend(md_line.spans);
-            lines.push(Line::from(line_spans));
+            // Assistant: no prefix, just clean left-aligned text
+            lines.push(md_line);
         } else {
             let mut line_spans = vec![Span::raw("  ")];
             line_spans.extend(md_line.spans);
@@ -570,7 +603,6 @@ pub fn render_message(msg: &ChatMessage, width: usize) -> Vec<Line<'_>> {
         }
     }
 
-    // No bottom spacing - let the next message's top spacing handle it
     lines
 }
 
@@ -779,7 +811,7 @@ impl MarkdownRenderer {
     fn render_horizontal_rule(&self) -> Line<'static> {
         Line::from(Span::styled(
             "────────────────────────────────────────",
-            Style::default().fg(Color::Rgb(80, 80, 100)),
+            Style::default().fg(Color::Rgb(42, 42, 46)),
         ))
     }
 
@@ -947,9 +979,9 @@ impl MarkdownRenderer {
             *width = (*width).max(3);
         }
 
-        let border_color = Color::Rgb(82, 82, 92);
+        let border_color = Color::Rgb(58, 58, 66);
         let header_style = Style::default()
-            .fg(Color::Rgb(203, 213, 245)) // Soft blue-white
+            .fg(Color::Rgb(232, 232, 232))
             .add_modifier(Modifier::BOLD);
         let separator_style = Style::default().fg(border_color);
 
@@ -1029,7 +1061,7 @@ impl MarkdownRenderer {
                     let aligned = align_text(&content, width, cell.alignment);
                     // Don't process inline markdown in tables - it breaks borders
                     // Just use the aligned text with default style
-                    row_spans.push(Span::styled(aligned, Style::default().fg(Color::Rgb(220, 220, 220))));
+                    row_spans.push(Span::styled(aligned, Style::default().fg(Color::Rgb(200, 200, 200))));
                     row_spans.push(Span::styled(" │ ", separator_style));
                 }
             }
@@ -1059,7 +1091,7 @@ impl MarkdownRenderer {
 
     /// Render a code block with syntax highlighting (no borders/backticks)
     fn render_code_block(&self, code: &str, language: &str) -> Vec<Line<'static>> {
-        let bg_color = Color::Rgb(30, 30, 35);
+        let bg_color = Color::Rgb(22, 22, 28);
         let bg_style = Style::default().bg(bg_color);
 
         let mut result = Vec::new();
@@ -1140,13 +1172,13 @@ impl MarkdownRenderer {
     fn render_header(&self, line: &str, level: u8) -> Line<'static> {
         let content = &line[level as usize..].trim_start();
         let (color, modifier) = match level {
-            1 => (Color::Cyan, Modifier::BOLD | Modifier::UNDERLINED),
-            2 => (Color::Rgb(180, 210, 255), Modifier::BOLD),
-            3 => (Color::Rgb(200, 170, 255), Modifier::BOLD),
-            4 => (Color::Rgb(220, 190, 255), Modifier::BOLD),
-            5 => (Color::Rgb(240, 210, 255), Modifier::BOLD),
-            6 => (Color::Rgb(240, 230, 255), Modifier::BOLD),
-            _ => (Color::Rgb(180, 210, 255), Modifier::BOLD),
+            1 => (Color::Rgb(232, 232, 232), Modifier::BOLD | Modifier::UNDERLINED),
+            2 => (Color::Rgb(224, 224, 224), Modifier::BOLD),
+            3 => (Color::Rgb(200, 200, 200), Modifier::BOLD),
+            4 => (Color::Rgb(180, 180, 180), Modifier::BOLD),
+            5 => (Color::Rgb(160, 160, 160), Modifier::BOLD),
+            6 => (Color::Rgb(140, 140, 140), Modifier::BOLD),
+            _ => (Color::Rgb(200, 200, 200), Modifier::BOLD),
         };
 
         Line::from(vec![Span::styled(
@@ -1159,16 +1191,16 @@ impl MarkdownRenderer {
     fn render_blockquote(&self, content: &str) -> Line<'static> {
         let processed = self.render_inline_span(
             content,
-            Style::default().fg(Color::Rgb(180, 180, 180)).italic(),
+            Style::default().fg(Color::Rgb(158, 158, 158)).italic(),
         );
-        let mut line = Line::from(Span::styled("│ ", Style::default().fg(Color::Rgb(150, 150, 150))));
+        let mut line = Line::from(Span::styled("│ ", Style::default().fg(Color::Rgb(58, 58, 64))));
         line.spans.extend(processed.spans);
         line
     }
 
     /// Render a list item
     fn render_list_item(&self, content: &str, _ordered: bool) -> Line<'static> {
-        let bullet = Span::styled("• ", Style::default().fg(Color::Rgb(255, 180, 100)));
+        let bullet = Span::styled("• ", Style::default().fg(Color::Rgb(107, 107, 107)));
         let processed = self.render_inline_span(content, Style::default());
         let mut line = Line::from(bullet);
         line.spans.extend(processed.spans);
@@ -1243,10 +1275,10 @@ impl MarkdownRenderer {
         for element in &elements {
             match element {
                 InlineElement::Code(code_content) => {
-                    // Code gets a distinct style with a subtle background
+                    // Inline code: warm amber on subtle dark bg
                     let code_style = Style::default()
-                        .fg(Color::Rgb(251, 191, 36))  // Amber/yellow for code
-                        .bg(Color::Rgb(40, 40, 45));
+                        .fg(Color::Rgb(229, 168, 110))  // Warm amber
+                        .bg(Color::Rgb(35, 35, 40));
                     spans.push(Span::styled(format!("`{}`", code_content), code_style));
                 }
                 InlineElement::Bold(content) => {
@@ -1262,7 +1294,7 @@ impl MarkdownRenderer {
                     spans.push(Span::styled(content.clone(), strike_style));
                 }
                 InlineElement::Link { text, .. } => {
-                    let link_style = base_style.fg(Color::Rgb(147, 197, 253)).add_modifier(Modifier::UNDERLINED);
+                    let link_style = base_style.fg(Color::Rgb(147, 180, 232)).add_modifier(Modifier::UNDERLINED);
                     spans.push(Span::styled(text.clone(), link_style));
                 }
                 InlineElement::Text(s) => {

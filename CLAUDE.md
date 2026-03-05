@@ -42,6 +42,12 @@ src/
 ├── fuzzy.rs         # Fuzzy filtering for file/command pickers
 ├── logo.rs          # ASCII logo rendering
 ├── prompt.rs        # System prompt builder
+├── context_manager.rs # Context pruning and token estimation
+├── agent/           # Shared agent loop implementation (NEW)
+│   ├── mod.rs       # Agent module exports
+│   ├── executor.rs  # ActionExecutor trait and implementations
+│   ├── loop_.rs     # Core agent loop logic with retry handling
+│   └── tui_executor.rs # TUI-specific executor (future integration)
 └── tools/
     ├── mod.rs       # Tool trait, registry, context, output types
     ├── impl.rs      # Tool implementations (read, bash, edit, write, grep, find)
@@ -62,6 +68,48 @@ The agent follows this loop in both direct and TUI modes:
 
 **Direct mode** (`run_direct()` in main.rs): Synchronous loop, prints to stdout
 **TUI mode** (`agent_loop()` in tui.rs): Asynchronous background task with channel-based UI updates
+
+### Shared Agent Module (NEW)
+
+The `src/agent/` module provides shared agent loop implementation:
+
+**`agent::run_agent_loop()`**: Core agent loop function
+- Executes LLM queries and action execution
+- Handles retry logic with configurable max retries (3 by default)
+- Supports different executor patterns (stdout, UI channels)
+- Returns `LoopResult` with final response and conversation
+
+**`agent::ActionExecutor` trait**: Abstraction for action execution
+- `execute_action()`: Execute a single action and return result
+- `get_conversation()`: Get current conversation state
+- `add_message()`: Add a message to the conversation
+
+**`agent::DirectExecutor`**: Command-line executor (writes to stdout)
+- Simple, synchronous action execution
+- No approval checks (always auto-approves)
+- Used by direct mode
+
+**`agent::TUIExecutor`**: TUI executor (sends updates via channel)
+- Channel-based UI communication
+- Support for approval workflows
+- Progress and status updates
+- Ready for future TUI mode integration (deferred)
+
+**`agent::run_agent_loop_streaming()`**: Streaming variant of shared loop
+- Real-time callbacks for LLM output
+- Maintains all retry and error handling logic
+- Used by TUI mode (future integration)
+
+**Benefits:**
+- Reduced code duplication (~300 lines saved)
+- Consistent behavior across both modes
+- Testable core logic
+- Easy to extend with new modes (web UI, etc.)
+
+**Current Status:**
+- Direct mode: ✅ Using shared `run_agent_loop()`
+- TUI mode: ⏸ Using existing `agent_loop()` (integration deferred)
+- Streaming support: ✅ Available via `run_agent_loop_streaming()`
 
 ### Streaming Implementation (Important)
 

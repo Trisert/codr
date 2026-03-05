@@ -23,6 +23,11 @@ struct OpenAIConfig {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    /// Manually specify whether the model supports native tool calling.
+    /// If set, overrides the automatic probe.
+    /// Some models may need this set explicitly if the probe is unreliable.
+    #[serde(default)]
+    native_tools: Option<bool>,
     #[serde(default)]
     extra: std::collections::HashMap<String, toml::Value>,
 }
@@ -121,6 +126,7 @@ impl Config {
                 base_url: self.openai.base_url.clone(),
                 model: self.openai.model.clone(),
                 api_key: self.openai.api_key.clone(),
+                native_tools_override: self.openai.native_tools,
                 extra,
             },
             ModelTypeConfig::Anthropic => {
@@ -212,12 +218,18 @@ api_key = "test-key"
 
         // Change to temp dir so config is found
         let original_dir = std::env::current_dir().unwrap();
-        let _ = std::env::set_current_dir(temp_dir.path());
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Simple guard to restore directory
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = DirGuard(original_dir);
 
         let config = Config::load();
-
-        let _ = std::env::set_current_dir(&original_dir);
-        drop(temp_dir);
 
         assert!(matches!(config.model, ModelTypeConfig::OpenAI));
         assert_eq!(config.openai.base_url, "http://custom:8080");
@@ -241,12 +253,18 @@ api_key = "sk-ant-test-key"
 
         // Change to temp dir so config is found
         let original_dir = std::env::current_dir().unwrap();
-        let _ = std::env::set_current_dir(temp_dir.path());
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Simple guard to restore directory
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _guard = DirGuard(original_dir);
 
         let config = Config::load();
-
-        let _ = std::env::set_current_dir(&original_dir);
-        drop(temp_dir);
 
         assert!(matches!(config.model, ModelTypeConfig::Anthropic));
         assert_eq!(

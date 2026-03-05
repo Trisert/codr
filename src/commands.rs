@@ -94,7 +94,7 @@ impl Command for CopyChatCommand {
         let mut markdown = String::new();
         let mut message_num = 0;
 
-        for msg in &app.messages {
+        for msg in app.messages() {
             match &*msg.role {
                 "user" => {
                     message_num += 1;
@@ -103,12 +103,12 @@ impl Command for CopyChatCommand {
                     markdown.push_str("\n\n");
                 }
                 "assistant" => {
-                    // Include thinking if present
-                    if let Some(ref thinking) = msg.thinking {
-                        markdown.push_str("**Thinking:** ");
-                        markdown.push_str(thinking);
-                        markdown.push_str("\n\n");
-                    }
+                    // TODO: Add thinking support (message struct doesn't have thinking field yet)
+                    // if let Some(ref thinking) = msg.thinking {
+                    //     markdown.push_str("**Thinking:** ");
+                    //     markdown.push_str(thinking);
+                    //     markdown.push_str("\n\n");
+                    // }
                     markdown.push_str(&msg.content);
                     markdown.push_str("\n\n");
                 }

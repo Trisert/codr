@@ -19,6 +19,10 @@ pub enum ModelType {
         base_url: String,
         model: String,
         api_key: Option<String>,
+        /// Manual override for native tool support. If Some(true), force enable.
+        /// If Some(false), force disable (use prompt-based calling).
+        /// If None, run the automatic probe.
+        native_tools_override: Option<bool>,
         extra: std::collections::HashMap<String, serde_json::Value>,
     },
 }
@@ -29,6 +33,8 @@ pub struct Model {
     config: ModelConfig,
     usage: Arc<Mutex<Usage>>,
     base_url: Option<String>,  // Store base_url for interrupt requests
+    /// Cached result of runtime tool support probe (None = not yet probed)
+    tool_support_probed: Arc<Mutex<Option<bool>>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +105,100 @@ impl Serialize for Message {
         state.serialize_field("content", &self.content.as_str())?;
         state.serialize_field("images", &self.images)?;
         state.end()
+    }
+}
+
+// ============================================================
+// Cross-Provider Context Handoff
+// ============================================================
+
+/// Serializable version of Message for cross-provider handoff
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableMessage {
+    pub role: String,
+    pub content: String,
+    pub images: Vec<SerializableImageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableImageAttachment {
+    pub data: String,
+    pub media_type: String,
+}
+
+impl From<&Message> for SerializableMessage {
+    fn from(msg: &Message) -> Self {
+        Self {
+            role: msg.role.to_string(),
+            content: msg.content.to_string(),
+            images: msg.images.iter().map(|img| SerializableImageAttachment {
+                data: img.data.to_string(),
+                media_type: img.media_type.to_string(),
+            }).collect(),
+        }
+    }
+}
+
+impl From<SerializableMessage> for Message {
+    fn from(msg: SerializableMessage) -> Self {
+        Self {
+            role: msg.role.into(),
+            content: Arc::new(msg.content),
+            images: msg.images.into_iter().map(|img| ImageAttachment {
+                data: Arc::new(img.data),
+                media_type: img.media_type.into(),
+            }).collect(),
+        }
+    }
+}
+
+/// Serializable conversation state for cross-provider handoff
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationState {
+    pub messages: Vec<SerializableMessage>,
+    pub system_prompt: Option<String>,
+    pub provider_type: String,
+    pub export_timestamp: i64,
+}
+
+impl Model {
+    /// Export conversation state to JSON for cross-provider handoff
+    pub fn export_conversation_state(
+        &self,
+        messages: &[Message],
+        system_prompt: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let provider_type = match &self.config.model_type {
+            ModelType::Anthropic => "anthropic".to_string(),
+            ModelType::OpenAI { .. } => "openai".to_string(),
+        };
+
+        let serializable_messages: Vec<SerializableMessage> =
+            messages.iter().map(|m| m.into()).collect();
+
+        let state = ConversationState {
+            messages: serializable_messages,
+            system_prompt: system_prompt.map(|s| s.to_string()),
+            provider_type,
+            export_timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64,
+        };
+
+        Ok(serde_json::to_string_pretty(&state)?)
+    }
+
+    /// Import conversation state from JSON for cross-provider handoff
+    pub fn import_conversation_state(
+        &self,
+        json: &str,
+    ) -> Result<(Vec<Message>, Option<String>), Box<dyn std::error::Error>> {
+        let state: ConversationState = serde_json::from_str(json)?;
+
+        let messages: Vec<Message> =
+            state.messages.into_iter().map(|m| m.into()).collect();
+
+        Ok((messages, state.system_prompt))
     }
 }
 
@@ -263,6 +363,7 @@ impl Model {
                 cost_in_currency: None,
             })),
             base_url,
+            tool_support_probed: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -320,16 +421,170 @@ impl Model {
         messages
     }
 
-    /// Check if this model supports native tool calling
+    /// Check if this model supports native tool calling.
+    /// For OpenAI-compatible endpoints:
+    /// 1. Checks manual override (if set in config)
+    /// 2. Falls back to cached probe result
+    /// 3. Defaults to false if not yet probed (prompt-based tool calling is safe fallback)
     pub fn supports_native_tools(&self) -> bool {
         match &self.config.model_type {
             ModelType::Anthropic => true,
-            ModelType::OpenAI { .. } => {
-                // Enable native tools for all OpenAI-compatible endpoints
-                // Most modern local LLM servers (Ollama, LM Studio, llama.cpp, vLLM, etc.)
-                // support OpenAI-compatible tool calling APIs
-                true
+            ModelType::OpenAI { native_tools_override, .. } => {
+                // Use manual override if specified
+                if let Some(override_val) = native_tools_override {
+                    return *override_val;
+                }
+                // Otherwise check cached probe result; default to false if not yet probed
+                self.tool_support_probed
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(false)
             }
+        }
+    }
+
+    /// Probe the OpenAI-compatible server to check if it supports native tool calling.
+    /// Sends a minimal request with a simple tool definition and checks whether
+    /// the response contains structured `tool_calls`.
+    /// Returns `true` if the server supports native tool calling, `false` otherwise.
+    pub async fn probe_tool_support(&self) -> bool {
+        let ModelType::OpenAI { base_url, model, api_key, .. } = &self.config.model_type else {
+            return true; // Anthropic always supports tools
+        };
+
+        let url = format!("{}/v1/chat/completions", base_url);
+
+        let probe_request = serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Use the ping tool now."}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "description": "Respond with pong",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            }],
+            "max_tokens": 64
+        });
+
+        let mut req = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(15));
+
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let response = match req.json(&probe_request).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Tool probe: request failed ({}), assuming no native tool support", e);
+                return false;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            eprintln!("Tool probe: server returned {} , assuming no native tool support", status);
+            return false;
+        }
+
+        // Parse the response to check for tool_calls
+        #[derive(Deserialize)]
+        struct ProbeToolCall {
+            #[serde(default)]
+            function: Option<ProbeFunction>,
+        }
+
+        #[derive(Deserialize)]
+        struct ProbeFunction {
+            #[serde(default)]
+            name: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct ProbeMessage {
+            #[serde(default)]
+            tool_calls: Option<Vec<ProbeToolCall>>,
+        }
+
+        #[derive(Deserialize)]
+        struct ProbeChoice {
+            message: ProbeMessage,
+        }
+
+        #[derive(Deserialize)]
+        struct ProbeResponse {
+            choices: Vec<ProbeChoice>,
+        }
+
+        match response.json::<ProbeResponse>().await {
+            Ok(probe_resp) => {
+                if let Some(choice) = probe_resp.choices.first() {
+                    if let Some(tool_calls) = &choice.message.tool_calls {
+                        let has_valid_tool_call = tool_calls.iter().any(|tc| {
+                            tc.function
+                                .as_ref()
+                                .and_then(|f| f.name.as_ref())
+                                .map(|n| !n.is_empty())
+                                .unwrap_or(false)
+                        });
+                        if has_valid_tool_call {
+                            eprintln!("Tool probe: server supports native tool calling ✓");
+                            return true;
+                        }
+                    }
+                }
+                eprintln!("Tool probe: no tool_calls in response, using prompt-based tool calling");
+                false
+            }
+            Err(e) => {
+                eprintln!("Tool probe: failed to parse response ({}), assuming no native tool support", e);
+                false
+            }
+        }
+    }
+
+    /// Probe the server for tool support and cache the result.
+    /// Should be called once at startup.
+    /// Skips probing if native_tools_override is set in config.
+    pub async fn probe_and_cache_tool_support(&self) {
+        if matches!(&self.config.model_type, ModelType::Anthropic) {
+            // Anthropic always supports tools, no need to probe
+            *self.tool_support_probed.lock().unwrap() = Some(true);
+            return;
+        }
+
+        // Check if manual override is set
+        if let ModelType::OpenAI { native_tools_override: Some(_), .. } = &self.config.model_type {
+            // Override is set, no need to probe - supports_native_tools() will use the override
+            *self.tool_support_probed.lock().unwrap() = None;
+            return;
+        }
+
+        let result = self.probe_tool_support().await;
+        *self.tool_support_probed.lock().unwrap() = Some(result);
+    }
+
+    /// Get a reference to the model type (for capability detection)
+    pub fn model_type(&self) -> &ModelType {
+        &self.config.model_type
+    }
+
+    /// Get the model name (for capability detection)
+    pub fn model_name(&self) -> String {
+        match &self.config.model_type {
+            ModelType::Anthropic => "claude".to_string(),
+            ModelType::OpenAI { model, .. } => model.clone(),
         }
     }
 
@@ -343,7 +598,7 @@ impl Model {
             .map(|t| AnthropicToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
-                input_schema: t.parameters().to_json_schema(),
+                input_schema: t.parameters_schema(),
             })
             .collect()
     }
@@ -360,7 +615,7 @@ impl Model {
                 function: OpenAIFunctionDefinition {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
-                    parameters: t.parameters().to_json_schema(),
+                    parameters: t.parameters_schema(),
                 },
             })
             .collect()
@@ -371,7 +626,7 @@ impl Model {
 
         match &self.config.model_type {
             ModelType::Anthropic => self.query_anthropic(&messages_with_reminder, None).await,
-            ModelType::OpenAI { base_url, model, api_key, extra } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 self.query_openai_compat(&messages_with_reminder, base_url, model, api_key.as_deref(), extra)
                     .await
             }
@@ -389,7 +644,7 @@ impl Model {
                 let tool_defs = self.create_anthropic_tools(tools);
                 self.query_anthropic(messages, Some(&tool_defs)).await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 let tool_defs = self.create_openai_tools(tools);
                 self.query_openai_compat_with_tools(messages, base_url, model, api_key.as_deref(), extra, Some(&tool_defs))
                     .await
@@ -415,7 +670,7 @@ impl Model {
                 self.query_anthropic_streaming(&messages_with_reminder, None, on_text, on_thinking, cancel_token)
                     .await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 self.query_openai_compat_streaming(
                     &messages_with_reminder,
                     OpenAICompatParams {
@@ -452,7 +707,7 @@ impl Model {
                 self.query_anthropic_streaming(messages, Some(&tool_defs), on_text, on_thinking, cancel_token)
                     .await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 let tool_defs = self.create_openai_tools(tools);
                 self.query_openai_compat_streaming_with_tools(
                     messages,
@@ -940,7 +1195,7 @@ impl Model {
 
         let response = req
             .json(&request_body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(300))
             .send()
             .await?;
 
@@ -955,6 +1210,8 @@ impl Model {
         let mut full_content = String::new();
         let mut thinking_content = String::new();
         let mut buffer = String::new();
+        // Accumulate tool call chunks: index -> (name, arguments_so_far)
+        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> = std::collections::HashMap::new();
 
         loop {
             // Check for cancellation before each chunk
@@ -1004,7 +1261,7 @@ impl Model {
                     #[derive(Deserialize)]
                     struct StreamingToolCall {
                         #[serde(default)]
-                        _index: Option<usize>,
+                        index: Option<usize>,
                         #[serde(default)]
                         _id: Option<String>,
                         #[serde(default)]
@@ -1048,22 +1305,30 @@ impl Model {
                                 full_content.push_str(&content);
                                 on_text(content);
                             }
-                            // Handle tool calls (accumulate and convert to XML format)
+                            // Handle tool calls: accumulate name and arguments across chunks
                             if let Some(tool_calls) = choice.delta.tool_calls {
                                 for tool_call in tool_calls {
+                                    let idx = tool_call.index.unwrap_or(0);
                                     if let Some(function) = tool_call.function {
-                                        let name = function.name.unwrap_or_default();
-                                        let arguments = function.arguments.unwrap_or_default();
-
-                                        // Arguments stream in chunks, accumulate them
-                                        // For now, we'll accumulate and emit at the end
-                                        if !arguments.is_empty()
-                                            && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments)
-                                        {
-                                            let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
-                                                name, serde_json::to_string(&args_json).unwrap_or_default());
-                                            full_content.push_str(&tool_xml);
-                                            on_text(tool_xml);
+                                        let entry = tool_call_accumulators.entry(idx)
+                                            .or_insert_with(|| (String::new(), String::new(), 0));
+                                        if let Some(name) = function.name {
+                                            if !name.is_empty() && entry.0.is_empty() {
+                                                entry.0 = name.clone();
+                                                // Stream tool name when first detected
+                                                on_text(format!("\n⚙ Calling {}...", name));
+                                            }
+                                        }
+                                        if let Some(arguments) = function.arguments {
+                                            entry.1.push_str(&arguments);
+                                            let new_len = entry.1.len();
+                                            // Stream progress every ~1KB of new argument data
+                                            let last_reported = entry.2;
+                                            if new_len >= last_reported + 1024 {
+                                                let size_kb = new_len as f64 / 1024.0;
+                                                on_text(format!("⚙ {}: generating ({:.1}KB)...", entry.0, size_kb));
+                                                entry.2 = new_len;
+                                            }
                                         }
                                     }
                                 }
@@ -1080,6 +1345,26 @@ impl Model {
                         // Sometimes the event is just an empty string or generic message we don't care about,
                         // but if we fail to parse a non-empty payload, we just ignore it.
                     }
+                }
+            }
+        }
+
+        // Emit accumulated tool calls as complete XML
+        let mut sorted_indices: Vec<usize> = tool_call_accumulators.keys().copied().collect();
+        sorted_indices.sort();
+        for idx in sorted_indices {
+            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx) {
+                if !name.is_empty() {
+                    // Try to parse the accumulated arguments as JSON for validation
+                    let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
+                        serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
+                    } else {
+                        // Use raw arguments even if not valid JSON - parser can handle it
+                        arguments.clone()
+                    };
+                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
+                    full_content.push_str(&tool_xml);
+                    on_text(tool_xml);
                 }
             }
         }
@@ -1148,7 +1433,7 @@ impl Model {
 
         let response = req
             .json(&request_body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(300))
             .send()
             .await?;
 
@@ -1163,6 +1448,8 @@ impl Model {
         let mut full_content = String::new();
         let mut thinking_content = String::new();
         let mut buffer = String::new();
+        // Accumulate tool call chunks: index -> (name, arguments_so_far)
+        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> = std::collections::HashMap::new();
 
         loop {
             if cancel_token.is_cancelled() {
@@ -1211,7 +1498,7 @@ impl Model {
                     #[derive(Deserialize)]
                     struct StreamingToolCall {
                         #[serde(default)]
-                        _index: Option<usize>,
+                        index: Option<usize>,
                         #[serde(default)]
                         _id: Option<String>,
                         #[serde(default)]
@@ -1255,21 +1542,30 @@ impl Model {
                                 full_content.push_str(&content);
                                 on_text(content);
                             }
-                            // Handle tool calls (accumulate and convert to XML format)
+                            // Handle tool calls: accumulate name and arguments across chunks
                             if let Some(tool_calls) = choice.delta.tool_calls {
                                 for tool_call in tool_calls {
+                                    let idx = tool_call.index.unwrap_or(0);
                                     if let Some(function) = tool_call.function {
-                                        let name = function.name.unwrap_or_default();
-                                        let arguments = function.arguments.unwrap_or_default();
-
-                                        // Arguments stream in chunks, accumulate them
-                                        if !arguments.is_empty()
-                                            && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&arguments)
-                                        {
-                                            let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>",
-                                                name, serde_json::to_string(&args_json).unwrap_or_default());
-                                            full_content.push_str(&tool_xml);
-                                            on_text(tool_xml);
+                                        let entry = tool_call_accumulators.entry(idx)
+                                            .or_insert_with(|| (String::new(), String::new(), 0));
+                                        if let Some(name) = function.name {
+                                            if !name.is_empty() && entry.0.is_empty() {
+                                                entry.0 = name.clone();
+                                                // Stream tool name when first detected
+                                                on_text(format!("\n⚙ Calling {}...\n", name));
+                                            }
+                                        }
+                                        if let Some(arguments) = function.arguments {
+                                            entry.1.push_str(&arguments);
+                                            let new_len = entry.1.len();
+                                            // Stream progress every ~1KB of new argument data
+                                            let last_reported = entry.2;
+                                            if new_len >= last_reported + 1024 {
+                                                let size_kb = new_len as f64 / 1024.0;
+                                                on_text(format!("⚙ {}: generating ({:.1}KB)...\n", entry.0, size_kb));
+                                                entry.2 = new_len;
+                                            }
                                         }
                                     }
                                 }
@@ -1290,6 +1586,24 @@ impl Model {
             }
         }
 
+        // Emit accumulated tool calls as complete XML
+        let mut sorted_indices: Vec<usize> = tool_call_accumulators.keys().copied().collect();
+        sorted_indices.sort();
+        for idx in sorted_indices {
+            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx) {
+                if !name.is_empty() {
+                    let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
+                        serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
+                    } else {
+                        arguments.clone()
+                    };
+                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
+                    full_content.push_str(&tool_xml);
+                    on_text(tool_xml);
+                }
+            }
+        }
+
         if !thinking_content.is_empty() {
             Ok(format!(
                 "<thinking>{}</thinking>\n\n{}",
@@ -1297,6 +1611,26 @@ impl Model {
             ))
         } else {
             Ok(full_content)
+        }
+    }
+}
+
+// ============================================================
+// Cache Key Trait (for model_probe capability cache)
+// ============================================================
+
+/// Trait for generating cache keys for models
+pub trait CacheKey {
+    fn get_cache_key(&self) -> String;
+}
+
+impl CacheKey for Model {
+    fn get_cache_key(&self) -> String {
+        match &self.config.model_type {
+            ModelType::Anthropic => "anthropic:claude".to_string(),
+            ModelType::OpenAI { base_url, model, .. } => {
+                format!("openai:{}:{}", base_url, model)
+            }
         }
     }
 }
@@ -1361,11 +1695,12 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: Some("test-key".to_string()),
+            native_tools_override: None,
             extra: std::collections::HashMap::new(),
         };
 
         match mt {
-            ModelType::OpenAI { base_url, model, api_key, extra: _ } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -1386,7 +1721,7 @@ mod tests {
         let mt2 = mt1.clone();
 
         match mt2 {
-            ModelType::OpenAI { base_url, model, api_key, extra: _ } => {
+            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -1738,5 +2073,64 @@ mod tests {
     #[test]
     fn test_anthropic_api_url() {
         assert_eq!(ANTHROPIC_API_URL, "https://api.anthropic.com/v1/messages");
+    }
+
+    // ============================================================
+    // Tool Support Probe Tests
+    // ============================================================
+
+    #[test]
+    fn test_anthropic_supports_native_tools() {
+        let model = Model::new(ModelType::Anthropic);
+        // Anthropic always supports native tools (no probe needed)
+        assert!(model.supports_native_tools());
+    }
+
+    #[test]
+    fn test_openai_defaults_to_no_native_tools_when_unprobed() {
+        let model = Model::new(ModelType::OpenAI {
+            base_url: "http://localhost:8080".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            extra: std::collections::HashMap::new(),
+        });
+        // Before probing, OpenAI should default to false (safe fallback)
+        assert!(!model.supports_native_tools());
+    }
+
+    #[test]
+    fn test_openai_respects_cached_probe_true() {
+        let model = Model::new(ModelType::OpenAI {
+            base_url: "http://localhost:8080".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            extra: std::collections::HashMap::new(),
+        });
+        // Simulate a successful probe
+        *model.tool_support_probed.lock().unwrap() = Some(true);
+        assert!(model.supports_native_tools());
+    }
+
+    #[test]
+    fn test_openai_respects_cached_probe_false() {
+        let model = Model::new(ModelType::OpenAI {
+            base_url: "http://localhost:8080".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            extra: std::collections::HashMap::new(),
+        });
+        // Simulate a failed probe
+        *model.tool_support_probed.lock().unwrap() = Some(false);
+        assert!(!model.supports_native_tools());
+    }
+
+    #[test]
+    fn test_anthropic_probe_caches_true() {
+        let model = Model::new(ModelType::Anthropic);
+        // Manually call the synchronous cache-setting path
+        // (probe_and_cache_tool_support is async but for Anthropic it just sets true)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(model.probe_and_cache_tool_support());
+        assert_eq!(*model.tool_support_probed.lock().unwrap(), Some(true));
     }
 }

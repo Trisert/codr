@@ -1,0 +1,14 @@
+pub mod tui;
+pub mod agent;
+pub mod commands;
+pub mod config;
+pub mod context_manager;
+pub mod error;
+pub mod fuzzy;
+pub mod logo;
+pub mod model;
+pub mod model_probe;
+pub mod model_registry;
+pub mod parser;
+pub mod prompt;
+pub mod tools;

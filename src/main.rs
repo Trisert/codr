@@ -1,20 +1,22 @@
+pub mod agent;
 pub mod commands;
 pub mod config;
+pub mod context_manager;
 pub mod error;
 pub mod fuzzy;
 pub mod logo;
 pub mod model;
+pub mod model_probe;
+pub mod model_registry;
 pub mod parser;
 pub mod prompt;
 pub mod tools;
 pub mod tui;
-pub mod tui_components;
 
 use clap::Parser;
 use config::Config;
-use error::AgentError;
+use context_manager::ContextManager;
 use model::{Model, ModelType};
-use parser::{Action, parse_actions};
 use prompt::{build_system_prompt, get_model_type_identifier, get_recommended_style, PromptStyle};
 use tools::{ToolRegistry, create_coding_tools, Role};
 
@@ -45,16 +47,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_type = config.to_model_type();
     let model = Model::new(model_type.clone());
 
+    // Probe the server for native tool calling support (runs once at startup)
+    model.probe_and_cache_tool_support().await;
+
     // Get model name for display
-    let model_name = match &model_type {
+    let _model_name = match &model_type {
         ModelType::OpenAI { model, .. } => model.clone(),
         ModelType::Anthropic => "claude".to_string(),
     };
 
     // Create tool registry
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let tool_registry = create_coding_tools(cwd);
+    let tool_registry = std::sync::Arc::new(create_coding_tools(cwd.clone()));
     let tools_description = tool_registry.descriptions();
+
+    // Create async tool registry for parallel execution and streaming
+    let _async_tool_registry = std::sync::Arc::new(
+        crate::tools::async_wrapper::create_async_coding_tools(cwd)
+    );
 
     // Direct mode is only used when explicitly requested with --direct/-d
     // Otherwise, TUI (chat) mode is the default
@@ -62,25 +72,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if use_tui {
         // TUI mode (interactive chat - default)
-        let model_type_id = get_model_type_identifier(&model_type);
-        let prompt_style = get_recommended_style(model_type_id);
-        let system_prompt = build_system_prompt(
-            &tools_description,
-            &load_project_context().unwrap_or_default(),
-            prompt_style,
-        );
-        let mut app = tui::App::new(model, tool_registry, model_name, cli.yolo);
-        app.set_system_prompt(&system_prompt);
+        let initial_messages = Vec::new(); // Start with empty conversation
 
-        // If task provided, use it as initial message
-        if !cli.task.is_empty() {
-            let initial_task = cli.task.join(" ");
-            app.messages
-                .push(tui_components::ChatMessage::user(&initial_task));
-            app.start_processing();
-        }
+        // Create role from cli flags
+        let role = if cli.yolo {
+            Role::Yolo
+        } else {
+            Role::Safe
+        };
 
-        tui::run_tui(app).await?;
+        // Run TUI with integrated agent
+        tui::run_tui_agent(model, tool_registry, initial_messages, role).await?;
     } else {
         // Direct mode (non-interactive, single task execution)
         let initial_task = cli.task.join(" ");
@@ -117,211 +119,61 @@ async fn run_direct(
     prompt_style: PromptStyle,
     initial_task: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use agent::{DirectExecutor, run_agent_loop};
+    use std::sync::Arc;
+
     // Initialize messages with system prompt and user task
     let system_prompt = build_system_prompt(tools_description, project_context, prompt_style);
-    let mut messages = model.create_messages(vec![
+    let initial_messages = model.create_messages(vec![
         ("system", &system_prompt),
         ("user", initial_task),
     ]);
 
-    // Main agent loop - exits when a plain text response is received
-    'agent_loop: loop {
-        // Use native tool calling if the model supports it (direct mode uses Yolo role)
-        let lm_output = if model.supports_native_tools() {
-            let tools_for_role = tool_registry.get_tools_for_role(Role::Yolo);
-            let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
-            model.query_with_tools(&messages, &tools_refs).await?
-        } else {
-            model.query(&messages).await?
-        };
-        println!("LM output:\n{}", lm_output);
-        println!("\n{}", "─".repeat(60));
+    // Create context manager for token-aware message pruning (128k token limit)
+    let mut context_manager = ContextManager::new(128_000, &system_prompt);
 
-        // Remember what the LM said
-        messages = model.add_assistant_message(messages, &lm_output);
-
-        // Parse the actions
-        let parsed = match parse_actions(&lm_output) {
-            Ok(p) => p,
-            Err(AgentError::Terminating(msg)) => {
-                println!("{}", msg);
-                break;
-            }
-            Err(AgentError::Timeout(msg)) => {
-                println!("Timeout: {}", msg);
-                messages = model.add_user_message(messages, &msg);
-                continue;
-            }
-        };
-
-        // Handle each action
-        let mut all_outputs = Vec::new();
-
-        for action in &parsed.actions {
-            // Handle plain text response (no tools needed)
-            if let Action::Response(response) = action {
-                println!("{}", response);
-                println!("\n{}", "═".repeat(60));
-                println!();
-                break 'agent_loop; // Exit the agent loop after a plain text response
-            }
-
-            // Execute tool/bash actions
-            let output = match execute_action(action, tool_registry) {
-                Ok(o) => o,
-                Err(AgentError::Terminating(msg)) => {
-                    println!("{}", msg);
-                    break 'agent_loop;
-                }
-                Err(AgentError::Timeout(msg)) => msg,
-            };
-
-            println!("Output:\n{}", output);
-            println!("\n{}", "═".repeat(60));
-            println!();
-
-            all_outputs.push(output);
+    // Add initial messages to context manager
+    for msg in &initial_messages {
+        if &*msg.role != "system" {
+            context_manager.add_message(msg.clone());
         }
-
-        // Send command outputs back to LM
-        let combined_output = all_outputs.join("\n---\n\n");
-        messages = model.add_user_message(messages, &combined_output);
     }
 
+    // Prune messages to fit (reserve 8k tokens for response)
+    context_manager.prune_to_fit(8192);
+
+    // Build initial messages from pruned context
+    let mut messages = vec![initial_messages[0].clone()]; // Keep system prompt
+    for msg in context_manager.get_messages() {
+        messages.push(msg);
+    }
+
+    // Create tool registry for the executor (we create a new instance since ToolRegistry is not cloneable)
+    // This is safe because create_coding_tools creates the same tools each time
+    let tool_registry_owned = create_coding_tools(std::env::current_dir()?);
+    let tool_registry_arc = Arc::new(tool_registry_owned);
+    let executor = DirectExecutor::new(tool_registry_arc);
+
+    // Run the shared agent loop with the same registry reference
+    let result = run_agent_loop(
+        &model,
+        messages,
+        tool_registry,
+        executor,
+        &Role::Yolo,
+    )
+    .await
+    .map_err(|e| format!("Agent loop error: {}", e))?;
+
+    // Print final response if any
+    if let Some(response) = result.final_response {
+        println!("{}", response);
+        println!("\n{}", "═".repeat(60));
+        println!();
+    }
+
+    println!("Executed {} actions", result.actions_executed);
     Ok(())
-}
-
-// ============================================================
-// Execute Action
-// ============================================================
-
-fn execute_action(action: &Action, tool_registry: &ToolRegistry) -> Result<String, AgentError> {
-    use std::process::Command;
-    use std::sync::mpsc;
-    use std::thread;
-
-    match action {
-        Action::Bash {
-            command,
-            workdir,
-            timeout_ms,
-            env,
-        } => {
-            if command.trim() == "exit" {
-                return Err(AgentError::Terminating(
-                    "Agent requested to exit".to_string(),
-                ));
-            }
-
-            let mut cmd = Command::new("bash");
-            cmd.arg("-c")
-                .arg(&**command)
-                .env("PAGER", "cat")
-                .env("MANPAGER", "cat")
-                .env("LESS", "-R")
-                .env("PIP_PROGRESS_BAR", "off")
-                .env("TQDM_DISABLE", "1");
-
-            if let Some(dir) = workdir {
-                cmd.current_dir(&**dir);
-            }
-
-            if let Some(env_vars) = env
-                && let Some(obj) = env_vars.as_object()
-            {
-                for (key, value) in obj {
-                    if let Some(v) = value.as_str() {
-                        cmd.env(key, v);
-                    }
-                }
-            }
-
-            let result = if let Some(timeout) = timeout_ms {
-                let (tx, rx) = mpsc::channel();
-                let cmd_str = command.clone();
-                let workdir_clone = workdir.clone();
-                let env_clone = env.clone();
-
-                thread::spawn(move || {
-                    let mut cmd = Command::new("bash");
-                    cmd.arg("-c")
-                        .arg(&*cmd_str)
-                        .env("PAGER", "cat")
-                        .env("MANPAGER", "cat")
-                        .env("LESS", "-R")
-                        .env("PIP_PROGRESS_BAR", "off")
-                        .env("TQDM_DISABLE", "1");
-
-                    if let Some(dir) = &workdir_clone {
-                        cmd.current_dir(&**dir);
-                    }
-                    if let Some(env_vars) = &env_clone
-                        && let Some(obj) = env_vars.as_object()
-                    {
-                        for (key, value) in obj {
-                            if let Some(v) = value.as_str() {
-                                cmd.env(key, v);
-                            }
-                        }
-                    }
-
-                    let output = cmd.output();
-                    tx.send(output).ok();
-                });
-
-                match rx.recv_timeout(std::time::Duration::from_millis(*timeout)) {
-                    Ok(Ok(output)) => Ok((
-                        output.status,
-                        output.stdout.to_vec(),
-                        output.stderr.to_vec(),
-                    )),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "command timed out",
-                    )),
-                }
-            } else {
-                cmd.output()
-                    .map(|o| (o.status, o.stdout.to_vec(), o.stderr.to_vec()))
-            };
-
-            match result {
-                Ok((status, stdout, stderr)) => {
-                    if !status.success() {
-                        return Err(AgentError::Timeout(format!(
-                            "Command exited with code: {:?}",
-                            status.code()
-                        )));
-                    }
-                    let stdout_str = String::from_utf8_lossy(&stdout).to_string();
-                    let stderr_str = String::from_utf8_lossy(&stderr).to_string();
-                    Ok(format!("{}\n{}", stdout_str, stderr_str).trim().to_string())
-                }
-                Err(e) => Err(AgentError::Timeout(format!(
-                    "Command execution failed: {}",
-                    e
-                ))),
-            }
-        }
-        Action::Tool { name, params } => match tool_registry.execute(name, params.clone()) {
-            Ok(output) => {
-                let mut result = (*output.content).clone();
-                if !output.attachments.is_empty() {
-                    result.push_str(&format!("\n[{} attachment(s)]", output.attachments.len()));
-                }
-                if let Some(line_count) = output.metadata.line_count {
-                    result.push_str(&format!("\n[Lines: {}]", line_count));
-                }
-                if output.metadata.truncated {
-                    result.push_str(" [truncated]");
-                }
-                Ok(result)
-            }
-            Err(e) => Ok(format!("Tool error: {}", e)),
-        },
-        Action::Response(response) => Ok(response.to_string()),
-    }
 }
 
 // ============================================================

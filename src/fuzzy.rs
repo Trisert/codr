@@ -4,9 +4,10 @@
 /// Returns Some(score) if the query matches the target, None otherwise.
 /// Higher scores indicate better matches.
 ///
-/// Scoring for substring matching:
+/// Scoring:
 /// - Exact match: 100 points
-/// - Case-insensitive substring match: score based on match position and length
+/// - Prefix match: 100 + (query length * 7.5) points, capped at 130
+/// - Substring match: score based on position and length
 pub fn fuzzy_match(query: &str, target: &str) -> Option<usize> {
     let query_lower = query.to_lowercase();
     let target_lower = target.to_lowercase();
@@ -23,6 +24,14 @@ pub fn fuzzy_match(query: &str, target: &str) -> Option<usize> {
 
     // Substring match
     if let Some(pos) = target_lower.find(&query_lower) {
+        // Check if it's a prefix match (starts at position 0)
+        if pos == 0 {
+            // Prefix match gets a bonus: 100 + length bonus
+            let length_bonus = (query.len() * 15).min(30);
+            return Some(100 + length_bonus);
+        }
+
+        // Non-prefix substring match
         // Score based on position (earlier is better) and length (longer is better)
         let position_score = 50 - (pos * 5); // Earlier matches get higher score
         let length_score = query.len() * 10; // Longer matches get higher score

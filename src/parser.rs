@@ -1,5 +1,4 @@
 use crate::error::AgentError;
-use regex::Regex;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ pub enum Action {
 impl Action {
     pub fn is_read_only(&self) -> bool {
         match self {
-            Action::Tool { name, .. } => matches!(name.as_ref(), "read" | "grep" | "find"),
+            Action::Tool { name, .. } => matches!(name.as_ref(), "read" | "grep" | "find" | "file_info"),
             Action::Bash { .. } => false,
             Action::Response(_) => false,
         }
@@ -36,9 +35,16 @@ impl Action {
 // Parse Action
 // ============================================================
 
-/// Parse codr_tool XML format: <codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-fn parse_tool_action(content: &str) -> Option<Action> {
-    // First try XML format
+/// Parse XML tool format: <codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
+/// (Temporary compatibility during migration)
+fn parse_xml_tool_call(content: &str) -> Option<Action> {
+    // Strip thinking content if present (models may output <thinking>...</thinking> before tool calls)
+    let content = if let Some(thinking_end) = content.find("</thinking>") {
+        content[thinking_end + "</thinking>".len()..].trim_start()
+    } else {
+        content
+    };
+
     if let Some(start) = content.find("<codr_tool")
         && let Some(name_start) = content[start..].find("name=\"") {
             let name_start = start + name_start + 6;
@@ -56,275 +62,289 @@ fn parse_tool_action(content: &str) -> Option<Action> {
                 }
             }
         }
-
-    // Fall back to old tool-action format for backward compatibility
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    let tool_name = lines[0].trim();
-    let params_json = lines[1..].join("\n");
-
-    match serde_json::from_str::<Value>(&params_json) {
-        Ok(params) => Some(Action::Tool {
-            name: tool_name.into(),
-            params,
-        }),
-        Err(_) => Some(Action::Tool {
-            name: tool_name.into(),
-            params: serde_json::json!({ "input": params_json }),
-        }),
-    }
+    None
 }
 
-/// Parse OpenAI function calling format: {"name": "read", "arguments": {...}}
-fn parse_openai_tool_call(content: &str) -> Option<Action> {
-    let value: Value = serde_json::from_str(content).ok()?;
+/// Parse JSON tool call format: {"name": "read", "arguments": {...}}
+/// This is the standard format for OpenAI-compatible APIs
+fn parse_json_tool_call(content: &str) -> Option<Action> {
+    let value: Value = serde_json::from_str(content.trim()).ok()?;
 
-    let name = value.get("name")?.as_str()?.into();
-    let arguments = value.get("arguments")?;
+    // Handle array format for multiple tool calls
+    if let Some(arr) = value.as_array() {
+        if let Some(first) = arr.first() {
+            return extract_from_json_value(first);
+        }
+        return None;
+    }
 
-    Some(Action::Tool {
-        name,
-        params: arguments.clone(),
-    })
+    extract_from_json_value(&value)
 }
 
-/// Parse Anthropic tool_use format: {"type": "tool_use", "name": "read", "input": {...}}
-fn parse_anthropic_tool_use(content: &str) -> Option<Action> {
-    let value: Value = serde_json::from_str(content).ok()?;
-
-    if value.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
-        return None;
-    }
-
-    let name = value.get("name")?.as_str()?.into();
-    let input = value.get("input")?.clone();
-
-    Some(Action::Tool {
-        name,
-        params: input,
-    })
-}
-
-/// Parse single-line shorthand: read FILE=src/main.rs or read src/main.rs
-fn parse_shorthand(content: &str) -> Option<Action> {
-    let trimmed = content.trim();
-    if trimmed.contains('\n') {
-        return None;
-    }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let tool_name = parts[0];
-    if !["read", "grep", "find", "edit", "write", "bash"].contains(&tool_name) {
-        return None;
-    }
-
-    // Try KEY=VALUE format
-    let mut params = serde_json::Map::new();
-    let mut has_key_value = false;
-
-    for part in &parts[1..] {
-        if let Some((key, value)) = part.split_once('=') {
-            has_key_value = true;
-            params.insert(
-                key.to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
+/// Extract tool call from a JSON value (handles both standard and Qwen formats)
+fn extract_from_json_value(value: &Value) -> Option<Action> {
+    // Qwen format: {"input": "..."} - extract XML from input field
+    if let Some(input_str) = value.get("input").and_then(|v| v.as_str()) {
+        if let Some(extracted) = extract_xml_tool_from_string(input_str) {
+            // Return the extracted tool call
+            return Some(Action::Tool {
+                name: extracted.get("name")?.as_str()?.into(),
+                params: extracted.get("arguments")?.clone(),
+            });
         }
     }
 
-    if has_key_value {
-        return Some(Action::Tool {
-            name: tool_name.into(),
-            params: serde_json::Value::Object(params),
-        });
+    // Standard format: {"name": "tool", "arguments": {...}}
+    let name = value.get("name")?.as_str()?.into();
+    let arguments = value.get("arguments")
+        .or_else(|| value.get("parameters"))
+        .cloned()
+        .unwrap_or_default();
+
+    Some(Action::Tool { name, params: arguments })
+}
+
+/// Extract XML tool call from a string (for models that embed tool calls in text)
+fn extract_xml_tool_from_string(content: &str) -> Option<Value> {
+    // Strip thinking content if present (models may output <thinking>...</thinking> before tool calls)
+    let content_clean = if let Some(thinking_end) = content.find("</thinking>") {
+        // Skip past the thinking tag and any whitespace/newlines
+        content[thinking_end + "</thinking>".len()..].trim_start()
+    } else {
+        content
+    };
+
+    // Look for <codr_tool name="...">{...}</codr_tool>
+    if let Some(start) = content_clean.find("<codr_tool") {
+        let content_after = &content_clean[start..];
+        // Find name="..." attribute
+        if let Some(name_start) = content_after.find("name=\"") {
+            let name_start_abs = start + name_start + 6;
+            if let Some(name_end) = content_clean[name_start_abs..].find('"') {
+                let name = &content_clean[name_start_abs..name_start_abs + name_end];
+                // Trim the quotes that Qwen adds: name=\"find\" -> find
+                let name = name.trim_matches('"');
+                // Find the closing >
+                if let Some(gt_pos) = content_after.find('>') {
+                    let body_start = start + gt_pos + 1;
+                    // Find closing tag
+                    if let Some(end_tag) = content_clean[body_start..].find("</codr_tool>") {
+                        let body = &content_clean[body_start..body_start + end_tag];
+                        // The body should be JSON, possibly with escaped quotes
+                        match serde_json::from_str::<Value>(body) {
+                            Ok(params) => {
+                                // Successfully parsed JSON
+                                return Some(serde_json::json!({ "name": name, "arguments": params }));
+                            }
+                            Err(_e) => {
+                                // JSON parse failed - might be malformed or escaped
+                                // Try to handle common cases
+                                let body_clean = body.trim();
+                                if body_clean.starts_with('{') && body_clean.ends_with('}') {
+                                    // It looks like JSON but has escape issues
+                                    // Try to use it as-is
+                                    return Some(serde_json::json!({ "name": name, "arguments": body_clean }));
+                                }
+                                // Last resort: use as input field
+                                return Some(serde_json::json!({ "name": name, "arguments": serde_json::json!({ "input": body_clean }) }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    // Fallback: positional argument as "input" or "file_path"
-    if parts.len() > 1 {
-        let params = if tool_name == "bash" {
-            serde_json::json!({ "command": parts[1..].join(" ") })
-        } else {
-            serde_json::json!({ "file_path": parts[1] })
-        };
-        return Some(Action::Tool {
-            name: tool_name.into(),
-            params,
-        });
+    // Also try to find bash commands
+    if let Some(start) = content_clean.find("<codr_bash>") {
+        let content_after = &content_clean[start..];
+        if let Some(end) = content_after.find("</codr_bash>") {
+            let command = &content_clean[start + 11..start + end];
+            return Some(serde_json::json!({
+                "name": "bash",
+                "arguments": { "command": command.trim() }
+            }));
+        }
     }
 
     None
 }
 
-/// Parse bash-action format
-fn parse_bash_action(content: &str) -> Action {
-    let mut trimmed = content.trim();
+/// Parse JSON bash format: {"command": "ls -la"} or just the command as string
+fn parse_json_bash(content: &str) -> Option<Action> {
+    let trimmed = content.trim();
 
-    // Strip <command></command> tokens if present
-    if let Some(start) = trimmed.find("<command>")
-        && let Some(end) = trimmed.find("</command>")
-    {
-        trimmed = &trimmed[start + 9..end];
-        trimmed = trimmed.trim();
+    // Try JSON format first
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+            return Some(Action::Bash {
+                command: command.into(),
+                workdir: value.get("cwd")
+                    .or_else(|| value.get("workdir"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.into()),
+                timeout_ms: value.get("timeout_ms")
+                    .or_else(|| value.get("timeout"))
+                    .and_then(|v| v.as_u64()),
+                env: value.get("env").cloned(),
+            });
+        }
     }
 
-    // Try JSON format
-    if let Ok(params) = serde_json::from_str::<Value>(trimmed)
-        && params.get("command").is_some()
-    {
-        return Action::Bash {
-            command: params["command"].as_str().unwrap_or("").into(),
-            workdir: params
-                .get("workdir")
-                .and_then(|v| v.as_str())
-                .map(|s| s.into()),
-            timeout_ms: params.get("timeout").and_then(|v| v.as_u64()),
-            env: params.get("env").cloned(),
-        };
+    // If it's just a string (simple command)
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        if let Ok(s) = serde_json::from_str::<String>(trimmed) {
+            return Some(Action::Bash {
+                command: s.into(),
+                workdir: None,
+                timeout_ms: None,
+                env: None,
+            });
+        }
     }
 
-    // Check for obviously malformed commands (template syntax, etc.)
-    if trimmed.contains("{pattern}")
-        || trimmed.contains("{file}")
-        || trimmed.contains("{path}")
-        || trimmed.contains("{::")
-    {
-        // Return an error command that will be caught during execution
-        return Action::Bash {
-            command: format!(
-                "# ERROR: Invalid command contains template syntax\n# Command was: {}",
-                trimmed
-            ).into(),
+    None
+}
+
+/// Parse bash action from <codr_bash> XML format (legacy support)
+fn parse_xml_bash(content: &str) -> Option<Action> {
+    if let Some(start) = content.find("<codr_bash>")
+        && let Some(end) = content.find("</codr_bash>") {
+        let command = &content[start + 11..end];
+        return Some(Action::Bash {
+            command: command.trim().into(),
             workdir: None,
             timeout_ms: None,
             env: None,
-        };
+        });
+    }
+    None
+}
+
+/// Parse bash command (supports JSON and XML formats)
+fn parse_bash_action(content: &str) -> Action {
+    // Try XML format first (for backward compatibility during migration)
+    if let Some(action) = parse_xml_bash(content) {
+        return action;
     }
 
-    // Fall back to simple string format
+    // Try JSON format
+    if let Some(action) = parse_json_bash(content) {
+        return action;
+    }
+
+    // Fallback: treat entire content as command
     Action::Bash {
-        command: trimmed.into(),
+        command: content.trim().into(),
         workdir: None,
         timeout_ms: None,
         env: None,
     }
 }
 
-/// Parse a single tool call from any supported format
-fn parse_single_tool_call(content: &str) -> Option<Action> {
+/// Main parse function - detects format and parses accordingly
+pub fn parse_action(content: &str) -> Option<Action> {
     let trimmed = content.trim();
+
+    // Empty content means plain response
     if trimmed.is_empty() {
+        return Some(Action::Response(Arc::new(String::new())));
+    }
+
+    // Try XML tool format first (backward compatibility)
+    if let Some(action) = parse_xml_tool_call(trimmed) {
+        return Some(action);
+    }
+
+    // Try JSON tool call format
+    if let Some(action) = parse_json_tool_call(trimmed) {
+        return Some(action);
+    }
+
+    // Check if it's a bash command (starts with <codr_bash>)
+    if trimmed.contains("<codr_bash>") {
+        return Some(parse_bash_action(trimmed));
+    }
+
+    // If it looks like JSON but we couldn't parse it, treat as error
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return None;
     }
 
-    // Try OpenAI format first
-    if let Some(action) = parse_openai_tool_call(trimmed) {
-        return Some(action);
+    // Otherwise, it's a plain text response
+    Some(Action::Response(Arc::new(trimmed.to_string())))
+}
+
+/// Extract JSON object(s) from mixed text/JSON content
+/// Handles cases where models output thinking text followed by JSON
+fn extract_json_from_content(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+
+    // If it starts with { or [, it's already pure JSON
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Some(trimmed.to_string());
     }
 
-    // Try Anthropic format
-    if let Some(action) = parse_anthropic_tool_use(trimmed) {
-        return Some(action);
-    }
+    // Strip markdown-style thinking blocks like "**Thinking:** ... \n\n"
+    let content_to_search = if let Some(thinking_start) = trimmed.find("**Thinking:**") {
+        let after_thinking = &trimmed[thinking_start + "**Thinking:**".len()..];
+        // Look for the end of the thinking (double newline or the JSON start)
+        if let Some(json_start) = after_thinking.find("\n\n{\"") {
+            after_thinking[json_start + 2..].trim()
+        } else if let Some(json_start) = after_thinking.find("\n{\"") {
+            after_thinking[json_start + 1..].trim()
+        } else if let Some(json_start) = after_thinking.find("{\"") {
+            after_thinking[json_start..].trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
 
-    // Try shorthand format
-    if let Some(action) = parse_shorthand(trimmed) {
-        return Some(action);
-    }
+    // Look for JSON object in the content
+    // Find the first { that starts a JSON object
+    if let Some(start) = content_to_search.find('{') {
+        // Find the matching closing brace
+        let mut brace_count = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
 
-    // Try tool-action block format
-    if let Some(action) = parse_tool_action(trimmed) {
-        return Some(action);
-    }
-
-    // Try multi-line format: tool-name\n{json}\nor: tool-name\n{json params on multiple lines}
-    if let Some(first_newline) = trimmed.find('\n') {
-        let potential_tool = trimmed[..first_newline].trim();
-        if ["read", "grep", "find", "edit", "write", "bash"].contains(&potential_tool) {
-            let json_part = trimmed[first_newline..].trim();
-            if let Ok(params) = serde_json::from_str::<Value>(json_part) {
-                return Some(Action::Tool {
-                    name: potential_tool.into(),
-                    params,
-                });
+        for (i, c) in content_to_search[start..].chars().enumerate() {
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' if !escape_next => in_string = !in_string,
+                '{' if !in_string => brace_count += 1,
+                '}' if !in_string => {
+                    brace_count -= 1;
+                    if brace_count == 0 {
+                        // Found the complete JSON object
+                        return Some(trimmed[start..start + i + 1].trim().to_string());
+                    }
+                }
+                _ => escape_next = false,
             }
         }
     }
 
-    // Try common plain-text patterns
-    // Pattern: "I'll run: find *" or "I'll execute: read file.txt"
-    // Pattern: "find *" or "find: *" or "running: find *"
-    // Pattern: "read file.txt" (single argument)
-    let lower = trimmed.to_lowercase();
-    
-    // Match patterns like "find *" or "find: *" or "I'll run: find *"
-    for tool in ["find", "grep", "read", "edit", "write", "bash"] {
-        let prefixes = vec![
-            format!("{} ", tool),
-            format!("{}:", tool),
-            format!("i'll run: {} ", tool),
-            format!("i'll run: {}:", tool),
-            format!("i will run: {} ", tool),
-            format!("i will run: {}:", tool),
-            format!("running: {} ", tool),
-            format!("running: {}:", tool),
-        ];
-        
-        for prefix in prefixes {
-            if lower.starts_with(&prefix) || lower.contains(&format!(" {} ", prefix.trim())) {
-                let rest = trimmed.strip_prefix(&prefix).or_else(|| {
-                    // Try to find in the middle
-                    if let Some(idx) = lower.find(&format!(" {} ", prefix.trim())) {
-                        Some(&trimmed[idx + prefix.len()..])
-                    } else {
-                        None
-                    }
-                }).unwrap_or(trimmed).trim();
-                
-                // Try to parse as JSON first
-                if let Ok(params) = serde_json::from_str::<Value>(rest) {
-                    return Some(Action::Tool {
-                        name: tool.into(),
-                        params,
-                    });
-                }
-                
-                // Try key=value format
-                let mut param_map = serde_json::Map::new();
-                let mut has_params = false;
-                for part in rest.split_whitespace() {
-                    if let Some((k, v)) = part.split_once('=') {
-                        has_params = true;
-                        param_map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    // Look for JSON array
+    if let Some(start) = content_to_search.find('[') {
+        let mut bracket_count = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, c) in content_to_search[start..].chars().enumerate() {
+            match c {
+                '\\' if in_string => escape_next = true,
+                '"' if !escape_next => in_string = !in_string,
+                '[' if !in_string => bracket_count += 1,
+                ']' if !in_string => {
+                    bracket_count -= 1;
+                    if bracket_count == 0 {
+                        return Some(trimmed[start..start + i + 1].trim().to_string());
                     }
                 }
-                if has_params {
-                    return Some(Action::Tool {
-                        name: tool.into(),
-                        params: serde_json::Value::Object(param_map),
-                    });
-                }
-                
-                // Single argument - different for each tool
-                if !rest.is_empty() {
-                    let params = match tool {
-                        "read" | "find" | "edit" => serde_json::json!({"file_path": rest}),
-                        "grep" => serde_json::json!({"pattern": rest}),
-                        "write" => serde_json::json!({"path": rest, "content": ""}),
-                        "bash" => serde_json::json!({"command": rest}),
-                        _ => serde_json::json!({"input": rest}),
-                    };
-                    return Some(Action::Tool {
-                        name: tool.into(),
-                        params,
-                    });
-                }
+                _ => escape_next = false,
             }
         }
     }
@@ -332,178 +352,100 @@ fn parse_single_tool_call(content: &str) -> Option<Action> {
     None
 }
 
-/// Strip thinking blocks from content to avoid interference with XML parsing
-fn strip_thinking_blocks(content: &str) -> String {
-    let mut result = content.to_string();
-
-    // Remove <thinking>...</thinking> blocks (Claude format)
-    while let Some(start) = result.find("<thinking>") {
-        if let Some(end) = result[start..].find("</thinking>") {
-            let end = start + end + "</thinking>".len();
-            result.replace_range(start..end, "");
-        } else {
-            break;
-        }
-    }
-
-    // TODO: Add Qwen/Ollama thinking block removal when tag format is known
-    // The previous implementation had missing/empty tag names causing infinite loop
-
-    result
-}
-
-/// Parse all tool calls from a response
-fn parse_all_tool_calls(content: &str) -> Vec<Action> {
+/// Parse multiple actions (for handling multiple tool calls in one response)
+pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
     let mut actions = Vec::new();
+    let remaining = content.trim();
 
-    // Remove thinking blocks to avoid interference with XML parsing
-    let content = strip_thinking_blocks(content);
-
-    // Regex patterns for various formats
-
-    // 0. XML format: <codr_tool name="...">...</codr_tool>
-    let xml_tool_re = Regex::new(r#"(?s)<codr_tool\s+name="([^"]+)">.*?</codr_tool>"#).unwrap();
-    for cap in xml_tool_re.captures_iter(&content) {
-        if let Some(name) = cap.get(1)
-            && let Some(body) = cap.get(0) {
-                let body_content = body.as_str();
-                if let Some(start) = body_content.find('>') {
-                    let start = start + 1;
-                    if let Some(end) = body_content[start..].find("</codr_tool>") {
-                        let params_json = &body_content[start..start + end];
-                        match serde_json::from_str::<Value>(params_json) {
-                            Ok(params) => {
-                                let action = Action::Tool { name: name.as_str().into(), params };
-                                if !actions.iter().any(|a| action_equals(a, &action)) {
-                                    actions.push(action);
-                                }
-                            }
-                            Err(_) => {
-                                let action = Action::Tool { name: name.as_str().into(), params: serde_json::json!({ "input": params_json }) };
-                                if !actions.iter().any(|a| action_equals(a, &action)) {
-                                    actions.push(action);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    if remaining.is_empty() {
+        return Ok(vec![Action::Response(Arc::new(String::new()))]);
     }
 
-    // 0b. XML format: <codr_bash>...</codr_bash>
-    let xml_bash_re = Regex::new(r"(?s)<codr_bash>(.*?)</codr_bash>").unwrap();
-    for cap in xml_bash_re.captures_iter(&content) {
-        if let Some(cmd) = cap.get(1) {
-            let command = cmd.as_str().trim();
-            if !command.is_empty() {
-                let action = Action::Bash { 
-                    command: command.into(),
-                    workdir: None,
-                    timeout_ms: None,
-                    env: None,
-                };
-                if !actions.iter().any(|a| action_equals(a, &action)) {
-                    actions.push(action);
-                }
-            }
-        }
-    }
-
-    // 1. Standard tool-action blocks: ```tool-action\n...\n```
-    let tool_re = Regex::new(r"(?s)```\s*tool-action\s*\n(.*?)\n```").unwrap();
-    for cap in tool_re.captures_iter(&content) {
-        if let Some(action) = parse_single_tool_call(cap.get(1).unwrap().as_str())
-            && !actions.iter().any(|a| action_equals(a, &action)) {
-                actions.push(action);
-            }
-    }
-
-    // 2. Bash-action blocks: ```bash-action\n...\n```
-    let bash_re = Regex::new(r"(?s)```\s*bash-action\s*\n(.*?)\n```").unwrap();
-    for cap in bash_re.captures_iter(&content) {
-        let action = parse_bash_action(cap.get(1).unwrap().as_str());
-        if !actions.iter().any(|a| action_equals(a, &action)) {
-            actions.push(action);
-        }
-    }
-
-    // 5. Try to find JSON array of tool calls: [{"name": "...", "arguments": {...}}, ...]
-    if actions.is_empty()
-        && let Ok(value) = serde_json::from_str::<Value>(&content)
-            && let Some(arr) = value.as_array() {
+    // First, try to extract JSON from mixed content (handles models that output thinking + JSON)
+    if let Some(json_str) = extract_json_from_content(remaining) {
+        // Try to parse as JSON array of tool calls
+        if let Ok(value) = serde_json::from_str::<Value>(&json_str) {
+            if let Some(arr) = value.as_array() {
                 for item in arr {
-                    if let Some(action) = parse_single_tool_call(&item.to_string()) {
-                        actions.push(action);
+                    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                        actions.push(Action::Tool {
+                            name: name.into(),
+                            params: item.get("arguments")
+                                .or_else(|| item.get("parameters"))
+                                .or_else(|| item.get("input"))
+                                .cloned()
+                                .unwrap_or_default(),
+                        });
                     }
+                }
+                if !actions.is_empty() {
+                    return Ok(actions);
                 }
             }
 
-    actions
-}
+            // Try single tool call
+            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                actions.push(Action::Tool {
+                    name: name.into(),
+                    params: value.get("arguments")
+                        .or_else(|| value.get("parameters"))
+                        .or_else(|| value.get("input"))
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+                return Ok(actions);
+            } else {
+                // Fallback: Detect common malformed patterns
+                // If JSON has "content" field but no "name", it might be a malformed write call
+                if value.get("content").is_some() {
+                    // Check if there's also a "file_path" field
+                    let params = if value.get("file_path").is_some() {
+                        // Has both file_path and content - reconstruct proper write call
+                        value.clone()
+                    } else {
+                        // Has only content - create default file path
+                        serde_json::json!({
+                            "file_path": "output.txt",
+                            "content": value.get("content").unwrap()
+                        })
+                    };
 
-/// Check if two actions are equivalent (for deduplication)
-/// Uses semantic comparison for tool params to handle JSON formatting differences
-fn action_equals(a: &Action, b: &Action) -> bool {
-    match (a, b) {
-        (
-            Action::Tool {
-                name: n1,
-                params: p1,
-            },
-            Action::Tool {
-                name: n2,
-                params: p2,
-            },
-        ) => {
-            if n1 != n2 {
-                return false;
+                    actions.push(Action::Tool {
+                        name: "write".into(),
+                        params,
+                    });
+                    return Ok(actions);
+                }
             }
-            // Compare params semantically by converting to canonical JSON
-            // This handles whitespace and formatting differences
-            canonical_json_eq(p1, p2)
         }
-        (Action::Bash { command: c1, .. }, Action::Bash { command: c2, .. }) => c1 == c2,
-        _ => false,
-    }
-}
-
-/// Compare two JSON values semantically by converting to canonical form
-fn canonical_json_eq(a: &Value, b: &Value) -> bool {
-    // Convert both to compact JSON strings and compare
-    // This normalizes whitespace, key ordering (for objects), etc.
-    serde_json::to_string(a).ok() == serde_json::to_string(b).ok()
-}
-
-/// Check if all actions are read-only (can be parallelized)
-#[allow(dead_code)]
-fn all_read_only(actions: &[Action]) -> bool {
-    !actions.is_empty() && actions.iter().all(Action::is_read_only)
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ParsedActions {
-    pub actions: Vec<Action>,
-    pub is_parallel: bool,
-}
-
-pub fn parse_actions(lm_output: &str) -> Result<ParsedActions, AgentError> {
-    let actions = parse_all_tool_calls(lm_output);
-
-    if actions.is_empty() {
-        // No tool or bash action found - treat as plain text response
-        return Ok(ParsedActions {
-            actions: vec![Action::Response(Arc::new(lm_output.to_string()))],
-            is_parallel: false,
-        });
     }
 
-    let is_parallel = all_read_only(&actions);
+    // Try parsing the whole thing as JSON (for pure JSON without thinking)
+    if let Ok(value) = serde_json::from_str::<Value>(remaining) {
+        if let Some(arr) = value.as_array() {
+            for item in arr {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    actions.push(Action::Tool {
+                        name: name.into(),
+                        params: item.get("arguments")
+                            .or_else(|| item.get("parameters"))
+                            .or_else(|| item.get("input"))
+                            .cloned()
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            if !actions.is_empty() {
+                return Ok(actions);
+            }
+        }
+    }
 
-    Ok(ParsedActions {
-        actions,
-        is_parallel,
-    })
+    // Single action
+    match parse_action(remaining) {
+        Some(action) => Ok(vec![action]),
+        None => Err(AgentError::Terminating(format!("Failed to parse action: {}", remaining))),
+    }
 }
 
 // ============================================================
@@ -514,245 +456,40 @@ pub fn parse_actions(lm_output: &str) -> Result<ParsedActions, AgentError> {
 mod tests {
     use super::*;
 
-    // ============================================================
-    // Action Tests
-    // ============================================================
-
     #[test]
-    fn test_action_is_read_only() {
-        assert!(matches!(
-            Action::Tool { name: "read".into(), params: serde_json::json!({}) },
-            a if a.is_read_only() == true
-        ));
-        assert!(matches!(
-            Action::Tool { name: "grep".into(), params: serde_json::json!({}) },
-            a if a.is_read_only() == true
-        ));
-        assert!(matches!(
-            Action::Tool { name: "find".into(), params: serde_json::json!({}) },
-            a if a.is_read_only() == true
-        ));
-        assert!(matches!(
-            Action::Tool { name: "edit".into(), params: serde_json::json!({}) },
-            a if a.is_read_only() == false
-        ));
-        assert!(matches!(
-            Action::Tool { name: "write".into(), params: serde_json::json!({}) },
-            a if a.is_read_only() == false
-        ));
-        let action = Action::Bash { command: "ls".into(), workdir: None, timeout_ms: None, env: None };
-        assert!(!action.is_read_only());
-        assert!(matches!(
-            Action::Response(Arc::new("hello".to_string())),
-            a if a.is_read_only() == false
-        ));
-    }
-
-    // ============================================================
-    // XML Tool Action Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_tool_action_xml_valid() {
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>"#;
-        let action = parse_tool_action(input);
-        
+    fn test_parse_json_tool_call() {
+        let json = r#"{"name": "read", "arguments": {"file_path": "test.txt"}}"#;
+        let action = parse_action(json);
         assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
+        match action.unwrap() {
             Action::Tool { name, params } => {
                 assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
+                assert_eq!(params["file_path"], "test.txt");
             }
             _ => panic!("Expected Tool action"),
         }
     }
 
     #[test]
-    fn test_parse_tool_action_xml_with_newlines() {
-        let input = r#"<codr_tool name="read">{
-  "file_path": "src/main.rs"
-}</codr_tool>"#;
-        let action = parse_tool_action(input);
-        
+    fn test_parse_json_tool_call_with_parameters() {
+        let json = r#"{"name": "grep", "parameters": {"pattern": "test"}}"#;
+        let action = parse_action(json);
         assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
+        match action.unwrap() {
             Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
+                assert_eq!(name.as_ref(), "grep");
+                assert_eq!(params["pattern"], "test");
             }
             _ => panic!("Expected Tool action"),
         }
     }
 
     #[test]
-    fn test_parse_tool_action_xml_invalid_json() {
-        let input = r#"<codr_tool name="read">not valid json</codr_tool>"#;
-        let action = parse_tool_action(input);
-        
+    fn test_parse_json_bash() {
+        let json = r#"{"command": "ls -la"}"#;
+        let action = parse_json_bash(json);
         assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["input"], "not valid json");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_tool_action_xml_missing_tool_name() {
-        let input = r#"<codr_tool>{"file_path": "src/main.rs"}</codr_tool>"#;
-        let action = parse_tool_action(input);
-        
-        // Should fall back to legacy format
-        assert!(action.is_some());
-    }
-
-    // ============================================================
-    // OpenAI Tool Call Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_openai_tool_call() {
-        let input = r#"{"name": "read", "arguments": {"file_path": "src/main.rs"}}"#;
-        let action = parse_openai_tool_call(input);
-        
-        assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_openai_tool_call_missing_fields() {
-        let input = r#"{"name": "read"}"#;
-        let action = parse_openai_tool_call(input);
-        
-        assert!(action.is_none());
-    }
-
-    // ============================================================
-    // Anthropic Tool Use Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_anthropic_tool_use() {
-        let input = r#"{"type": "tool_use", "name": "read", "input": {"file_path": "src/main.rs"}}"#;
-        let action = parse_anthropic_tool_use(input);
-        
-        assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_anthropic_tool_use_wrong_type() {
-        let input = r#"{"type": "text", "name": "read", "input": {"file_path": "src/main.rs"}}"#;
-        let action = parse_anthropic_tool_use(input);
-        
-        assert!(action.is_none());
-    }
-
-    // ============================================================
-    // Shorthand Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_shorthand_key_value() {
-        let input = "read file_path=src/main.rs";
-        let action = parse_shorthand(input);
-        
-        assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_shorthand_positional() {
-        let input = "read src/main.rs";
-        let action = parse_shorthand(input);
-        
-        assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_shorthand_bash() {
-        let input = "bash ls -la";
-        let action = parse_shorthand(input);
-        
-        assert!(action.is_some());
-        let action = action.unwrap();
-        match action {
-            Action::Tool { name, params } => {
-                assert_eq!(&*name, "bash");
-                assert_eq!(params["command"], "ls -la");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_shorthand_multiline_returns_none() {
-        let input = "read\nsrc/main.rs";
-        let action = parse_shorthand(input);
-        
-        assert!(action.is_none());
-    }
-
-    // ============================================================
-    // Bash Action Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_bash_action_simple() {
-        let input = "ls -la";
-        let action = parse_bash_action(input);
-        
-        match action {
-            Action::Bash { command, workdir, timeout_ms, env } => {
-                assert_eq!(command.as_ref(), "ls -la");
-                assert!(workdir.is_none());
-                assert!(timeout_ms.is_none());
-                assert!(env.is_none());
-            }
-            _ => panic!("Expected Bash action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_bash_action_with_tags() {
-        let input = "<command>ls -la</command>";
-        let action = parse_bash_action(input);
-        
-        match action {
+        match action.unwrap() {
             Action::Bash { command, .. } => {
                 assert_eq!(command.as_ref(), "ls -la");
             }
@@ -761,60 +498,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bash_action_json_format() {
-        let input = r#"{"command": "ls -la", "workdir": "/tmp", "timeout": 5000}"#;
-        let action = parse_bash_action(input);
-        
-        match action {
-            Action::Bash { command, workdir, timeout_ms, env: _ } => {
-                assert_eq!(command.as_ref(), "ls -la");
-                assert_eq!(workdir, Some("/tmp".into()));
-                assert_eq!(timeout_ms, Some(5000));
-            }
-            _ => panic!("Expected Bash action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_bash_action_template_syntax_error() {
-        let input = "ls {file}";
-        let action = parse_bash_action(input);
-        
-        match action {
-            Action::Bash { command, .. } => {
-                assert!(command.contains("ERROR"));
-            }
-            _ => panic!("Expected Bash action with error"),
-        }
-    }
-
-    #[test]
-    fn test_parse_bash_action_pattern_template_error() {
-        let input = "grep {pattern}";
-        let action = parse_bash_action(input);
-        
-        match action {
-            Action::Bash { command, .. } => {
-                assert!(command.contains("ERROR"));
-            }
-            _ => panic!("Expected Bash action with error"),
-        }
-    }
-
-    // ============================================================
-    // XML Codr Bash Parsing Tests
-    // ============================================================
-
-    #[test]
-    fn test_parse_codr_bash_xml() {
-        let input = "<codr_bash>ls -la</codr_bash>";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
+    fn test_parse_xml_bash() {
+        let xml = r#"<codr_bash>ls -la</codr_bash>"#;
+        let action = parse_xml_bash(xml);
+        assert!(action.is_some());
+        match action.unwrap() {
             Action::Bash { command, .. } => {
                 assert_eq!(command.as_ref(), "ls -la");
             }
@@ -822,189 +510,24 @@ mod tests {
         }
     }
 
-    // ============================================================
-    // Full parse_actions Tests
-    // ============================================================
-
     #[test]
-    fn test_parse_actions_plain_response() {
-        let input = "Hello, how are you?";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
+    fn test_parse_plain_response() {
+        let text = "Hello, world!";
+        let action = parse_action(text);
+        assert!(action.is_some());
+        match action.unwrap() {
             Action::Response(content) => {
-                assert_eq!(&**content, "Hello, how are you?");
+                assert_eq!(content.as_ref(), "Hello, world!");
             }
             _ => panic!("Expected Response action"),
         }
     }
 
     #[test]
-    fn test_parse_actions_xml_tool() {
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
-            Action::Tool { name, params } => {
-                assert_eq!(name.as_ref(), "read");
-                assert_eq!(params["file_path"], "src/main.rs");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_actions_multiple_tools() {
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_tool name="grep">{"pattern": "fn"}</codr_tool>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_actions_mixed_tools_and_bash() {
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_bash>ls -la</codr_bash>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_actions_tool_action_block() {
-        let input = r#"```tool-action
-read src/main.rs
-```"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
-            Action::Tool { name, params: _ } => {
-                assert_eq!(name.as_ref(), "read");
-            }
-            _ => panic!("Expected Tool action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_actions_bash_action_block() {
-        let input = r#"```bash-action
-ls -la
-```"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
-            Action::Bash { command, .. } => {
-                assert_eq!(command.as_ref(), "ls -la");
-            }
-            _ => panic!("Expected Bash action"),
-        }
-    }
-
-    #[test]
-    fn test_parse_actions_is_parallel() {
-        // Read-only tools should be parallelizable
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_tool name="grep">{"pattern": "fn"}</codr_tool>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(parsed.is_parallel);
-    }
-
-    #[test]
-    fn test_parse_actions_not_parallel_with_write() {
-        // Write tool makes it non-parallel
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_tool name="write">{"path": "test.txt", "content": "hi"}</codr_tool>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(!parsed.is_parallel);
-    }
-
-    #[test]
-    fn test_parse_actions_not_parallel_with_bash() {
-        // Bash makes it non-parallel
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_bash>ls -la</codr_bash>"#;
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert!(!parsed.is_parallel);
-    }
-
-    #[test]
-    fn test_parse_actions_deduplication() {
-        // Same action should not be duplicated
-        let input = r#"<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>
-<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>"#;
-        let result = parse_actions(input);
-
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_actions_deduplication_different_formatting() {
-        // Same action with different JSON formatting should be deduplicated
-        let input = r#"<codr_tool name="read">{"file_path":"src/main.rs","line_start":1}</codr_tool>
-<codr_tool name="read">{ "file_path": "src/main.rs", "line_start": 1 }</codr_tool>"#;
-        let result = parse_actions(input);
-
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1, "Actions with different formatting should be deduplicated");
-    }
-
-    #[test]
-    fn test_parse_actions_complex_text_with_tool() {
-        let input = "I'll read the file for you.\n\n<codr_tool name=\"read\">{\"file_path\": \"src/main.rs\"}</codr_tool>\n\nLet me check that.";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-    }
-
-    // ============================================================
-    // Edge Cases
-    // ============================================================
-
-    #[test]
-    fn test_parse_actions_empty_string() {
-        let input = "";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-        
-        match &parsed.actions[0] {
+    fn test_parse_empty_content() {
+        let action = parse_action("");
+        assert!(action.is_some());
+        match action.unwrap() {
             Action::Response(content) => {
                 assert!(content.is_empty());
             }
@@ -1013,24 +536,19 @@ ls -la
     }
 
     #[test]
-    fn test_parse_actions_whitespace_only() {
-        let input = "   \n\t\n   ";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        assert_eq!(parsed.actions.len(), 1);
-    }
+    fn test_is_read_only() {
+        let read_action = Action::Tool {
+            name: Arc::from("read"),
+            params: serde_json::json!({"file_path": "test.txt"}),
+        };
+        assert!(read_action.is_read_only());
 
-    #[test]
-    fn test_parse_single_tool_call_plain_text() {
-        // Plain text that looks like a tool should not be parsed as tool
-        let input = "read this";
-        let result = parse_actions(input);
-        
-        assert!(result.is_ok());
-        let parsed = result.unwrap();
-        // This might be parsed as shorthand, let's see
-        assert!(!parsed.actions.is_empty());
+        let bash_action = Action::Bash {
+            command: Arc::from("ls"),
+            workdir: None,
+            timeout_ms: None,
+            env: None,
+        };
+        assert!(!bash_action.is_read_only());
     }
 }

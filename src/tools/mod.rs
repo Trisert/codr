@@ -3,11 +3,17 @@
 // ============================================================
 
 pub mod async_handler;
+pub mod async_wrapper;
 pub mod context;
+pub mod params;
 pub mod r#impl;
 pub mod schema;
 
-use schema::{ToolSchema, ValidationError};
+pub use params::*;
+use schema::ValidationError;
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -85,9 +91,17 @@ impl ToolCategory {
 }
 
 // ============================================================
-// Tool Trait
+// Tool Trait (Object-Safe for Registry)
 // ============================================================
 
+/// Associated type for tool parameters
+/// All parameter structs must derive Serialize, Deserialize, and JsonSchema
+pub trait ToolParams: Serialize + DeserializeOwned + JsonSchema + Send + Sync + 'static {}
+
+// Blanket implementation for all types that satisfy the bounds
+impl<T> ToolParams for T where T: Serialize + DeserializeOwned + JsonSchema + Send + Sync + 'static {}
+
+/// Core tool trait (object-safe, uses Value for compatibility)
 #[allow(dead_code)]
 pub trait Tool: Send + Sync {
     /// Name of the tool (used for invocation)
@@ -99,23 +113,60 @@ pub trait Tool: Send + Sync {
     /// Description of what the tool does
     fn description(&self) -> &str;
 
-    /// JSON schema for parameters
-    fn parameters(&self) -> &ToolSchema;
-
-    /// Execute the tool with given parameters
+    /// Get JSON schema for parameters (returns JSON Schema format)
+    /// Must be implemented by each tool
     #[allow(clippy::result_large_err)]
-    fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+    fn parameters_schema(&self) -> Value;
+
+    /// Execute the tool with JSON parameters (validated and converted internally)
+    /// Must be implemented by each tool
+    #[allow(clippy::result_large_err)]
+    fn execute_json(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 
     /// Get the tool category (optional override)
     fn category(&self) -> ToolCategory {
         ToolCategory::FileOps
     }
+}
 
-    /// Validate parameters against schema (optional override)
+/// Helper trait for tools with typed parameters (not object-safe, used internally)
+pub trait TypedTool: Tool {
+    type Params: ToolParams;
+
+    /// Execute with typed parameters
     #[allow(clippy::result_large_err)]
-    fn validate_params(&self, params: &Value) -> Result<Value, ValidationError> {
-        Ok(params.clone())
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Default implementation bridges JSON to typed
+    fn execute_json(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        // Deserialize Value to typed params with detailed error reporting
+        let typed_params: Self::Params = serde_json::from_value(params.clone())
+            .map_err(|e| {
+                ToolError::InvalidParameters(format!(
+                    "Invalid parameters for tool '{}': {}\nReceived: {}",
+                    self.name(),
+                    e,
+                    params
+                ))
+            })?;
+
+        self.execute(typed_params, ctx)
     }
+
+    /// Default implementation generates schema from Params type
+    fn parameters_schema(&self) -> Value {
+        schema_for::<Self::Params>()
+    }
+}
+
+/// Helper function to generate JSON schema for a type
+fn schema_for<T: JsonSchema>() -> Value {
+    let schema = schemars::schema_for!(T);
+    serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "required": []
+    }))
 }
 
 // ============================================================
@@ -177,9 +228,19 @@ impl Default for ToolContext {
 
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
-    pub content: Arc<String>,  // Shared content
+    /// Text content for the LLM (what the model "sees")
+    pub content: Arc<String>,
+
+    /// Structured data for UI display (optional)
+    /// This follows pi's design - separate content for LLM vs structured data for UI
+    pub details: Option<Value>,
+
+    /// Binary attachments (images, etc.)
     pub attachments: Vec<Attachment>,
+
+    /// Metadata about the output
     pub metadata: OutputMetadata,
+
     /// Alternative content for TUI display (if set, this is shown instead of content)
     pub content_for_display: Option<Arc<String>>,  // Shared display content
 }
@@ -207,6 +268,7 @@ impl ToolOutput {
     pub fn text(content: String) -> Self {
         Self {
             content: Arc::new(content),
+            details: None,
             attachments: Vec::new(),
             metadata: OutputMetadata::default(),
             content_for_display: None,
@@ -229,6 +291,12 @@ impl ToolOutput {
 
     pub fn with_summary_display<S: Into<Arc<String>>>(mut self, summary: S) -> Self {
         self.content_for_display = Some(summary.into());
+        self
+    }
+
+    /// Add structured details for UI display (following pi's design)
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
         self
     }
 }
@@ -362,101 +430,31 @@ impl ToolRegistry {
         self.tools.iter().map(|t| t.as_ref()).collect()
     }
 
-    /// Validate parameters against tool schema
+    /// Validate and prepare parameters for execution
+    /// Returns validated JSON value or detailed validation error
     #[allow(clippy::result_large_err)]
     pub fn validate(&self, name: &str, params: &Value) -> Result<Value, ValidationError> {
-        let tool = self.get(name).ok_or_else(|| {
-            ValidationError::new(
+        // Check tool exists
+        if self.get(name).is_none() {
+            return Err(ValidationError::new(
                 name,
                 &format!("Tool '{}' not found", name),
                 Value::Null,
                 Value::Null,
-            )
-        })?;
-
-        let schema = tool.parameters();
-
-        // Check required parameters
-        for required_param in &schema.required {
-            if params.get(required_param).is_none() {
-                return Err(ValidationError::new(
-                    name,
-                    &format!("Missing required parameter: {}", required_param),
-                    Value::Null,
-                    Value::String("any".to_string()),
-                ));
-            }
+            ));
         }
 
-        // Validate each provided parameter
-        for (key, value) in params.as_object().unwrap_or(&serde_json::Map::new()) {
-            if let Some(prop) = schema.get_property(key) {
-                let type_valid = match &prop.property_type {
-                    schema::PropertyType::String => value.is_string() || value.is_null(),
-                    schema::PropertyType::Number => {
-                        value.is_number() || value.is_string() || value.is_null()
-                    }
-                    schema::PropertyType::Integer => {
-                        value.is_number()
-                            || value.is_string()
-                            || value.as_bool().is_some()
-                            || value.is_null()
-                    }
-                    schema::PropertyType::Boolean => {
-                        value.is_boolean()
-                            || value.is_string()
-                            || value.is_number()
-                            || value.is_null()
-                    }
-                    schema::PropertyType::Array(_) => value.is_array(),
-                    schema::PropertyType::Object => value.is_object(),
-                    schema::PropertyType::OneOf(types) => types.iter().any(|t| match t {
-                        schema::PropertyType::String => value.is_string(),
-                        schema::PropertyType::Number => value.is_number(),
-                        schema::PropertyType::Integer => value.is_number(),
-                        schema::PropertyType::Boolean => value.is_boolean(),
-                        _ => false,
-                    }),
-                };
-
-                if !type_valid {
-                    let expected_type = match &prop.property_type {
-                        schema::PropertyType::String => "string",
-                        schema::PropertyType::Number => "number",
-                        schema::PropertyType::Integer => "integer",
-                        schema::PropertyType::Boolean => "boolean",
-                        schema::PropertyType::Array(_) => "array",
-                        schema::PropertyType::Object => "object",
-                        schema::PropertyType::OneOf(_) => "string/number/integer/boolean",
-                    };
-
-                    return Err(ValidationError::new(
-                        name,
-                        &format!(
-                            "Parameter '{}' must be {}, got: {}",
-                            key, expected_type, value
-                        ),
-                        value.clone(),
-                        Value::String(expected_type.to_string()),
-                    ));
-                }
-            }
-        }
-
-        // Use tool's own validation (allows custom coercion)
-        tool.validate_params(params)
+        // Validation happens during execution via serde deserialization
+        // This provides detailed error messages automatically
+        Ok(params.clone())
     }
 
+    /// Execute a tool by name with JSON parameters
     #[allow(clippy::result_large_err)]
     pub fn execute(&self, name: &str, params: Value) -> Result<ToolOutput, ToolError> {
-        // Validate first
-        let validated_params = self.validate(name, &params)?;
-
-        let tool = self
-            .get(name)
-            .ok_or_else(|| ToolError::Custom(format!("Tool '{}' not found", name)))?;
+        let tool = self.get(name).ok_or_else(|| ToolError::Custom(format!("Tool '{}' not found", name)))?;
         let ctx = ToolContext::new(self.cwd.clone());
-        tool.execute(validated_params, &ctx)
+        tool.execute_json(params, &ctx)
     }
 
     /// Execute multiple actions - parallel for read-only, sequential for others

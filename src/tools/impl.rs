@@ -1,22 +1,18 @@
 use super::context::{
     build_walker, find_project_root, is_binary_file, is_image_file, truncate_file,
 };
-use super::schema::ExtractParams;
-use super::schema::ToolSchema;
-use super::{Tool, ToolContext, ToolError, ToolOutput};
+use super::params::*;
+use super::{TypedTool, Tool, ToolContext, ToolError, ToolOutput};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 
 // ============================================================
 // Read Tool
 // ============================================================
 
 #[allow(dead_code)]
-pub struct ReadTool {
-    schema: ToolSchema,
-}
+pub struct ReadTool;
 
 impl Default for ReadTool {
     fn default() -> Self {
@@ -26,12 +22,7 @@ impl Default for ReadTool {
 
 impl ReadTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("file_path", "Path to the file to read", true)
-            .integer("offset", "Starting line number (0-indexed)", false)
-            .integer("limit", "Maximum number of lines to read", false);
-
-        Self { schema }
+        Self
     }
 }
 
@@ -49,38 +40,30 @@ impl Tool for ReadTool {
         Detects images and can return them as attachments. Automatically truncates to ~5000 lines or 500KB."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::FileOps
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let file_path = params.get_required_str("file_path")?;
-        
-        // Support both offset/limit and line_start/line_end (aliases from edit tool)
-        // line_start/line_end are treated as 1-indexed (user-friendly), convert to 0-indexed
-        let line_start = params.get_str("line_start")?.and_then(|s| s.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
-        let line_end = params.get_str("line_end")?.and_then(|s| s.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
-        
-        let offset = params
-            .get_str("offset")?
-            .or_else(|| line_start.map(|s| s.to_string()))
-            .and_then(|s| s.parse::<usize>().ok());
-            
-        // If line_end is provided with line_start, compute limit from range
-        // Otherwise use limit directly
-        let limit = if let (Some(start), Some(end)) = (line_start, line_end) {
-            Some(end.saturating_sub(start) + 1)
-        } else {
-            params.get_str("limit")?.and_then(|s| s.parse::<usize>().ok())
-        };
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for ReadTool {
+    type Params = ReadParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let ReadParams {
+            file_path,
+            offset,
+            limit,
+            line_start,
+            line_end,
+        } = params;
 
         let path = ctx.resolve_path(&file_path);
 
@@ -92,11 +75,17 @@ impl Tool for ReadTool {
         if is_image_file(&path) {
             let data = fs::read(&path)?;
             let data_len = data.len();
+            let file_path_clone = file_path.clone();
             return Ok(ToolOutput::text(format!(
                 "[Image file: {} - {} bytes]",
                 file_path, data_len
             ))
-            .with_attachment(file_path.clone(), mime_type(&path), data)
+            .with_attachment(file_path_clone, mime_type(&path), data)
+            .with_details(serde_json::json!({
+                "file_path": file_path,
+                "size": data_len,
+                "type": "image"
+            }))
             .with_metadata(super::OutputMetadata {
                 file_path: Some(file_path),
                 byte_count: Some(data_len),
@@ -112,38 +101,55 @@ impl Tool for ReadTool {
             )));
         }
 
+        // Handle offset/limit with line_start/line_end support
+        // line_start/line_end are 1-indexed (user-friendly), convert to 0-indexed
+        let final_offset = line_start
+            .map(|n| n.saturating_sub(1))
+            .or(offset);
+
+        let final_limit = if let (Some(start), Some(end)) = (line_start, line_end) {
+            Some(end.saturating_sub(start) + 1)
+        } else {
+            limit
+        };
+
         // Read text file
-        let max_lines = limit.unwrap_or(ctx.line_limit);
+        let max_lines = final_limit.unwrap_or(ctx.line_limit);
         let result = truncate_file(
             &path,
             ctx.line_limit,
             ctx.token_limit,
-            offset,
+            final_offset,
             Some(max_lines),
         )?;
 
         // Create display summary for TUI (minimal, clean)
-        let display_summary = if let (Some(off), Some(lim)) = (offset, limit) {
+        let display_summary = if let (Some(off), Some(lim)) = (final_offset, final_limit) {
             format!("Reading {}:{}-{}", file_path, off + 1, off + lim)
-        } else if let Some(off) = offset {
+        } else if let Some(off) = final_offset {
             format!("Reading {}:{}-", file_path, off + 1)
         } else {
             format!("Reading {}", file_path)
         };
 
-        // Full content goes to LLM, but we mark it with metadata for clean TUI display
-        let mut output = ToolOutput::text(result.content).with_metadata(super::OutputMetadata {
-            file_path: Some(file_path.clone()),
-            line_count: Some(result.line_count),
-            byte_count: Some(result.byte_count),
-            truncated: result.truncated,
-            display_summary: Some(display_summary.clone()),
-        });
-
-        // For display purposes, override content with just the summary
-        output.content_for_display = Some(Arc::new(display_summary));
-
-        Ok(output)
+        // Full content goes to LLM, structured details for UI
+        Ok(ToolOutput::text(result.content)
+            .with_metadata(super::OutputMetadata {
+                file_path: Some(file_path.clone()),
+                line_count: Some(result.line_count),
+                byte_count: Some(result.byte_count),
+                truncated: result.truncated,
+                display_summary: Some(display_summary.clone()),
+            })
+            .with_summary_display(display_summary.clone())
+            .with_details(serde_json::json!({
+                "file_path": file_path,
+                "line_count": result.line_count,
+                "byte_count": result.byte_count,
+                "truncated": result.truncated,
+                "display_summary": display_summary
+            }))
+        )
     }
 }
 
@@ -152,9 +158,7 @@ impl Tool for ReadTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct BashTool {
-    schema: ToolSchema,
-}
+pub struct BashTool;
 
 impl Default for BashTool {
     fn default() -> Self {
@@ -164,15 +168,7 @@ impl Default for BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("command", "Shell command to execute", true)
-            .string(
-                "cwd",
-                "Working directory for the command (defaults to project root)",
-                false,
-            );
-
-        Self { schema }
+        Self
     }
 }
 
@@ -190,20 +186,24 @@ impl Tool for BashTool {
         Returns combined stdout/stderr. Working directory defaults to project root."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::System
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let command = params.get_required_str("command")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for BashTool {
+    type Params = BashParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let BashParams { command, cwd } = params;
 
         // Validate command - reject obviously malformed commands
         let trimmed = command.trim();
@@ -228,8 +228,7 @@ impl Tool for BashTool {
             )));
         }
 
-        let cwd_str = params.get_str("cwd")?;
-        let cwd = cwd_str
+        let cwd = cwd
             .map(|p| ctx.resolve_path(&p))
             .unwrap_or_else(|| find_project_root(&ctx.cwd));
 
@@ -249,14 +248,24 @@ impl Tool for BashTool {
         let combined = format!("{}\n{}", stdout, stderr).trim().to_string();
         let line_count = combined.lines().count();
         let byte_count = combined.len();
+        let exit_code = output.status.code();
 
-        Ok(ToolOutput::text(combined).with_metadata(super::OutputMetadata {
-            file_path: None,
-            line_count: Some(line_count),
-            byte_count: Some(byte_count),
-            truncated: false,
-            display_summary: None,
-        }))
+        Ok(ToolOutput::text(combined)
+            .with_metadata(super::OutputMetadata {
+                file_path: None,
+                line_count: Some(line_count),
+                byte_count: Some(byte_count),
+                truncated: false,
+                display_summary: None,
+            })
+            .with_details(serde_json::json!({
+                "command": command,
+                "exit_code": exit_code,
+                "line_count": line_count,
+                "byte_count": byte_count,
+                "cwd": cwd.to_string_lossy().to_string()
+            }))
+        )
     }
 }
 
@@ -265,9 +274,7 @@ impl Tool for BashTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct EditTool {
-    schema: ToolSchema,
-}
+pub struct EditTool;
 
 impl Default for EditTool {
     fn default() -> Self {
@@ -277,15 +284,7 @@ impl Default for EditTool {
 
 impl EditTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("file_path", "Path to the file to edit", true)
-            .string("old_text", "Exact text to find and replace (use with new_text)", false)
-            .string("new_text", "Replacement text (use with old_text)", false)
-            .integer("line_start", "Starting line number for line-based edit (0-indexed)", false)
-            .integer("line_end", "Ending line number for line-based edit (0-indexed)", false)
-            .string("new_content", "New content for line range (use with line_start/line_end)", false);
-
-        Self { schema }
+        Self
     }
 }
 
@@ -304,20 +303,32 @@ impl Tool for EditTool {
         Always read the file first to see its contents."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::FileOps
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let file_path = params.get_required_str("file_path")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for EditTool {
+    type Params = EditParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let EditParams {
+            file_path,
+            old_text,
+            new_text,
+            line_start,
+            line_end,
+            new_content,
+        } = params;
+
         let path = ctx.resolve_path(&file_path);
 
         if !path.exists() {
@@ -327,14 +338,10 @@ impl Tool for EditTool {
         let content = fs::read_to_string(&path)?;
 
         // Determine which mode to use: line-based or string replacement
-        let line_start = params.get_integer("line_start")?;
-        let line_end = params.get_integer("line_end")?;
-        let new_content = params.get_str("new_content")?;
-
         // Line-based editing mode
         if line_start.is_some() || line_end.is_some() || new_content.is_some() {
             let start = line_start.unwrap_or(0) as usize;
-            let end = line_end.unwrap_or(start as i64) as usize;
+            let end = line_end.map(|v| v as usize).unwrap_or(start);
             let replacement = new_content.unwrap_or_default();
 
             let lines: Vec<&str> = content.lines().collect();
@@ -361,17 +368,29 @@ impl Tool for EditTool {
             let new_content = new_lines.join("\n");
             fs::write(&path, new_content)?;
 
+            let line_count = replacement.lines().count();
             let summary = format!("Edited {} (lines {}-{})", file_path, start, end);
             return Ok(ToolOutput::text(format!(
                 "Successfully edited {} (replaced lines {}-{} with {} lines)",
-                file_path, start, end, replacement.lines().count()
+                file_path, start, end, line_count
             ))
-            .with_summary_display(summary));
+            .with_summary_display(summary)
+            .with_details(serde_json::json!({
+                "file_path": file_path,
+                "mode": "line_range",
+                "line_start": start,
+                "line_end": end,
+                "lines_replaced": line_count
+            })));
         }
 
         // String replacement mode (original)
-        let old_text = params.get_required_str("old_text")?;
-        let new_text = params.get_required_str("new_text")?;
+        let old_text = old_text.ok_or_else(|| {
+            ToolError::InvalidParameters("Edit requires either old_text/new_text or line_start/line_end/new_content".to_string())
+        })?;
+        let new_text = new_text.ok_or_else(|| {
+            ToolError::InvalidParameters("old_text requires new_text".to_string())
+        })?;
 
         if !content.contains(&old_text) {
             return Ok(ToolOutput::text(
@@ -390,7 +409,13 @@ impl Tool for EditTool {
             "Successfully edited {}",
             file_path
         ))
-        .with_summary_display(summary))
+        .with_summary_display(summary)
+        .with_details(serde_json::json!({
+            "file_path": file_path,
+            "mode": "string_replacement",
+            "old_text_length": old_text.len(),
+            "new_text_length": new_text.len()
+        })))
     }
 }
 
@@ -399,9 +424,7 @@ impl Tool for EditTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct FileInfoTool {
-    schema: ToolSchema,
-}
+pub struct FileInfoTool;
 
 impl Default for FileInfoTool {
     fn default() -> Self {
@@ -411,10 +434,7 @@ impl Default for FileInfoTool {
 
 impl FileInfoTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("file_path", "Path to the file to get metadata for", true);
-
-        Self { schema }
+        Self
     }
 }
 
@@ -432,16 +452,24 @@ impl Tool for FileInfoTool {
         Useful for understanding file properties without reading the entire content."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
+    fn category(&self) -> super::ToolCategory {
+        super::ToolCategory::FileOps
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let file_path = params.get_required_str("file_path")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for FileInfoTool {
+    type Params = FileInfoParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let FileInfoParams { file_path } = params;
         let path = ctx.resolve_path(&file_path);
 
         if !path.exists() {
@@ -514,11 +542,17 @@ impl Tool for FileInfoTool {
         output.push_str(&format!("MIME type: {}\n", mime_hint));
 
         let summary = format!("Info: {} ({} bytes)", file_path, size);
-        Ok(ToolOutput::text(output).with_summary_display(summary))
-    }
-
-    fn category(&self) -> super::ToolCategory {
-        super::ToolCategory::FileOps
+        Ok(ToolOutput::text(output)
+            .with_summary_display(summary)
+            .with_details(serde_json::json!({
+                "file_path": file_path,
+                "size": size,
+                "is_dir": is_dir,
+                "is_symlink": is_symlink,
+                "extension": extension,
+                "mime_type": mime_hint
+            }))
+        )
     }
 }
 
@@ -527,9 +561,7 @@ impl Tool for FileInfoTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct WriteTool {
-    schema: ToolSchema,
-}
+pub struct WriteTool;
 
 impl Default for WriteTool {
     fn default() -> Self {
@@ -539,11 +571,7 @@ impl Default for WriteTool {
 
 impl WriteTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("file_path", "Path to the file to write", true)
-            .string("content", "Content to write to the file", true);
-
-        Self { schema }
+        Self
     }
 }
 
@@ -562,22 +590,43 @@ impl Tool for WriteTool {
         Use read before edit to preserve existing content."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::FileOps
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let file_path = params.get_required_str("file_path")?;
-        let content = params.get_required_str("content")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for WriteTool {
+    type Params = WriteParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let WriteParams { file_path, content } = params;
         let content_len = content.len();
+
+        // Validate file_path - prevent writing to root or system directories
+        let file_path = if file_path.starts_with('/') {
+            // Strip leading slashes and use relative path
+            file_path.trim_start_matches('/').to_string()
+        } else {
+            file_path
+        };
+
+        // Additional safety check - refuse to write to system directories
+        let system_dirs = ["/boot", "/etc", "/sys", "/proc", "/dev", "/root", "/var"];
+        for sys_dir in &system_dirs {
+            if file_path.starts_with(sys_dir) || file_path.contains(&format!("{}/", sys_dir)) {
+                return Err(ToolError::ExecutionFailed(
+                    format!("Refusing to write to system directory: {}", file_path)
+                ));
+            }
+        }
 
         let path = ctx.resolve_path(&file_path);
 
@@ -595,7 +644,11 @@ impl Tool for WriteTool {
             "Successfully wrote {} ({} bytes)",
             file_path, content_len
         ))
-        .with_summary_display(summary))
+        .with_summary_display(summary)
+        .with_details(serde_json::json!({
+            "file_path": file_path,
+            "bytes_written": content_len
+        })))
     }
 }
 
@@ -604,9 +657,7 @@ impl Tool for WriteTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct GrepTool {
-    schema: ToolSchema,
-}
+pub struct GrepTool;
 
 impl Default for GrepTool {
     fn default() -> Self {
@@ -616,16 +667,7 @@ impl Default for GrepTool {
 
 impl GrepTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string("pattern", "Regular expression pattern to search for", true)
-            .string(
-                "path",
-                "Path to search (defaults to current directory)",
-                false,
-            )
-            .boolean("case_insensitive", "Perform case-insensitive search", false);
-
-        Self { schema }
+        Self
     }
 }
 
@@ -643,20 +685,28 @@ impl Tool for GrepTool {
         Returns matching lines with file paths and line numbers."
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::Search
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let pattern = params.get_required_str("pattern")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for GrepTool {
+    type Params = GrepParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let GrepParams {
+            pattern,
+            path,
+            case_insensitive,
+        } = params;
 
         // Validate pattern - reject template syntax
         if pattern.contains('{') || pattern.contains('}') || pattern.contains("$(") {
@@ -666,8 +716,8 @@ impl Tool for GrepTool {
             )));
         }
 
-        let path = params.get_str("path")?.unwrap_or_else(|| ".".to_string());
-        let case_insensitive = params.get_bool("case_insensitive")?.unwrap_or(false);
+        let search_path = path.unwrap_or_else(|| ".".to_string());
+        let case_insensitive = case_insensitive.unwrap_or(false);
 
         let regex = if case_insensitive {
             regex::RegexBuilder::new(&pattern)
@@ -679,7 +729,7 @@ impl Tool for GrepTool {
 
         let mut matches = Vec::new();
 
-        for entry in build_walker(&ctx.cwd, &path) {
+        for entry in build_walker(&ctx.cwd, &search_path) {
             let entry = entry?;
             let entry_path = entry.path();
 
@@ -698,6 +748,7 @@ impl Tool for GrepTool {
             }
         }
 
+        let match_count = matches.len();
         Ok(ToolOutput::text(if matches.is_empty() {
             "No matches found".to_string()
         } else {
@@ -706,11 +757,16 @@ impl Tool for GrepTool {
         .with_metadata(super::OutputMetadata {
             display_summary: Some(format!(
                 "Search found {} matches for '{}'",
-                matches.len(),
-                pattern
+                match_count, pattern
             )),
             ..Default::default()
-        }))
+        })
+        .with_details(serde_json::json!({
+            "pattern": pattern,
+            "path": search_path,
+            "case_insensitive": case_insensitive,
+            "match_count": match_count
+        })))
     }
 }
 
@@ -719,9 +775,7 @@ impl Tool for GrepTool {
 // ============================================================
 
 #[allow(dead_code)]
-pub struct FindTool {
-    schema: ToolSchema,
-}
+pub struct FindTool;
 
 impl Default for FindTool {
     fn default() -> Self {
@@ -731,19 +785,7 @@ impl Default for FindTool {
 
 impl FindTool {
     pub fn new() -> Self {
-        let schema = ToolSchema::new()
-            .string(
-                "pattern",
-                "Glob pattern to match files (e.g., '*.rs', 'src/**/*.ts')",
-                true,
-            )
-            .string(
-                "path",
-                "Path to search (defaults to current directory)",
-                false,
-            );
-
-        Self { schema }
+        Self
     }
 }
 
@@ -761,20 +803,24 @@ impl Tool for FindTool {
         Supports patterns like '*.rs', 'src/**/*.ts', '**/Cargo.toml'"
     }
 
-    fn parameters(&self) -> &ToolSchema {
-        &self.schema
-    }
-
     fn category(&self) -> super::ToolCategory {
         super::ToolCategory::Search
     }
 
-    fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let pattern = params.get_required_str("pattern")?;
+    fn parameters_schema(&self) -> serde_json::Value {
+        <Self as TypedTool>::parameters_schema(self)
+    }
+
+    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        <Self as TypedTool>::execute_json(self, params, ctx)
+    }
+}
+
+impl TypedTool for FindTool {
+    type Params = FindParams;
+
+    fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let FindParams { pattern, path } = params;
 
         // Validate pattern - reject template syntax or obviously malformed patterns
         if pattern.contains('{') || pattern.contains('}') || pattern.contains("$(") {
@@ -792,27 +838,34 @@ impl Tool for FindTool {
             )));
         }
 
-        let path = params.get_str("path")?.unwrap_or_else(|| ".".to_string());
-
-        let search_path = ctx.resolve_path(&path);
+        let search_path = path.unwrap_or_else(|| ".".to_string());
+        let search_path_resolved = ctx.resolve_path(&search_path);
 
         // Try fd first (preferred), then find with gitignore, then glob fallback
-        let result = try_fd(&search_path, &pattern)
-            .or_else(|| try_find(&search_path, &pattern))
-            .or_else(|| try_glob(&search_path, &pattern, ctx));
+        let result = try_fd(&search_path_resolved, &pattern)
+            .or_else(|| try_find(&search_path_resolved, &pattern))
+            .or_else(|| try_glob(&search_path_resolved, &pattern, ctx));
 
         match result {
             Some(matches) if !matches.is_empty() => {
                 let mut sorted = matches;
                 sorted.sort();
                 let content = sorted.join("\n");
-                let summary = format!("Glob '{}' ({} found)", pattern, sorted.len());
+                let found_count = sorted.len();
+                let summary = format!("Glob '{}' ({} found)", pattern, found_count);
                 Ok(ToolOutput::text(content)
                     .with_metadata(super::OutputMetadata {
                         display_summary: Some(summary.clone()),
                         ..Default::default()
                     })
-                    .with_summary_display(summary))
+                    .with_summary_display(summary)
+                    .with_details(serde_json::json!({
+                        "pattern": pattern,
+                        "path": search_path,
+                        "found_count": found_count,
+                        "files": sorted
+                    }))
+                )
             }
             _ => {
                 let summary = format!("glob '{}' (0 found)", pattern);
@@ -821,7 +874,13 @@ impl Tool for FindTool {
                         display_summary: Some(summary.clone()),
                         ..Default::default()
                     })
-                    .with_summary_display(summary))
+                    .with_summary_display(summary)
+                    .with_details(serde_json::json!({
+                        "pattern": pattern,
+                        "path": search_path,
+                        "found_count": 0
+                    }))
+                )
             }
         }
     }
