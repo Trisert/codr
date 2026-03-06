@@ -48,7 +48,9 @@ fn clean_tool_tags(content: &str) -> String {
     // Remove backticks around tool calls
     result = result.replace("```tool", "").replace("```", "");
 
-    result.trim().to_string()
+    // Don't trim! Preserving whitespace is crucial for proper spacing in streaming.
+    // Just return the cleaned content as-is.
+    result
 }
 
 use ratatui::{
@@ -84,6 +86,19 @@ fn looks_like_tool_call(content: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Check if content looks like a tool progress message (should be filtered from display)
+/// These are internal messages like "⚙ Calling read..." or "⚙ read: generating (1.2KB)..."
+fn looks_like_tool_progress(content: &str) -> bool {
+    let trimmed = content.trim();
+    // Check for tool progress indicator with gear emoji
+    if !trimmed.starts_with("⚙") {
+        return false;
+    }
+    // Verify it's actually a progress message, not just any message with gear emoji
+    // Progress messages contain "Calling " or "generating ("
+    trimmed.contains("Calling ") || trimmed.contains(": generating (")
 }
 
 /// Main TUI application state
@@ -284,9 +299,9 @@ impl App {
             }
 
             TuiUpdate::ToolProgress(progress) => {
-                // Show progress message
-                self.progress = Some(progress.to_string());
-                self.show_spinner = true;
+                // Don't show progress messages in status bar - they clutter the UI
+                let _ = progress; // Suppress unused warning
+                // Still update agent status
                 self.agent_status = widgets::banner::AgentStatus::Running;
             }
 
@@ -330,45 +345,59 @@ impl App {
                 // Clean content: filter XML tool tags and JSON tool calls
                 let cleaned = clean_tool_tags(&content);
 
-                // Filter out tool call JSON from display content
+                // Filter out tool call JSON and progress messages from display content
                 // Tool calls look like: {"name": "...", "arguments": {...}} or arrays of such objects
-                let filtered_content = if cleaned.trim().is_empty() || looks_like_tool_call(&cleaned) {
-                    String::new() // Don't display tool calls as content
+                // Progress messages look like: "⚙ Calling read..." or "⚙ read: generating (1.2KB)..."
+                let filtered_content = if cleaned.trim().is_empty()
+                    || looks_like_tool_call(&cleaned)
+                    || looks_like_tool_progress(&cleaned)
+                {
+                    String::new() // Don't display tool calls or progress messages as content
                 } else {
                     cleaned
                 };
 
-                let is_new_message = if filtered_content.is_empty() {
-                    // Empty content (tool call) - still check if new message type
-                    if let Some(last_msg) = self.messages.last_mut() {
-                        &*last_msg.role != &*role
-                    } else {
-                        true
-                    }
-                } else if let Some(last_msg) = self.messages.last_mut() {
+                let is_new_message = if let Some(last_msg) = self.messages.last_mut() {
+                    // Check if we should append to existing message or create new one
                     if &*last_msg.role == &*role {
-                        // Append to existing message
-                        let mut existing = (*last_msg.content).clone();
-                        existing.push_str(&filtered_content);
-                        last_msg.content = Arc::new(existing);
-                        false
+                        // Same role
+                        if filtered_content.is_empty() {
+                            // Empty content: nothing to add
+                            false
+                        } else {
+                            // Non-empty content: append to existing message
+                            let mut existing = (*last_msg.content).clone();
+                            existing.push_str(&filtered_content);
+                            last_msg.content = Arc::new(existing);
+                            false
+                        }
                     } else {
-                        // Create new message
+                        // Different role
+                        if filtered_content.is_empty() {
+                            // Empty content: don't create message yet
+                            false
+                        } else {
+                            // Non-empty content: create new message
+                            self.messages.push(Message {
+                                role: role.to_string().into(),
+                                content: Arc::new(filtered_content),
+                                images: Vec::new(),
+                            });
+                            true
+                        }
+                    }
+                } else {
+                    // First message: create it only if there's actual content
+                    if !filtered_content.is_empty() {
                         self.messages.push(Message {
                             role: role.to_string().into(),
                             content: Arc::new(filtered_content),
                             images: Vec::new(),
                         });
                         true
+                    } else {
+                        false
                     }
-                } else {
-                    // First message
-                    self.messages.push(Message {
-                        role: role.to_string().into(),
-                        content: Arc::new(filtered_content),
-                        images: Vec::new(),
-                    });
-                    true
                 };
 
                 // Auto-scroll to bottom when new message is added or role changes

@@ -147,6 +147,28 @@ impl<'a> Widget for BannerWidget<'a> {
         let y2 = y1 + 1;
         let mut line2_spans = Vec::new();
 
+        // Working indicator when agent is active
+        if matches!(self.agent_status, AgentStatus::Running | AgentStatus::Streaming) {
+            // Animated working message like Claude Code
+            let working_messages = [
+                "discombambulating...",
+                "contemplating...",
+                "working...",
+                "processing...",
+            ];
+            let frame = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() / 3) as usize % working_messages.len();
+            let working_text = working_messages[frame];
+
+            line2_spans.push(Span::styled(
+                working_text,
+                Style::default().fg(self.theme.secondary).add_modifier(Modifier::ITALIC)
+            ));
+            line2_spans.push(Span::styled("  ", Style::default()));
+        }
+
         // CWD (truncated if too long)
         if let Some(cwd) = self.cwd {
             let max_cwd_len = area.width as usize / 2;

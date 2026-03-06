@@ -226,7 +226,9 @@ pub fn clean_tool_tags(content: &str) -> String {
         }
     }
 
-    result.trim().to_string()
+    // Don't trim! Preserving whitespace is crucial for proper spacing in streaming.
+    // Just return as-is for consistency with tui/mod.rs.
+    result
 }
 
 /// Clean content for conversation history (remove XML tags but preserve semantic meaning)

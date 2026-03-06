@@ -206,14 +206,15 @@ impl<'a> ConversationWidget<'a> {
             }
 
             "action" => {
-                // Action message: indented with indicator
-                let prefix = "  ⎿ ";
+                // Action message: aligned with indicator
+                let prefix = "  ▸";
                 let prefix_style = Style::default().fg(self.theme.dimmed);
                 let content_style = Style::default().fg(self.theme.dimmed).add_modifier(Modifier::ITALIC);
 
                 buf.set_string(x, y, prefix, prefix_style);
 
-                let content_x = x + 4;
+                // Align content with first letter over the symbol
+                let content_x = x + 2;
                 for line in message.content.lines() {
                     if y >= area.bottom() - 2 {
                         break;
