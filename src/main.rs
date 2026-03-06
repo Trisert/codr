@@ -2,6 +2,7 @@ pub mod agent;
 pub mod commands;
 pub mod config;
 pub mod context_manager;
+pub mod conversation;
 pub mod error;
 pub mod fuzzy;
 pub mod logo;
@@ -28,6 +29,10 @@ struct Cli {
     /// Run in direct mode (non-interactive, single task execution)
     #[arg(short = 'd', long = "direct")]
     direct: bool,
+
+    /// Resume the most recent conversation
+    #[arg(short = 'r', long = "resume")]
+    resume: bool,
 
     /// Enable YOLO mode (auto-approve bash commands)
     #[arg(long = "yolo")]
@@ -72,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if use_tui {
         // TUI mode (interactive chat - default)
-        let initial_messages = Vec::new(); // Start with empty conversation
+        let initial_messages = Vec::new(); // Will be loaded if --resume is set
 
         // Create role from cli flags
         let role = if cli.yolo {
@@ -82,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Run TUI with integrated agent
-        tui::run_tui_agent(model, tool_registry, initial_messages, role).await?;
+        tui::run_tui_agent(model, tool_registry, initial_messages, role, cli.resume).await?;
     } else {
         // Direct mode (non-interactive, single task execution)
         let initial_task = cli.task.join(" ");
@@ -155,12 +160,14 @@ async fn run_direct(
     let executor = DirectExecutor::new(tool_registry_arc);
 
     // Run the shared agent loop with the same registry reference
+    // Direct mode doesn't need streaming, so use default config
     let result = run_agent_loop(
         &model,
         messages,
         tool_registry,
         executor,
         &Role::Yolo,
+        agent::LoopConfig::new(),
     )
     .await
     .map_err(|e| format!("Agent loop error: {}", e))?;

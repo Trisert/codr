@@ -6,59 +6,10 @@
 use crate::agent::executor::{ActionExecutor, ExecutionError, MAX_RETRIES};
 use crate::error::AgentError;
 use crate::model::{Message, Model};
-use crate::parser::{Action, parse_actions};
+use crate::parser::{Action, parse_actions, clean_message_content};
 use crate::tools::ToolRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Clean content for conversation history (remove XML tags but preserve semantic meaning)
-/// This is called when adding LLM output to the conversation history for the next turn
-fn clean_for_conversation(content: &str) -> String {
-    let mut result = content.to_string();
-
-    // Remove <codr_tool name="XXX">params</codr_tool> tags entirely
-    while let Some(start) = result.find("<codr_tool") {
-        if let Some(end_tag) = result[start..].find("</codr_tool>") {
-            let end = start + end_tag + "</codr_tool>".len();
-            result.replace_range(start..end, "");
-        } else {
-            result.truncate(start);
-            break;
-        }
-    }
-
-    // Remove <codr_bash>command</codr_bash> tags entirely
-    while let Some(start) = result.find("<codr_bash>") {
-        if let Some(end_tag) = result[start..].find("</codr_bash>") {
-            let end = start + end_tag + "</codr_bash>".len();
-            result.replace_range(start..end, "");
-        } else {
-            result.truncate(start);
-            break;
-        }
-    }
-
-    // Remove thinking tags entirely
-    let thinking_tags = [("<thinking>", "</thinking>"), ("<thinking>", "</thinking>")];
-    for (start_tag, end_tag) in thinking_tags {
-        while let Some(start) = result.find(start_tag) {
-            if let Some(end_offset) = result[start..].find(end_tag) {
-                let end = start + end_offset + end_tag.len();
-                result.replace_range(start..end, "");
-            } else {
-                result.truncate(start);
-                break;
-            }
-        }
-    }
-
-    // Clean up extra whitespace that might result from tag removal
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
-    }
-
-    result.trim().to_string()
-}
 
 /// Result of running the agent loop
 #[derive(Debug)]
@@ -77,10 +28,50 @@ pub type StreamingCallback = Arc<dyn Fn(Arc<str>) + Send + Sync>;
 /// Streaming callback type for thinking content
 pub type ThinkingCallback = Arc<dyn Fn(Arc<str>) + Send + Sync>;
 
+/// Configuration for the agent loop
+#[derive(Default)]
+pub struct LoopConfig {
+    /// Enable streaming mode
+    pub streaming: bool,
+    /// Optional callback for streaming text content
+    pub on_streaming: Option<StreamingCallback>,
+    /// Optional callback for streaming thinking content
+    pub on_thinking: Option<ThinkingCallback>,
+    /// Optional cancellation token for interrupting streaming
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+
+impl LoopConfig {
+    /// Create a new non-streaming config
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new streaming config
+    pub fn streaming(
+        on_streaming: StreamingCallback,
+        on_thinking: ThinkingCallback,
+    ) -> Self {
+        Self {
+            streaming: true,
+            on_streaming: Some(on_streaming),
+            on_thinking: Some(on_thinking),
+            cancel_token: None,
+        }
+    }
+
+    /// Set the cancellation token
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+}
+
 /// Run the agent loop with the given executor
 ///
 /// This is the core agent loop that:
-/// 1. Queries the LLM
+/// 1. Queries the LLM (with optional streaming)
 /// 2. Parses the response into actions
 /// 3. Executes the actions (with retry logic)
 /// 4. Feeds results back to the LLM
@@ -88,30 +79,75 @@ pub type ThinkingCallback = Arc<dyn Fn(Arc<str>) + Send + Sync>;
 ///
 /// The executor parameter determines how actions are executed and
 /// where output is sent (stdout, UI channel, etc.).
+///
+/// The config parameter controls whether streaming is enabled and
+/// provides optional callbacks for real-time updates.
 pub async fn run_agent_loop<E: ActionExecutor>(
     model: &Model,
     initial_conversation: Vec<Message>,
     tool_registry: &ToolRegistry,
     mut executor: E,
     role: &crate::tools::Role,
+    config: LoopConfig,
 ) -> Result<LoopResult, String> {
     let mut conversation = initial_conversation;
     let mut actions_executed = 0;
 
+    // Prepare streaming callbacks if enabled
+    let on_streaming = config.on_streaming;
+    let on_thinking = config.on_thinking;
+
     loop {
-        // Query the LLM (with streaming support for native tool calling)
-        let lm_output = if model.supports_native_tools() {
-            let tools_for_role = tool_registry.get_tools_for_role(*role);
-            let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
-            model
-                .query_with_tools(&conversation, &tools_refs)
-                .await
-                .map_err(|e| format!("Query error: {}", e))?
+        // Query the LLM (streaming or non-streaming based on config)
+        let lm_output = if config.streaming {
+            // Streaming mode
+            if model.supports_native_tools() {
+                let tools_for_role = tool_registry.get_tools_for_role(*role);
+                let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
+                let cancel_token = config.cancel_token.clone().unwrap_or_default();
+                let on_streaming_cb = on_streaming.clone().unwrap();
+                let on_thinking_cb = on_thinking.clone().unwrap();
+
+                model
+                    .query_streaming_with_tools(
+                        &conversation,
+                        &tools_refs,
+                        move |chunk| on_streaming_cb(Arc::from(chunk)),
+                        move |thinking| on_thinking_cb(Arc::from(thinking)),
+                        &cancel_token,
+                    )
+                    .await
+                    .map_err(|e| format!("Query error: {}", e))?
+            } else {
+                let cancel_token = config.cancel_token.clone().unwrap_or_default();
+                let on_streaming_cb = on_streaming.clone().unwrap();
+                let on_thinking_cb = on_thinking.clone().unwrap();
+
+                model
+                    .query_streaming(
+                        &conversation,
+                        move |chunk| on_streaming_cb(Arc::from(chunk)),
+                        move |thinking| on_thinking_cb(Arc::from(thinking)),
+                        &cancel_token,
+                    )
+                    .await
+                    .map_err(|e| format!("Query error: {}", e))?
+            }
         } else {
-            model
-                .query(&conversation)
-                .await
-                .map_err(|e| format!("Query error: {}", e))?
+            // Non-streaming mode
+            if model.supports_native_tools() {
+                let tools_for_role = tool_registry.get_tools_for_role(*role);
+                let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
+                model
+                    .query_with_tools(&conversation, &tools_refs)
+                    .await
+                    .map_err(|e| format!("Query error: {}", e))?
+            } else {
+                model
+                    .query(&conversation)
+                    .await
+                    .map_err(|e| format!("Query error: {}", e))?
+            }
         };
 
         // Parse the response into actions
@@ -197,14 +233,14 @@ fn execute_actions_with_retry<E: ActionExecutor>(
         }
 
         // Check if tool is available in current role
-        if let Action::Tool { name, .. } = action {
-            if !role.tool_available(name.as_ref()) {
+        if let Action::Tool { name, .. } = action
+            && !role.tool_available(name.as_ref()) {
                 let error_msg = format!(
                     "Tool '{}' is not available in {} mode. Use Shift+Tab to change roles.",
                     name,
                     role.name()
                 );
-                let cleaned_output = clean_for_conversation(lm_output);
+                let cleaned_output = clean_message_content(lm_output, true);
                 *conversation = model.add_assistant_message(
                     conversation.clone(),
                     cleaned_output.as_str(),
@@ -212,7 +248,6 @@ fn execute_actions_with_retry<E: ActionExecutor>(
                 *conversation = model.add_user_message(conversation.clone(), &error_msg);
                 return Err(ExecutionError::retryable(error_msg));
             }
-        }
 
         // Get the action key for tracking retries
         let action_key = get_action_key(action);
@@ -227,7 +262,7 @@ fn execute_actions_with_retry<E: ActionExecutor>(
                 }
 
                 // Add messages to conversation
-                let cleaned_output = clean_for_conversation(lm_output);
+                let cleaned_output = clean_message_content(lm_output, true);
                 *conversation = model.add_assistant_message(conversation.clone(), cleaned_output.as_str());
                 *conversation = model.add_user_message(
                     conversation.clone(),
@@ -260,7 +295,7 @@ fn execute_actions_with_retry<E: ActionExecutor>(
                         "Please fix the parameters and try again."
                     );
 
-                    let cleaned_output = clean_for_conversation(lm_output);
+                    let cleaned_output = clean_message_content(lm_output, true);
                     *conversation = model.add_assistant_message(
                         conversation.clone(),
                         &cleaned_output,
@@ -285,113 +320,19 @@ fn execute_actions_with_retry<E: ActionExecutor>(
 ///
 /// This variant provides real-time streaming of LLM responses through callbacks,
 /// useful for TUI mode where progressive display is important.
+///
+/// This is now a thin wrapper around the unified `run_agent_loop` function.
 pub async fn run_agent_loop_streaming<E: ActionExecutor>(
     model: &Model,
     initial_conversation: Vec<Message>,
     tool_registry: &ToolRegistry,
-    mut executor: E,
+    executor: E,
     role: &crate::tools::Role,
     on_streaming: StreamingCallback,
     on_thinking: ThinkingCallback,
 ) -> Result<LoopResult, String> {
-    // Wrap callbacks in Arc for cloning
-    let on_streaming_cb = Arc::new(on_streaming);
-    let on_thinking_cb = Arc::new(on_thinking);
-
-    let mut conversation = initial_conversation;
-    let mut actions_executed = 0;
-
-    loop {
-        // Query LLM with streaming support
-        // Clone callbacks for this iteration
-        let on_streaming_iter = on_streaming_cb.clone();
-        let on_thinking_iter = on_thinking_cb.clone();
-
-        let lm_output = if model.supports_native_tools() {
-            let tools_for_role = tool_registry.get_tools_for_role(*role);
-            let tools_refs: Vec<&dyn crate::tools::Tool> = tools_for_role;
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-
-            model
-                .query_streaming_with_tools(
-                    &conversation,
-                    &tools_refs,
-                    move |chunk| on_streaming_iter(Arc::from(chunk)),
-                    move |thinking| on_thinking_iter(Arc::from(thinking)),
-                    &cancel_token,
-                )
-                .await
-                .map_err(|e| format!("Query error: {}", e))?
-        } else {
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-
-            model
-                .query_streaming(
-                    &conversation,
-                    move |chunk| on_streaming_iter(Arc::from(chunk)),
-                    move |thinking| on_thinking_iter(Arc::from(thinking)),
-                    &cancel_token,
-                )
-                .await
-                .map_err(|e| format!("Query error: {}", e))?
-        };
-
-        // Parse response into actions
-        let parsed = parse_actions(&lm_output);
-
-        let actions = match parsed {
-            Ok(actions) => actions,
-            Err(AgentError::Terminating(msg)) => {
-                let _ = executor.execute_action(&Action::Response(Arc::new((*msg).to_string())));
-                return Ok(LoopResult {
-                    final_response: None,
-                    conversation,
-                    actions_executed,
-                });
-            }
-            Err(AgentError::Timeout(msg)) => {
-                conversation = model.add_user_message(conversation, &msg);
-                continue;
-            }
-        };
-
-        // Check for plain text response (loop exit condition)
-        if let Some(Action::Response(response)) = actions.iter().find(|a| matches!(a, Action::Response(_))) {
-            return Ok(LoopResult {
-                final_response: Some((*response).to_string()),
-                conversation,
-                actions_executed,
-            });
-        }
-
-        // Execute all tool/bash actions with retry logic
-        let result = execute_actions_with_retry(
-            &actions,
-            &mut executor,
-            &lm_output,
-            &mut conversation,
-            model,
-            role,
-        );
-
-        match result {
-            Ok(count) => {
-                actions_executed += count;
-            }
-            Err(ExecutionError { message, is_fatal }) => {
-                if is_fatal {
-                    let _ = executor.execute_action(&Action::Response(Arc::new(message)));
-                    return Ok(LoopResult {
-                        final_response: None,
-                        conversation,
-                        actions_executed,
-                    });
-                } else {
-                    conversation = model.add_user_message(conversation, &message);
-                }
-            }
-        }
-    }
+    let config = LoopConfig::streaming(on_streaming, on_thinking);
+    run_agent_loop(model, initial_conversation, tool_registry, executor, role, config).await
 }
 
 /// Get a unique key for an action (for tracking retries)

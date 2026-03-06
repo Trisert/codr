@@ -3,6 +3,7 @@ pub mod agent;
 pub mod commands;
 pub mod config;
 pub mod context_manager;
+pub mod conversation;
 pub mod error;
 pub mod fuzzy;
 pub mod logo;

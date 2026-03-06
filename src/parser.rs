@@ -3,6 +3,73 @@ use serde_json::Value;
 use std::sync::Arc;
 
 // ============================================================
+// Message Cleaning
+// ============================================================
+
+/// Clean content for display by removing XML tool tags
+///
+/// This function removes <codr_tool>...</codr_tool> and <codr_bash>...</codr_bash> tags
+/// from content while preserving the semantic meaning for display purposes.
+///
+/// # Arguments
+/// * `content` - The content to clean
+/// * `trim_whitespace` - If true, trims leading/trailing whitespace. If false, preserves
+///   whitespace (useful for streaming where incremental content shouldn't be trimmed).
+///
+/// # Returns
+/// The cleaned content with XML tags removed
+pub fn clean_message_content(content: &str, trim_whitespace: bool) -> String {
+    let mut result = content.to_string();
+
+    // Remove <codr_tool name="XXX">params</codr_tool> tags entirely
+    while let Some(start) = result.find("<codr_tool") {
+        if let Some(end_tag) = result[start..].find("</codr_tool>") {
+            let end = start + end_tag + "</codr_tool>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove <codr_bash>command</codr_bash> tags entirely
+    while let Some(start) = result.find("<codr_bash>") {
+        if let Some(end_tag) = result[start..].find("</codr_bash>") {
+            let end = start + end_tag + "</codr_bash>".len();
+            result.replace_range(start..end, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+
+    // Remove thinking tags entirely
+    let thinking_tags = [("<thinking>", "</thinking>"), ("<thinking>", "</thinking>")];
+    for (start_tag, end_tag) in thinking_tags {
+        while let Some(start) = result.find(start_tag) {
+            if let Some(end_offset) = result[start..].find(end_tag) {
+                let end = start + end_offset + end_tag.len();
+                result.replace_range(start..end, "");
+            } else {
+                result.truncate(start);
+                break;
+            }
+        }
+    }
+
+    // Clean up extra whitespace that might result from tag removal
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    if trim_whitespace {
+        result.trim().to_string()
+    } else {
+        result
+    }
+}
+
+// ============================================================
 // Action Types
 // ============================================================
 
@@ -84,15 +151,14 @@ fn parse_json_tool_call(content: &str) -> Option<Action> {
 /// Extract tool call from a JSON value (handles both standard and Qwen formats)
 fn extract_from_json_value(value: &Value) -> Option<Action> {
     // Qwen format: {"input": "..."} - extract XML from input field
-    if let Some(input_str) = value.get("input").and_then(|v| v.as_str()) {
-        if let Some(extracted) = extract_xml_tool_from_string(input_str) {
+    if let Some(input_str) = value.get("input").and_then(|v| v.as_str())
+        && let Some(extracted) = extract_xml_tool_from_string(input_str) {
             // Return the extracted tool call
             return Some(Action::Tool {
                 name: extracted.get("name")?.as_str()?.into(),
                 params: extracted.get("arguments")?.clone(),
             });
         }
-    }
 
     // Standard format: {"name": "tool", "arguments": {...}}
     let name = value.get("name")?.as_str()?.into();
@@ -175,8 +241,8 @@ fn parse_json_bash(content: &str) -> Option<Action> {
     let trimmed = content.trim();
 
     // Try JSON format first
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && let Some(command) = value.get("command").and_then(|v| v.as_str()) {
             return Some(Action::Bash {
                 command: command.into(),
                 workdir: value.get("cwd")
@@ -189,11 +255,10 @@ fn parse_json_bash(content: &str) -> Option<Action> {
                 env: value.get("env").cloned(),
             });
         }
-    }
 
     // If it's just a string (simple command)
-    if trimmed.starts_with('"') && trimmed.ends_with('"') {
-        if let Ok(s) = serde_json::from_str::<String>(trimmed) {
+    if trimmed.starts_with('"') && trimmed.ends_with('"')
+        && let Ok(s) = serde_json::from_str::<String>(trimmed) {
             return Some(Action::Bash {
                 command: s.into(),
                 workdir: None,
@@ -201,7 +266,6 @@ fn parse_json_bash(content: &str) -> Option<Action> {
                 env: None,
             });
         }
-    }
 
     None
 }
@@ -421,8 +485,8 @@ pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
     }
 
     // Try parsing the whole thing as JSON (for pure JSON without thinking)
-    if let Ok(value) = serde_json::from_str::<Value>(remaining) {
-        if let Some(arr) = value.as_array() {
+    if let Ok(value) = serde_json::from_str::<Value>(remaining)
+        && let Some(arr) = value.as_array() {
             for item in arr {
                 if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                     actions.push(Action::Tool {
@@ -439,7 +503,6 @@ pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
                 return Ok(actions);
             }
         }
-    }
 
     // Single action
     match parse_action(remaining) {

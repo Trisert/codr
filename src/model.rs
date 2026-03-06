@@ -529,8 +529,8 @@ impl Model {
 
         match response.json::<ProbeResponse>().await {
             Ok(probe_resp) => {
-                if let Some(choice) = probe_resp.choices.first() {
-                    if let Some(tool_calls) = &choice.message.tool_calls {
+                if let Some(choice) = probe_resp.choices.first()
+                    && let Some(tool_calls) = &choice.message.tool_calls {
                         let has_valid_tool_call = tool_calls.iter().any(|tc| {
                             tc.function
                                 .as_ref()
@@ -543,7 +543,6 @@ impl Model {
                             return true;
                         }
                     }
-                }
                 eprintln!("Tool probe: no tool_calls in response, using prompt-based tool calling");
                 false
             }
@@ -1312,13 +1311,12 @@ impl Model {
                                     if let Some(function) = tool_call.function {
                                         let entry = tool_call_accumulators.entry(idx)
                                             .or_insert_with(|| (String::new(), String::new(), 0));
-                                        if let Some(name) = function.name {
-                                            if !name.is_empty() && entry.0.is_empty() {
+                                        if let Some(name) = function.name
+                                            && !name.is_empty() && entry.0.is_empty() {
                                                 entry.0 = name.clone();
                                                 // Stream tool name when first detected
                                                 on_text(format!("\n⚙ Calling {}...", name));
                                             }
-                                        }
                                         if let Some(arguments) = function.arguments {
                                             entry.1.push_str(&arguments);
                                             let new_len = entry.1.len();
@@ -1353,8 +1351,8 @@ impl Model {
         let mut sorted_indices: Vec<usize> = tool_call_accumulators.keys().copied().collect();
         sorted_indices.sort();
         for idx in sorted_indices {
-            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx) {
-                if !name.is_empty() {
+            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx)
+                && !name.is_empty() {
                     // Try to parse the accumulated arguments as JSON for validation
                     let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
                         serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
@@ -1366,7 +1364,6 @@ impl Model {
                     full_content.push_str(&tool_xml);
                     on_text(tool_xml);
                 }
-            }
         }
 
         if !thinking_content.is_empty() {
@@ -1549,13 +1546,12 @@ impl Model {
                                     if let Some(function) = tool_call.function {
                                         let entry = tool_call_accumulators.entry(idx)
                                             .or_insert_with(|| (String::new(), String::new(), 0));
-                                        if let Some(name) = function.name {
-                                            if !name.is_empty() && entry.0.is_empty() {
+                                        if let Some(name) = function.name
+                                            && !name.is_empty() && entry.0.is_empty() {
                                                 entry.0 = name.clone();
                                                 // Stream tool name when first detected
                                                 on_text(format!("\n⚙ Calling {}...\n", name));
                                             }
-                                        }
                                         if let Some(arguments) = function.arguments {
                                             entry.1.push_str(&arguments);
                                             let new_len = entry.1.len();
@@ -1590,8 +1586,8 @@ impl Model {
         let mut sorted_indices: Vec<usize> = tool_call_accumulators.keys().copied().collect();
         sorted_indices.sort();
         for idx in sorted_indices {
-            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx) {
-                if !name.is_empty() {
+            if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx)
+                && !name.is_empty() {
                     let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
                         serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
                     } else {
@@ -1601,7 +1597,6 @@ impl Model {
                     full_content.push_str(&tool_xml);
                     on_text(tool_xml);
                 }
-            }
         }
 
         if !thinking_content.is_empty() {

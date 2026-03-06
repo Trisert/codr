@@ -90,9 +90,43 @@ impl ExecutionError {
 ///
 /// Implementations can vary how they handle output (stdout, channels, etc.)
 /// while maintaining consistent execution and retry logic.
+///
+/// For executors that support approval workflows (like TUI mode), the trait
+/// provides methods to check for approval needs and to wait for approval results.
 pub trait ActionExecutor {
     /// Execute a single action and return the result
+    ///
+    /// For executors with approval support, this method should block until
+    /// approval is granted or rejected. If rejected, it should return an error.
     fn execute_action(&self, action: &Action) -> Result<ActionOutput, ExecutionError>;
+
+    /// Check if an action requires approval before execution
+    ///
+    /// Returns true if the action needs user approval. This is a synchronous
+    /// check that doesn't block - the actual approval waiting happens in
+    /// `execute_action()`.
+    ///
+    /// Default implementation returns false (no approval needed).
+    fn needs_approval(&self, _action: &Action) -> bool {
+        false
+    }
+
+    /// Notify the executor that an action has been approved
+    ///
+    /// This is called after the user grants approval for a pending action.
+    /// The executor should resume execution and return the result.
+    ///
+    /// Default implementation does nothing (no approval workflow).
+    #[allow(unused_variables)]
+    fn approve_action(&self, _action: &Action) {}
+
+    /// Notify the executor that an action has been rejected
+    ///
+    /// This is called after the user rejects a pending action.
+    /// The executor should terminate the pending action.
+    ///
+    /// Default implementation does nothing (no approval workflow).
+    fn reject_action(&self) {}
 }
 
 /// Direct executor for command-line mode (writes to stdout)
@@ -111,7 +145,7 @@ impl ActionExecutor for DirectExecutor {
         match action {
             Action::Bash { command, .. } => {
                 execute_bash(command.as_ref()).map(ActionOutput::visible)
-                    .map_err(|e| ExecutionError::from_agent_error(e))
+                    .map_err(ExecutionError::from_agent_error)
             }
             Action::Tool { name, params } => {
                 self.tool_registry

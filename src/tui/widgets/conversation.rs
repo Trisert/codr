@@ -11,6 +11,7 @@ use ratatui::{
     widgets::Widget,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use crate::tui::markdown::render_markdown;
 use crate::tui::theme::Theme;
 use crate::model::Message;
 
@@ -61,22 +62,22 @@ impl<'a> ConversationWidget<'a> {
         self
     }
 
-    /// Scroll up by n lines
+    /// Scroll up by n lines (hide newest messages)
     pub fn scroll_up(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
+    }
+
+    /// Scroll down by n lines (show more newest messages)
+    pub fn scroll_down(&mut self, n: usize, _max_offset: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
-    /// Scroll down by n lines
-    pub fn scroll_down(&mut self, n: usize, max_offset: usize) {
-        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
-    }
-
-    /// Scroll to bottom
+    /// Scroll to bottom (show all messages)
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
 
-    /// Get max scroll offset
+    /// Get max scroll offset (max messages to hide)
     pub fn max_scroll_offset(&self) -> usize {
         self.messages.len().saturating_sub(1)
     }
@@ -84,22 +85,55 @@ impl<'a> ConversationWidget<'a> {
 
 impl<'a> Widget for ConversationWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut y = area.y;
         let pad = 2;
         let x = area.x + pad;
 
-        // Simple scroll logic:
-        // - When scroll_offset = 0, show all messages (auto-scroll to bottom)
-        // - When scroll_offset > 0, skip that many messages from start (scroll up to see older)
-        let messages: Vec<&Message> = self.messages.iter()
-            .skip(self.scroll_offset)
-            .collect();
+        // Chat scroll logic:
+        // - scroll_offset = 0: show all messages (auto-scroll to bottom)
+        // - scroll_offset > 0: hide that many newest messages (scroll up to see older)
+        let visible_count = self.messages.len().saturating_sub(self.scroll_offset);
 
-        // Render messages from top to bottom
-        // Stop when we reach the bottom of the viewport (area.bottom() - 2 for input area)
-        for message in messages {
-            // Check if we've reached the bottom of the viewport
-            if y >= area.bottom() - 2 {
+        // Calculate heights of visible messages in order (oldest to newest)
+        // We take from the beginning since scroll_offset controls how many to skip from the end
+        let mut message_heights: Vec<u16> = Vec::new();
+        let mut total_height: u16 = 0;
+        for message in self.messages.iter().take(visible_count) {
+            let (spacing, add_bottom) = match &*message.role {
+                "user" => (1, false),
+                "assistant" => (1, false),
+                "action" => (0, false),
+                "output" => (0, true),
+                "thinking" => (0, false),
+                _ => (0, false),
+            };
+
+            let content_height: u16 = message.content.lines().count() as u16;
+            let mut msg_height = spacing as u16 + content_height;
+            if add_bottom {
+                msg_height += 1;
+            }
+            message_heights.push(msg_height);
+            total_height += msg_height;
+        }
+
+        // Determine starting Y position:
+        // - If all messages fit in viewport: position so newest message is at bottom
+        // - If messages overflow: start from top and let messages flow downward
+        let viewport_height = area.bottom() - area.y - 2;
+        let start_y = if total_height < viewport_height {
+            // All messages fit - anchor at bottom
+            area.bottom() - 2 - total_height
+        } else {
+            // Messages exceed viewport - start from top
+            area.y
+        };
+
+        // Render messages in order (oldest at top, newest at bottom)
+        let mut y = start_y;
+
+        for message in self.messages.iter().take(visible_count) {
+            // Don't render below viewport
+            if y > area.bottom() - 2 {
                 break;
             }
 
@@ -180,40 +214,47 @@ impl<'a> ConversationWidget<'a> {
             }
 
             "assistant" => {
-                // Assistant message: no prefix, left-aligned
-                let content_style = Style::default().fg(self.theme.foreground);
+                // Assistant message: render markdown using pulldown-cmark
+                let rendered = render_markdown(message.content.as_ref(), max_width);
+                let area_y = y;
 
-                for line in message.content.lines() {
+                for (i, line) in rendered.lines.iter().enumerate() {
                     if y >= area.bottom() - 2 {
                         break;
                     }
 
-                    // Check for code blocks
-                    if line.trim().starts_with("```") {
-                        // Code block with borders
-                        y = self.render_code_block(message, x, y, area, buf);
-                    } else {
-                        let (wrapped_text, _line_count) = self.wrap_text(line, x, area, max_width);
-                        for wrapped_line in wrapped_text.lines() {
-                            if y >= area.bottom() - 2 {
-                                break;
-                            }
-                            buf.set_string(x, y, wrapped_line, content_style);
-                            y += 1;
-                        }
+                    // Skip empty lines at the start (already handled by spacing)
+                    if i == 0 && line.spans.is_empty() {
+                        continue;
                     }
+
+                    // Render each line from the markdown
+                    let mut x_offset = 0;
+                    for span in &line.spans {
+                        if x + x_offset + span.content.width() as u16 >= area.right() - 2 {
+                            break;
+                        }
+                        buf.set_span(x + x_offset, y, span, max_width as u16);
+                        x_offset += span.content.width() as u16;
+                    }
+                    y += 1;
+                }
+
+                // Ensure we progressed at least one line
+                if y == area_y && !message.content.is_empty() {
+                    y += 1;
                 }
             }
 
             "action" => {
-                // Action message: aligned with indicator
-                let prefix = "  ▸";
+                // Action message: with ↳ indicator
+                let prefix = "↳ ";
                 let prefix_style = Style::default().fg(self.theme.dimmed);
                 let content_style = Style::default().fg(self.theme.dimmed).add_modifier(Modifier::ITALIC);
 
                 buf.set_string(x, y, prefix, prefix_style);
 
-                // Align content with first letter over the symbol
+                // Align content after the prefix
                 let content_x = x + 2;
                 for line in message.content.lines() {
                     if y >= area.bottom() - 2 {
@@ -250,7 +291,7 @@ impl<'a> ConversationWidget<'a> {
 
                 // Content with borders
                 for line in content_lines {
-                    let line_text = self.truncate_line(line, max_width.saturating_sub(4) as usize);
+                    let line_text = self.truncate_line(line, max_width.saturating_sub(4));
                     let padding = max_width_u16.saturating_sub(4).saturating_sub(line_text.len() as u16) as usize;
                     let border_line = format!("│ {}{}│", line_text, " ".repeat(padding));
                     buf.set_string(x, y, &border_line, content_style);
@@ -315,57 +356,6 @@ impl<'a> ConversationWidget<'a> {
         y
     }
 
-    /// Render code block with borders
-    fn render_code_block(&self, message: &Message, x: u16, mut y: u16, area: Rect, buf: &mut Buffer) -> u16 {
-        let max_width = (area.width - PADDING * 2) as usize;
-        let lines: Vec<&str> = message.content.lines().collect();
-
-        // Find code block boundaries
-        let mut in_code = false;
-        let mut code_start = 0;
-        let mut code_end = 0;
-
-        for (i, line) in lines.iter().enumerate() {
-            if line.trim().starts_with("```") && !in_code {
-                in_code = true;
-                code_start = i + 1;
-            } else if line.trim().starts_with("```") && in_code {
-                code_end = i;
-                break;
-            }
-        }
-
-        if !in_code || code_start >= code_end {
-            return y;
-        }
-
-        // Draw top border
-        let border_style = Style::default().fg(self.theme.border);
-        let top_border = format!("┌{}┐", "─".repeat(max_width.saturating_sub(2)));
-        buf.set_string(x, y, &top_border, border_style);
-        y += 1;
-
-        // Draw code content
-        let code_style = Style::default().fg(self.theme.foreground);
-        for line in &lines[code_start..code_end] {
-            if y >= area.bottom() - 2 {
-                break;
-            }
-
-            let wrapped_line = self.truncate_line(line, max_width.saturating_sub(2));
-            buf.set_string(x + 1, y, &format!("│{}│", wrapped_line), border_style);
-            buf.set_string(x + 2, y, &wrapped_line, code_style);
-            y += 1;
-        }
-
-        // Draw bottom border
-        let bottom_border = format!("└{}┘", "─".repeat(max_width.saturating_sub(2)));
-        buf.set_string(x, y, &bottom_border, border_style);
-        y += 1;
-
-        y
-    }
-
     /// Render pending action (approve/reject workflow)
     fn render_pending_action(&self, action: &PendingAction, x: u16, y: u16, _area: Rect, buf: &mut Buffer) -> u16 {
         let max_width = (_area.width - PADDING * 2) as usize;
@@ -401,54 +391,23 @@ impl<'a> ConversationWidget<'a> {
         y + 5
     }
 
-    /// Wrap text to fit width
+    /// Wrap text to fit width (word-aware using textwrap library)
     fn wrap_text(&self, text: &str, _x: u16, _area: Rect, max_width: usize) -> (String, u16) {
-        // Proper text wrapping that adapts to screen width
-        let mut result = String::new();
-        let mut current_line = String::new();
-        let mut current_width = 0;
-        let mut line_count = 0;
-
-        for c in text.chars() {
-            let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-
-            // Handle newline
-            if c == '\n' {
-                result.push_str(&current_line);
-                result.push('\n');
-                current_line = String::new();
-                current_width = 0;
-                line_count += 1;
-                continue;
-            }
-
-            // Check if we need to wrap
-            if current_width + char_width > max_width {
-                if !current_line.is_empty() {
-                    result.push_str(&current_line);
-                    result.push('\n');
-                    line_count += 1;
-                }
-                current_line = String::new();
-                current_width = 0;
-            }
-
-            current_line.push(c);
-            current_width += char_width;
+        if text.is_empty() {
+            return (String::new(), 1);
         }
 
-        // Add remaining content
-        if !current_line.is_empty() {
-            result.push_str(&current_line);
-            line_count += 1;
-        }
+        // Use textwrap for proper word wrapping
+        let options = textwrap::Options::new(max_width)
+            .word_separator(textwrap::WordSeparator::AsciiSpace)
+            .break_words(false);
 
-        // Ensure at least 1 line
-        if line_count == 0 {
-            line_count = 1;
-        }
+        let wrapped = textwrap::fill(text, options);
 
-        (result, line_count as u16)
+        // Count lines
+        let line_count = wrapped.lines().count() as u16;
+
+        (wrapped, line_count)
     }
 
     /// Truncate line to fit width
@@ -471,4 +430,3 @@ impl<'a> ConversationWidget<'a> {
         }
     }
 }
-

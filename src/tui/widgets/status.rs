@@ -170,7 +170,7 @@ impl<'a> StatusWidget<'a> {
         );
 
         if let Some(ch) = frame {
-            buf.set_string(x, y, &format!("{}", ch), style);
+            buf.set_string(x, y, format!("{}", ch), style);
         }
     }
 }

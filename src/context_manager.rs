@@ -2,6 +2,7 @@
 use crate::model::Message;
 use std::collections::VecDeque;
 
+#[derive(Clone)]
 pub struct ContextManager {
     max_tokens: usize,
     current_tokens: usize,
@@ -82,16 +83,6 @@ impl ContextManager {
     pub fn clear(&mut self) {
         self.messages.clear();
         self.current_tokens = self.system_prompt_tokens;
-    }
-
-    /// Clone the context manager (for temporary pruning operations)
-    pub fn clone(&self) -> Self {
-        Self {
-            max_tokens: self.max_tokens,
-            current_tokens: self.current_tokens,
-            messages: self.messages.clone(),
-            system_prompt_tokens: self.system_prompt_tokens,
-        }
     }
 }
 

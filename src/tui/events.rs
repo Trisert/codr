@@ -150,7 +150,7 @@ pub fn handle_mouse_event(event: MouseEvent) -> EventResult {
     match event.kind {
         MouseEventKind::ScrollUp => EventResult::ScrollUp,
         MouseEventKind::ScrollDown => EventResult::ScrollDown,
-        MouseEventKind::Down(button) if button == ratatui::crossterm::event::MouseButton::Left => {
+        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
             EventResult::NoOp // Handled by widgets
         }
         _ => EventResult::NoOp,

@@ -85,11 +85,11 @@ impl AsyncToolHandler for AsyncToolWrapper {
 
         // Use tokio::task::block_in_place to bridge sync/async
         // This is safe because we're in an async context and the operation is short-lived
-        let result = tokio::task::block_in_place(|| {
-            tool_ref.execute_json(params, &ctx)
-        });
+        
 
-        result
+        tokio::task::block_in_place(|| {
+            tool_ref.execute_json(params, &ctx)
+        })
     }
 }
 
@@ -192,7 +192,7 @@ impl IntegratedAsyncToolRegistry {
                 .map(|(idx, name, params)| {
                     let registry_cwd = self.cwd.clone();
                     // Clone the handler Arc for each task
-                    let handler_opt = self.get(&name).map(|h| std::sync::Arc::clone(h));
+                    let handler_opt = self.get(&name).map(std::sync::Arc::clone);
                     async move {
                         if let Some(handler) = handler_opt {
                             let invocation = ToolInvocation::new(name, params, registry_cwd);

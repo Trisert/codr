@@ -21,143 +21,129 @@ cargo run -- -d "your task here"
 cargo run -- --yolo
 ```
 
-**Note:** There are no tests in this project currently.
+**Note:** The project currently has no automated tests.
 
 ## Architecture Overview
 
-codr is a terminal-based AI agent (~400 lines of core implementation) that supports multiple LLM providers (OpenAI-compatible/llama.cpp, Anthropic Claude) and uses a tool-calling approach for codebase interaction.
+codr is a terminal-based AI agent that supports multiple LLM providers (OpenAI-compatible/llama.cpp, Anthropic Claude) and uses a tool-calling approach for codebase interaction.
 
 ### Core Components
 
 ```
 src/
-├── main.rs          # Entry point, CLI parsing, direct mode execution loop
+├── main.rs          # Entry point, CLI parsing, direct mode execution
 ├── model.rs         # Multi-provider LLM abstraction with streaming support
-├── parser.rs        # Parses codr_tool and codr_bash XML blocks from LM responses
+├── parser.rs        # Parses codr_tool/codr_bash XML blocks and JSON tool calls
 ├── config.rs        # TOML configuration loader with XDG directory support
 ├── error.rs         # Custom error types (Timeout, Terminating)
-├── tui.rs           # Terminal UI with background agent loop pattern
-├── tui_components.rs # Message rendering, markdown, themes
-├── commands.rs      # Slash command system (/copychat, etc.)
-├── fuzzy.rs         # Fuzzy filtering for file/command pickers
-├── logo.rs          # ASCII logo rendering
-├── prompt.rs        # System prompt builder
-├── context_manager.rs # Context pruning and token estimation
-├── agent/           # Shared agent loop implementation (NEW)
-│   ├── mod.rs       # Agent module exports
-│   ├── executor.rs  # ActionExecutor trait and implementations
-│   ├── loop_.rs     # Core agent loop logic with retry handling
-│   └── tui_executor.rs # TUI-specific executor (future integration)
+├── agent/           # Unified agent loop implementation
+│   ├── mod.rs       # Exports LoopConfig, LoopResult, ActionExecutor, etc.
+│   ├── executor.rs  # ActionExecutor trait with DirectExecutor and TUIExecutor
+│   ├── loop_.rs     # Core agent loop with unified streaming/non-streaming support
+│   ├── tui_executor.rs # TUI-specific executor with approval workflow
+│   └── updates.rs   # TuiUpdate types for agent→UI communication
+├── tui/             # Modular TUI implementation
+│   ├── mod.rs       # Main TUI entry point and agent loop integration
+│   ├── theme.rs     # Theme configuration (colors, styles)
+│   ├── markdown.rs  # Markdown renderer using pulldown-cmark
+│   ├── events.rs    # Event handling (keyboard, mouse)
+│   └── widgets/     # Modular widget architecture
+│       ├── mod.rs   # Widget exports
+│       ├── conversation.rs # Message display with markdown rendering
+│       ├── input.rs # User input widget
+│       ├── banner.rs # Status bar (model, role, tokens, cost)
+│       └── status.rs # Toast notifications and progress
 └── tools/
-    ├── mod.rs       # Tool trait, registry, context, output types
+    ├── mod.rs       # Tool trait, registry, categories, role filtering
     ├── impl.rs      # Tool implementations (read, bash, edit, write, grep, find)
     ├── schema.rs    # JSON schema types for tool parameters
     ├── context.rs   # Tool execution context (cwd, env, limits)
-    └── async_handler.rs # Codex-style async tool handler system (experimental)
+    └── async_wrapper.rs # Async tool wrappers (experimental)
 ```
 
-### Agent Loop Flow
+### Unified Agent Loop
 
-The agent follows this loop in both direct and TUI modes:
+The `src/agent/` module provides the core agent loop used by both direct and TUI modes:
 
-1. Send conversation history to LLM
-2. LLM proposes an action (tool call or bash command)
-3. Parse and execute the action
-4. Feed output back to LLM
-5. Repeat until a plain text response or exit command
-
-**Direct mode** (`run_direct()` in main.rs): Synchronous loop, prints to stdout
-**TUI mode** (`agent_loop()` in tui.rs): Asynchronous background task with channel-based UI updates
-
-### Shared Agent Module (NEW)
-
-The `src/agent/` module provides shared agent loop implementation:
-
-**`agent::run_agent_loop()`**: Core agent loop function
+**`agent::run_agent_loop()`**: Single function supporting both streaming and non-streaming modes via `LoopConfig`
 - Executes LLM queries and action execution
-- Handles retry logic with configurable max retries (3 by default)
+- Handles retry logic (3 max retries by default)
 - Supports different executor patterns (stdout, UI channels)
 - Returns `LoopResult` with final response and conversation
 
+**`agent::LoopConfig`**: Configuration for agent loop behavior
+- `streaming: bool` - Enable streaming mode
+- `on_streaming: Option<StreamingCallback>` - Callback for text chunks
+- `on_thinking: Option<ThinkingCallback>` - Callback for thinking chunks
+- `cancel_token: Option<CancellationToken>` - For cancellation
+
 **`agent::ActionExecutor` trait**: Abstraction for action execution
-- `execute_action()`: Execute a single action and return result
-- `get_conversation()`: Get current conversation state
-- `add_message()`: Add a message to the conversation
+- `execute_action()` - Execute a single action, return result
+- `needs_approval()` - Check if action requires user approval
+- `approve_action()` / `reject_action()` - Handle approval responses
 
-**`agent::DirectExecutor`**: Command-line executor (writes to stdout)
-- Simple, synchronous action execution
-- No approval checks (always auto-approves)
-- Used by direct mode
+**`agent::DirectExecutor`**: Command-line executor (direct mode)
+- Writes output to stdout
+- No approval workflow (always auto-approves)
 
-**`agent::TUIExecutor`**: TUI executor (sends updates via channel)
-- Channel-based UI communication
-- Support for approval workflows
-- Progress and status updates
-- Ready for future TUI mode integration (deferred)
-
-**`agent::run_agent_loop_streaming()`**: Streaming variant of shared loop
-- Real-time callbacks for LLM output
-- Maintains all retry and error handling logic
-- Used by TUI mode (future integration)
-
-**Benefits:**
-- Reduced code duplication (~300 lines saved)
-- Consistent behavior across both modes
-- Testable core logic
-- Easy to extend with new modes (web UI, etc.)
-
-**Current Status:**
-- Direct mode: ✅ Using shared `run_agent_loop()`
-- TUI mode: ⏸ Using existing `agent_loop()` (integration deferred)
-- Streaming support: ✅ Available via `run_agent_loop_streaming()`
-
-### Streaming Implementation (Important)
-
-The model uses **separate callbacks for thinking and text content** to support real-time progressive display:
-
-```rust
-pub async fn query_streaming<F, G>(
-    &self,
-    messages: &[Message],
-    on_text: F,      // Called for each text chunk
-    on_thinking: G,  // Called for each thinking chunk
-) -> Result<String>
-```
-
-**Key implementation details:**
-- **Thinking chunks** are accumulated and flushed to messages on newlines (creates natural sentence chunks)
-- **Text chunks** are accumulated in real-time and shown in the streaming buffer
-- **Cancellation** works by checking the cancel token in streaming callbacks and dropping the update channel
+**`agent::TUIExecutor`**: TUI executor (TUI mode)
+- Sends updates via `mpsc::unbounded_channel<TuiUpdate>`
+- Manages approval workflow internally
+- Returns `__APPROVAL_NEEDED__` error when approval required
 
 ### TUI Architecture
 
-The TUI uses a **background agent loop pattern**:
+The TUI uses a **modular widget architecture** with a **background agent loop**:
 
-1. **Main thread** runs the terminal UI event loop (ratatui)
-2. **Background task** (`agent_loop`) handles LLM queries and tool execution
-3. **Channel communication** (`mpsc::unbounded_channel`) sends updates from background to UI:
+**Layout:**
+```
+┌─────────────────────────────────────┐
+│ Banner (model, role, tokens, cost)  │  <- chunks[0]
+├─────────────────────────────────────┤
+│                                     │
+│   Conversation (messages)            │  <- chunks[1]
+│   - markdown rendering               │
+│   - scrolling support                │
+│                                     │
+├─────────────────────────────────────┤
+│ Input (prompt + role indicator)      │  <- chunks[2]
+└─────────────────────────────────────┘
+```
+
+**Background Agent Loop:**
+1. Main thread runs ratatui event loop
+2. Background task (`agent_loop` in `tui/mod.rs`) handles LLM queries and tool execution
+3. Channel communication sends updates via `TuiUpdate`:
    - `StreamingChunk` - Text content chunks
    - `StreamingThinkingChunk` - Thinking content chunks
    - `ActionMessage` - Tool/bash action to execute
    - `OutputMessage` - Tool execution output
+   - `NeedsApproval` - Approval request for SAFE mode
    - `ErrorMessage` - Error messages
-   - `UsageUpdate` - Token/cost updates (input_tokens, output_tokens, cost)
+   - `UsageUpdate` - Token/cost updates
    - `Done` - Stream complete
 
-**Token tracking:**
-- `session_input_tokens` - Tokens sent to LLM (prompt/input)
-- `session_output_tokens` - Tokens received from LLM (completion/output)
-- `session_cost` - Total cost in currency
-
-**Critical state variables:**
+**Key TUI state variables:**
 - `streaming_content` - Accumulated text content (flushed on Done)
 - `streaming_thinking` - Accumulated thinking (flushed on newlines)
-- `is_streaming_thinking` - Flag tracking current stream type
-- `update_rx` - Channel receiver (dropped on cancellation to stop processing)
+- `pending_action` - Current action awaiting approval
+- `agent_status` - Current agent state (Idle, Thinking, Running)
+
+### Markdown Rendering
+
+Assistant messages use `src/tui/markdown.rs`:
+- Based on pulldown-cmark parser
+- Renders to `ratatui::Text` with proper `Span` styling
+- Supports: headers, code blocks, lists, blockquotes, emphasis (bold/italic), horizontal rules
+- Word-aware wrapping via textwrap crate
+- Code blocks are NOT wrapped (preserves formatting)
+- Nested structures supported (lists in quotes, etc.)
+
+**Important:** The markdown renderer is designed for terminal display - it truncates overly long lines rather than overflowing the viewport.
 
 ### Tool System
 
-Tools implement the `Tool` trait and are registered in a `ToolRegistry`:
+Tools implement the `Tool` trait and are registered in `ToolRegistry`:
 
 ```rust
 trait Tool {
@@ -168,185 +154,114 @@ trait Tool {
 }
 ```
 
-**Tool output includes:**
-- `content` - Text result
-- `attachments` - Binary data (e.g., images)
-- `metadata` - File path, line count, truncation status
-
 **Available tools:** `read`, `bash`, `edit`, `write`, `grep`, `find`, `file_info`
 
-**Tool Categories:**
+**Tool Categories (for role filtering):**
 - `FileOps` - read, write, edit, file_info
 - `Search` - grep, find
 - `System` - bash
 
 ### Role System
 
-The agent has three operation modes (cycled with `Shift+Tab`):
-
+Three operation modes (cycled with `Shift+Tab`):
 - **YOLO** (Red) - Full access, all tools auto-approved
 - **SAFE** (Green, default) - All tools available, write/edit/bash require approval
-- **PLAN** (Blue) - Read-only mode: read, bash, grep, find, file_info only
+- **PLAN** (Blue) - Read-only: read, bash, grep, find, file_info only
 
-The current role is displayed in the footer: `codr <model> [ROLE]`
-
-**Async Tool System (Experimental):**
-`src/tools/async_handler.rs` contains a Codex-style async tool handler system with:
-- `AsyncToolHandler` trait for async tool execution
-- `ToolInvocation` struct with conversation history context
-- `AsyncToolRegistry` with parallel execution support for read-only tools
-- Currently not integrated but available for future enhancement
+**Role filtering:** `ToolRegistry::get_tools_for_role(role)` returns filtered tool list.
 
 ### Parser
 
-The parser (`parse_action()`) handles multiple action formats from different LLM providers:
-
+The parser (`parse_action()` in `src/parser.rs`) handles multiple formats:
+- **Native tool calling** - JSON format from OpenAI/Anthropic APIs
 - **XML Tool actions:** `<codr_tool name="read">{"file_path": "src/main.rs"}</codr_tool>`
 - **XML Bash actions:** `<codr_bash>ls -la</codr_bash>`
-- **Legacy tool-action:** Backtick format (still supported for backward compatibility)
-- **Plain responses:** Text without tool calls (indicates conversation end)
+- **Plain responses:** Text without tool calls (conversation end)
 
-The parser uses regex with `(?s)` dotall flag to capture multi-line blocks.
+Also provides `clean_message_content()` for removing XML tags from content for display.
 
 ### Model Abstraction
 
-`ModelType` enum supports multiple providers:
-- **OpenAI** - OpenAI-compatible API (defaults to local llama.cpp at localhost:8080)
+`ModelType` enum supports:
+- **OpenAI** - OpenAI-compatible API (defaults to localhost:8080 for llama.cpp)
 - **Anthropic** - Claude API with extended thinking support
 
-Each provider implements:
-- Non-streaming `query()` for simple requests
+Each implements:
+- Non-streaming `query()`
 - Streaming `query_streaming()` with separate text/thinking callbacks
 - Usage tracking (tokens, cost)
-
-The OpenAI provider supports:
-- Local llama.cpp servers (default)
-- Any OpenAI-compatible API
-- Optional API key for remote services
 
 ### Configuration
 
 Config loading priority:
 1. `./codr.toml` (current directory)
 2. `~/.config/codr/config.toml` (XDG config home)
-3. Default configuration (OpenAI on localhost:8080)
+3. Default (OpenAI on localhost:8080)
 
 **Example `codr.toml`:**
 ```toml
 model = "openai"  # or "anthropic"
 
 [openai]
-base_url = "http://localhost:8080"  # llama.cpp default
+base_url = "http://localhost:8080"
 model = "default"
-api_key = "..."  # optional, for remote APIs
+api_key = "..."  # optional
 
 [anthropic]
 api_key = "sk-ant-..."  # or set ANTHROPIC_API_KEY env var
 ```
 
-For local llama.cpp usage, start the server first:
-```bash
-llama-server --model /path/to/your/model.gguf
-```
-
-Then codr will connect to `http://localhost:8080` by default.
-
-### System Prompt
-
-The system prompt is dynamically generated to include tool descriptions and enforces:
-- Use tools only for coding tasks (read, edit, run commands)
-- Respond directly to greetings and casual questions
-- Stop after task completion (wait for next instruction)
-
 ## Important Implementation Notes
-
-### Streaming Display Logic
-
-When working with streaming content:
-- **Thinking** is flushed to messages on newlines (via `StreamingThinkingChunk` handler)
-- **Content** is accumulated and shown in real-time (via `StreamingChunk` handler)
-- **On Done**, remaining content is flushed to a final message
-- **On Disconnect**, same flushing happens (handles abrupt termination)
-
-### Cancellation
-
-Cancellation (`Ctrl+C`) works by:
-1. First press: Cancel current agent operation
-2. Second press (within 2 seconds): Quit application
-3. Implementation: `cancel_token.cancel()`, drops `update_rx` channel, clears streaming buffers
-
-### TUI Keybindings
-
-**Input Navigation:**
-- `Up/Down` - Navigate prompt history (or command/file picker when active)
-- `Left/Right` - Move cursor
-- `Enter` - Insert newline (or execute command when picker active)
-- `Backspace` - Delete character
-- `Tab` - Complete command/file name in picker
-- `Escape` - Close picker or clear selection
-- Typing exits history mode
-
-**Sending Messages:**
-- `Ctrl+S` - Send message (when not approving)
-- `[a]` - Approve bash command (when pending)
-- `[r]` - Reject bash command (when pending)
-
-**Pickers:**
-- `/` - Open command picker (type to filter, arrows to navigate, Tab to complete, Enter to execute)
-- `@` - Open file picker (type to filter, arrows to navigate, Tab to complete, Enter to select)
-
-**Other:**
-- `Shift+Tab` - Cycle roles (PLAN → SAFE → YOLO → PLAN)
-- `Ctrl+Q` - Quit application
-- `Ctrl+C` - Cancel agent (first press) / Quit (second press within 2s)
-- `Ctrl+O` - Copy selection or all messages to clipboard
-- `Ctrl+Y` / `Ctrl+Shift+V` - Paste from clipboard
-- `Ctrl+Home` - Scroll to top
-- `Ctrl+End` - Scroll to bottom
-- `Ctrl+Up/Down` - Scroll by 3 lines
-- `Page Up/Down` - Page scroll
-- `Mouse wheel` - Scroll
-- `Mouse click+drag` - Select text for copying
-
-### Message Rendering
-
-`render_message()` in `tui_components.rs` handles:
-- **Thinking content** - Displayed in italic, prefixed with "Thinking: "
-- **Markdown rendering** - Headers, code blocks with language labels, inline code, bold
-- **Role-based styling** - Different colors for user, assistant, action, output, error
 
 ### Adding New Tools
 
-To add a new tool:
-1. Implement the `Tool` trait in `src/tools/impl.rs`
-2. Implement the `category()` method returning a `ToolCategory` (FileOps/Search/System)
-3. Register it in `create_coding_tools()` in `src/tools/mod.rs`
-4. Update `Role::tool_available()` if the tool should be restricted in certain modes
+1. Implement `Tool` trait in `src/tools/impl.rs`
+2. Implement `category()` returning `ToolCategory` (FileOps/Search/System)
+3. Register in `create_coding_tools()` in `src/tools/mod.rs`
+4. Update `Role::tool_available()` if the tool should be restricted
 
 ### Edit Tool Modes
 
-The `edit` tool supports two editing modes:
+The `edit` tool supports two modes:
+1. **String replacement:** `{"file_path": "src/main.rs", "old_text": "old", "new_text": "new"}`
+2. **Line-based editing:** `{"file_path": "src/main.rs", "line_start": 10, "line_end": 20, "new_content": "new"}`
 
-1. **String replacement** (original):
-   ```json
-   {"file_path": "src/main.rs", "old_text": "old", "new_text": "new"}
-   ```
-
-2. **Line-based editing** (for replacing ranges):
-   ```json
-   {"file_path": "src/main.rs", "line_start": 10, "line_end": 20, "new_content": "new content"}
-   ```
-
-Both modes require reading the file first to verify contents.
-
-**Tool Validation:**
-Tools should validate their parameters to catch malformed LLM output:
-- Check for template syntax like `{pattern}`, `{file}`
-- Detect incomplete JSON or unmatched braces
-- Return clear error messages instead of executing unsafe commands
+Both require reading the file first to verify contents.
 
 ### Error Handling
 
-The agent uses two error types:
+Two error types:
 - `AgentError::Timeout` - Command timeout/retry (feeds error back to LLM)
-- `AgentError::Terminating` - Fatal error (ends the conversation)
+- `AgentError::Terminating` - Fatal error (ends conversation)
+
+### Tool Validation
+
+Tools should validate parameters to catch malformed LLM output:
+- Check for template syntax like `{pattern}`, `{file}`
+- Detect incomplete JSON or unmatched braces
+- Return clear error messages
+
+### TUI Keybindings
+
+**Input:**
+- `Up/Down` - Navigate history
+- `Left/Right` - Move cursor
+- `Enter` - Insert newline
+- `Ctrl+S` - Send message
+
+**Role & Approval:**
+- `Shift+Tab` - Cycle roles
+- `[a]` - Approve pending action
+- `[r]` - Reject pending action
+
+**Navigation:**
+- `Ctrl+Home/End` - Scroll to top/bottom
+- `Ctrl+Up/Down` - Scroll by 3 lines
+- `Page Up/Down` - Page scroll
+- `Mouse wheel` - Scroll
+
+**Other:**
+- `Ctrl+C` - Cancel (first press) / Quit (second press within 2s)
+- `Ctrl+Q` - Quit
+- `Ctrl+O` - Copy to clipboard
+- `Ctrl+Y` / `Ctrl+Shift+V` - Paste from clipboard
