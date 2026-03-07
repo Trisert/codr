@@ -54,9 +54,7 @@ impl ContextManager {
         let mut tokens_to_remove = self.current_tokens.saturating_sub(target);
 
         // Remove from front (oldest messages first)
-        while !self.messages.is_empty()
-            && self.messages.len() > keep_recent
-            && tokens_to_remove > 0
+        while !self.messages.is_empty() && self.messages.len() > keep_recent && tokens_to_remove > 0
         {
             if let Some(msg) = self.messages.front() {
                 let msg_tokens = estimate_tokens(&msg.content);
@@ -71,7 +69,11 @@ impl ContextManager {
 
         // Recalculate token count
         self.current_tokens = self.system_prompt_tokens
-            + self.messages.iter().map(|m| estimate_tokens(&m.content)).sum::<usize>();
+            + self
+                .messages
+                .iter()
+                .map(|m| estimate_tokens(&m.content))
+                .sum::<usize>();
     }
 
     /// Get message count
@@ -111,6 +113,7 @@ mod tests {
             role: "user".into(),
             content: Arc::new("Hello world".to_string()),
             images: vec![],
+            metadata: None,
         };
         manager.add_message(msg);
         assert_eq!(manager.message_count(), 1);
@@ -126,6 +129,7 @@ mod tests {
                 role: "user".into(),
                 content: Arc::new(format!("Message {}", i)),
                 images: vec![],
+                metadata: None,
             };
             manager.add_message(msg);
         }
@@ -142,8 +146,9 @@ mod tests {
         for _i in 0..50 {
             let msg = Message {
                 role: "user".into(),
-                content: Arc::new("A".repeat(100)),  // ~25 tokens each
+                content: Arc::new("A".repeat(100)), // ~25 tokens each
                 images: vec![],
+                metadata: None,
             };
             manager.add_message(msg);
         }
@@ -165,6 +170,7 @@ mod tests {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
             images: vec![],
+            metadata: None,
         };
         manager.add_message(msg);
         assert_eq!(manager.message_count(), 1);

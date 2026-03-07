@@ -3,8 +3,8 @@
 //! Displays temporary messages and progress indicators
 //! to the user.
 
-use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::Widget};
 use crate::tui::theme::Theme;
+use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::Widget};
 
 /// Message level for toasts
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,11 +104,7 @@ impl<'a> StatusWidget<'a> {
 
 impl<'a> Widget for StatusWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let active_toasts: Vec<_> = self
-            .toasts
-            .iter()
-            .filter(|t| !t.should_dismiss())
-            .collect();
+        let active_toasts: Vec<_> = self.toasts.iter().filter(|t| !t.should_dismiss()).collect();
 
         if active_toasts.is_empty() && self.progress.is_none() && !self.show_spinner {
             return;
@@ -129,8 +125,7 @@ impl<'a> Widget for StatusWidget<'a> {
                 break;
             }
 
-            let text_style = Style::default()
-                .fg(toast.color(self.theme));
+            let text_style = Style::default().fg(toast.color(self.theme));
 
             // Simple inline toast: icon + text
             let icon = match toast.level {
@@ -166,7 +161,9 @@ impl<'a> StatusWidget<'a> {
             (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() / 100) as usize % spinner.len()
+                .as_millis()
+                / 100) as usize
+                % spinner.len(),
         );
 
         if let Some(ch) = frame {

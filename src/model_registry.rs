@@ -266,11 +266,14 @@ impl ModelRegistry {
         let capabilities = model.default_capabilities();
         let name = model.canonical_name();
 
-        self.entries.insert(name.clone(), ModelEntry {
-            known_model: model,
-            capabilities,
-            available: true,
-        });
+        self.entries.insert(
+            name.clone(),
+            ModelEntry {
+                known_model: model,
+                capabilities,
+                available: true,
+            },
+        );
     }
 
     /// Look up a model by name
@@ -355,7 +358,10 @@ mod tests {
 
     #[test]
     fn test_known_model_canonical_name() {
-        assert_eq!(KnownModel::ClaudeSonnet4.canonical_name(), "claude-sonnet-4-20250514");
+        assert_eq!(
+            KnownModel::ClaudeSonnet4.canonical_name(),
+            "claude-sonnet-4-20250514"
+        );
         assert_eq!(KnownModel::GPT4.canonical_name(), "gpt-4");
         assert_eq!(KnownModel::DeepSeekR1.canonical_name(), "deepseek-r1");
     }
@@ -382,7 +388,10 @@ mod tests {
 
         // First call should register the model
         let entry1 = registry.lookup_or_register(unknown_model);
-        assert_eq!(entry1.known_model, KnownModel::Custom(unknown_model.to_string()));
+        assert_eq!(
+            entry1.known_model,
+            KnownModel::Custom(unknown_model.to_string())
+        );
 
         // Clone the capabilities before the second call
         let name1 = entry1.capabilities.model_name.clone();

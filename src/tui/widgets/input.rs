@@ -3,6 +3,7 @@
 //! Handles user input, history navigation,
 //! and file/command picker overlays.
 
+use crate::tui::theme::Theme;
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -11,7 +12,6 @@ use ratatui::{
     widgets::Widget,
 };
 use unicode_width::UnicodeWidthStr;
-use crate::tui::theme::Theme;
 
 /// Input widget for entering commands
 pub struct InputWidget {
@@ -153,7 +153,8 @@ impl InputWidget {
         }
 
         let max_index = self.history.len().saturating_sub(1);
-        let new_index = self.history_index
+        let new_index = self
+            .history_index
             .map(|i| i.saturating_add(1))
             .unwrap_or(0)
             .min(max_index);

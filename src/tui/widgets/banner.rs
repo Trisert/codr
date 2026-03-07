@@ -3,6 +3,7 @@
 //! Displays logo, model info, and status at the top of screen.
 //! Codex-style with enhanced status information.
 
+use crate::tui::theme::Theme;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -10,7 +11,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
-use crate::tui::theme::Theme;
 
 /// Banner widget showing logo and status
 pub struct BannerWidget<'a> {
@@ -91,8 +91,12 @@ impl<'a> Widget for BannerWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Codex-style separator at bottom
         let separator = "─".repeat(area.width as usize);
-        buf.set_string(area.x, area.bottom() - 1, &separator,
-            Style::default().fg(self.theme.border));
+        buf.set_string(
+            area.x,
+            area.bottom() - 1,
+            &separator,
+            Style::default().fg(self.theme.border),
+        );
 
         // Banner content - Codex style: two lines
         // Line 1: Model name + role + status indicator
@@ -100,7 +104,12 @@ impl<'a> Widget for BannerWidget<'a> {
 
         // Model name in primary color (OpenAI green)
         let mut spans = vec![
-            Span::styled("codr", Style::default().fg(self.theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "codr",
+                Style::default()
+                    .fg(self.theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" ", Style::default()),
         ];
 
@@ -120,7 +129,10 @@ impl<'a> Widget for BannerWidget<'a> {
         // Connection status
         let conn_indicator = if self.connected { "●" } else { "○" };
         spans.push(Span::styled(" ", Style::default()));
-        spans.push(Span::styled(conn_indicator, Style::default().fg(self.theme.dimmed)));
+        spans.push(Span::styled(
+            conn_indicator,
+            Style::default().fg(self.theme.dimmed),
+        ));
 
         // Right side: role in brackets
         let role_style = match self.role {
@@ -148,7 +160,10 @@ impl<'a> Widget for BannerWidget<'a> {
         let mut line2_spans = Vec::new();
 
         // Working indicator when agent is active
-        if matches!(self.agent_status, AgentStatus::Running | AgentStatus::Streaming) {
+        if matches!(
+            self.agent_status,
+            AgentStatus::Running | AgentStatus::Streaming
+        ) {
             // Animated working message like Claude Code
             let working_messages = [
                 "discombambulating...",
@@ -159,12 +174,16 @@ impl<'a> Widget for BannerWidget<'a> {
             let frame = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs() / 3) as usize % working_messages.len();
+                .as_secs()
+                / 3) as usize
+                % working_messages.len();
             let working_text = working_messages[frame];
 
             line2_spans.push(Span::styled(
                 working_text,
-                Style::default().fg(self.theme.secondary).add_modifier(Modifier::ITALIC)
+                Style::default()
+                    .fg(self.theme.secondary)
+                    .add_modifier(Modifier::ITALIC),
             ));
             line2_spans.push(Span::styled("  ", Style::default()));
         }
@@ -185,7 +204,7 @@ impl<'a> Widget for BannerWidget<'a> {
         if self.tokens > 0 {
             line2_spans.push(Span::styled(
                 format!("{} tokens", self.tokens),
-                self.theme.dim_style()
+                self.theme.dim_style(),
             ));
             line2_spans.push(Span::styled("  ", Style::default()));
         }
@@ -194,7 +213,7 @@ impl<'a> Widget for BannerWidget<'a> {
         if self.cost > 0.0 {
             line2_spans.push(Span::styled(
                 format!("${:.4}", self.cost),
-                self.theme.dim_style()
+                self.theme.dim_style(),
             ));
         }
 

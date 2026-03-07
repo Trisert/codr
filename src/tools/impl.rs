@@ -2,7 +2,7 @@ use super::context::{
     build_walker, find_project_root, is_binary_file, is_image_file, truncate_file,
 };
 use super::params::*;
-use super::{TypedTool, Tool, ToolContext, ToolError, ToolOutput};
+use super::{Tool, ToolContext, ToolError, ToolOutput, TypedTool};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -48,7 +48,11 @@ impl Tool for ReadTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -90,7 +94,8 @@ impl TypedTool for ReadTool {
                 file_path: Some(file_path),
                 byte_count: Some(data_len),
                 ..Default::default()
-            }));
+            })
+            .with_tool_category(super::ToolCategory::FileOps));
         }
 
         // Check if it's a binary file
@@ -98,14 +103,13 @@ impl TypedTool for ReadTool {
             return Ok(ToolOutput::text(format!(
                 "[Binary file: {} - cannot display contents]",
                 file_path
-            )));
+            ))
+            .with_tool_category(super::ToolCategory::FileOps));
         }
 
         // Handle offset/limit with line_start/line_end support
         // line_start/line_end are 1-indexed (user-friendly), convert to 0-indexed
-        let final_offset = line_start
-            .map(|n| n.saturating_sub(1))
-            .or(offset);
+        let final_offset = line_start.map(|n| n.saturating_sub(1)).or(offset);
 
         let final_limit = if let (Some(start), Some(end)) = (line_start, line_end) {
             Some(end.saturating_sub(start) + 1)
@@ -149,7 +153,7 @@ impl TypedTool for ReadTool {
                 "truncated": result.truncated,
                 "display_summary": display_summary
             }))
-        )
+            .with_tool_category(super::ToolCategory::FileOps))
     }
 }
 
@@ -194,7 +198,11 @@ impl Tool for BashTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -203,7 +211,12 @@ impl TypedTool for BashTool {
     type Params = BashParams;
 
     fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let BashParams { command, cwd } = params;
+        let BashParams {
+            command,
+            cwd,
+            timeout,
+            env,
+        } = params;
 
         // Validate command - reject obviously malformed commands
         let trimmed = command.trim();
@@ -217,7 +230,8 @@ impl TypedTool for BashTool {
             return Ok(ToolOutput::text(format!(
                 "Invalid command: contains template placeholders. The command looks like:\n{}",
                 trimmed
-            )));
+            ))
+            .with_tool_category(super::ToolCategory::System));
         }
 
         // Check for incomplete brace expansion
@@ -225,23 +239,79 @@ impl TypedTool for BashTool {
             return Ok(ToolOutput::text(format!(
                 "Invalid command: contains unmatched braces. The command looks like:\n{}",
                 trimmed
-            )));
+            ))
+            .with_tool_category(super::ToolCategory::System));
         }
 
         let cwd = cwd
             .map(|p| ctx.resolve_path(&p))
             .unwrap_or_else(|| find_project_root(&ctx.cwd));
 
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&cwd)
-            .env("PAGER", "cat")
-            .env("MANPAGER", "cat")
-            .env("LESS", "-R")
-            .env("PIP_PROGRESS_BAR", "off")
-            .env("TQDM_DISABLE", "1")
-            .output()?;
+        let output = if let Some(timeout_secs) = timeout {
+            let mut cmd = Command::new("timeout");
+            cmd.arg(timeout_secs.to_string())
+                .arg("bash")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&cwd)
+                .env("PAGER", "cat")
+                .env("MANPAGER", "cat")
+                .env("LESS", "-R")
+                .env("PIP_PROGRESS_BAR", "off")
+                .env("TQDM_DISABLE", "1");
+
+            if let Some(ref env_vars) = env {
+                for env_pair in env_vars {
+                    if let Some((key, value)) = env_pair.split_once('=') {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+
+            match cmd.output() {
+                Ok(out) => out,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let mut cmd = Command::new("bash");
+                    cmd.arg("-c")
+                        .arg(&command)
+                        .current_dir(&cwd)
+                        .env("PAGER", "cat")
+                        .env("MANPAGER", "cat")
+                        .env("LESS", "-R")
+                        .env("PIP_PROGRESS_BAR", "off")
+                        .env("TQDM_DISABLE", "1");
+                    if let Some(ref env_vars) = env {
+                        for env_pair in env_vars {
+                            if let Some((key, value)) = env_pair.split_once('=') {
+                                cmd.env(key, value);
+                            }
+                        }
+                    }
+                    cmd.output()?
+                }
+                Err(e) => return Err(ToolError::ExecutionFailed(format!("Timeout error: {}", e))),
+            }
+        } else {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c")
+                .arg(&command)
+                .current_dir(&cwd)
+                .env("PAGER", "cat")
+                .env("MANPAGER", "cat")
+                .env("LESS", "-R")
+                .env("PIP_PROGRESS_BAR", "off")
+                .env("TQDM_DISABLE", "1");
+
+            if let Some(ref env_vars) = env {
+                for env_pair in env_vars {
+                    if let Some((key, value)) = env_pair.split_once('=') {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+
+            cmd.output()?
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -250,22 +320,30 @@ impl TypedTool for BashTool {
         let byte_count = combined.len();
         let exit_code = output.status.code();
 
-        Ok(ToolOutput::text(combined)
-            .with_metadata(super::OutputMetadata {
-                file_path: None,
-                line_count: Some(line_count),
-                byte_count: Some(byte_count),
-                truncated: false,
-                display_summary: None,
-            })
-            .with_details(serde_json::json!({
-                "command": command,
-                "exit_code": exit_code,
-                "line_count": line_count,
-                "byte_count": byte_count,
-                "cwd": cwd.to_string_lossy().to_string()
-            }))
-        )
+        let timed_out = !output.status.success() && exit_code.is_none();
+
+        Ok(ToolOutput::text(if timed_out {
+            format!("Command timed out after {} seconds", timeout.unwrap_or(0))
+        } else {
+            combined
+        })
+        .with_metadata(super::OutputMetadata {
+            file_path: None,
+            line_count: Some(line_count),
+            byte_count: Some(byte_count),
+            truncated: false,
+            display_summary: None,
+        })
+        .with_details(serde_json::json!({
+            "command": command,
+            "exit_code": exit_code,
+            "timeout": timeout,
+            "timed_out": timed_out,
+            "line_count": line_count,
+            "byte_count": byte_count,
+            "cwd": cwd.to_string_lossy().to_string()
+        }))
+        .with_tool_category(super::ToolCategory::System))
     }
 }
 
@@ -311,7 +389,11 @@ impl Tool for EditTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -349,15 +431,19 @@ impl TypedTool for EditTool {
             if start >= lines.len() || end >= lines.len() {
                 return Ok(ToolOutput::text(format!(
                     "Edit failed: line range {}-{} out of bounds (file has {} lines).",
-                    start, end, lines.len()
-                )));
+                    start,
+                    end,
+                    lines.len()
+                ))
+                .with_tool_category(super::ToolCategory::FileOps));
             }
 
             if start > end {
                 return Ok(ToolOutput::text(format!(
                     "Edit failed: line_start ({}) must be <= line_end ({})",
                     start, end
-                )));
+                ))
+                .with_tool_category(super::ToolCategory::FileOps));
             }
 
             // Build new content with line range replaced
@@ -381,12 +467,16 @@ impl TypedTool for EditTool {
                 "line_start": start,
                 "line_end": end,
                 "lines_replaced": line_count
-            })));
+            }))
+            .with_tool_category(super::ToolCategory::FileOps));
         }
 
         // String replacement mode (original)
         let old_text = old_text.ok_or_else(|| {
-            ToolError::InvalidParameters("Edit requires either old_text/new_text or line_start/line_end/new_content".to_string())
+            ToolError::InvalidParameters(
+                "Edit requires either old_text/new_text or line_start/line_end/new_content"
+                    .to_string(),
+            )
         })?;
         let new_text = new_text.ok_or_else(|| {
             ToolError::InvalidParameters("old_text requires new_text".to_string())
@@ -398,24 +488,25 @@ impl TypedTool for EditTool {
                 The specified text does not exist in the file. \
                 Use the read tool to check the current file contents."
                     .to_string(),
-            ));
+            )
+            .with_tool_category(super::ToolCategory::FileOps));
         }
 
         let new_content = content.replace(&old_text, &new_text);
         fs::write(&path, new_content)?;
 
         let summary = format!("Edited {}", file_path);
-        Ok(ToolOutput::text(format!(
-            "Successfully edited {}",
-            file_path
-        ))
-        .with_summary_display(summary)
-        .with_details(serde_json::json!({
-            "file_path": file_path,
-            "mode": "string_replacement",
-            "old_text_length": old_text.len(),
-            "new_text_length": new_text.len()
-        })))
+        Ok(
+            ToolOutput::text(format!("Successfully edited {}", file_path))
+                .with_summary_display(summary)
+                .with_details(serde_json::json!({
+                    "file_path": file_path,
+                    "mode": "string_replacement",
+                    "old_text_length": old_text.len(),
+                    "new_text_length": new_text.len()
+                }))
+                .with_tool_category(super::ToolCategory::FileOps),
+        )
     }
 }
 
@@ -460,7 +551,11 @@ impl Tool for FileInfoTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -469,7 +564,11 @@ impl TypedTool for FileInfoTool {
     type Params = FileInfoParams;
 
     fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let FileInfoParams { file_path } = params;
+        let FileInfoParams {
+            file_path,
+            hash,
+            permissions_octal,
+        } = params;
         let path = ctx.resolve_path(&file_path);
 
         if !path.exists() {
@@ -479,24 +578,43 @@ impl TypedTool for FileInfoTool {
         let metadata = std::fs::metadata(&path)?;
         let size = metadata.len();
         let _modified = metadata.modified().ok();
-        let _perms = metadata.permissions();
+        let perms = metadata.permissions();
         let is_dir = path.is_dir();
         let is_symlink = path.is_symlink();
 
         // Format output as structured text
         let mut output = format!("File: {}\n", file_path);
-        output.push_str(&format!("Type: {}\n",
-            if is_dir { "Directory" }
-            else if is_symlink { "Symlink" }
-            else { "Regular File" }
+        output.push_str(&format!(
+            "Type: {}\n",
+            if is_dir {
+                "Directory"
+            } else if is_symlink {
+                "Symlink"
+            } else {
+                "Regular File"
+            }
         ));
         output.push_str(&format!("Size: {} bytes\n", size));
-        output.push_str(&format!("Size (human): {}\n",
-            if size < 1024 { format!("{} B", size) }
-            else if size < 1024 * 1024 { format!("{:.1} KB", size as f64 / 1024.0) }
-            else if size < 1024 * 1024 * 1024 { format!("{:.1} MB", size as f64 / (1024.0 * 1024.0)) }
-            else { format!("{:.1} GB", size as f64 / (1024.0 * 1024.0 * 1024.0)) }
+        output.push_str(&format!(
+            "Size (human): {}\n",
+            if size < 1024 {
+                format!("{} B", size)
+            } else if size < 1024 * 1024 {
+                format!("{:.1} KB", size as f64 / 1024.0)
+            } else if size < 1024 * 1024 * 1024 {
+                format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
+            } else {
+                format!("{:.1} GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+            }
         ));
+
+        // Include permissions in octal format if requested
+        if permissions_octal.unwrap_or(false) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = perms.mode();
+            let octal = format!("{}{}{}", mode & 0o700 >> 6, mode & 0o070 >> 3, mode & 0o007);
+            output.push_str(&format!("Permissions: {} (rwx)\n", octal));
+        }
 
         // Format modification time in a simple format
         if let Ok(modified) = path.metadata().and_then(|m| m.modified()) {
@@ -511,14 +629,45 @@ impl TypedTool for FileInfoTool {
                 let day = (day_of_year % 30) + 1;
                 let hours = ((secs % 86400) / 3600) as u32;
                 let minutes = ((secs % 3600) / 60) as u32;
-                output.push_str(&format!("Modified: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n",
-                    year, month, day, hours, minutes, secs % 60));
+                output.push_str(&format!(
+                    "Modified: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC\n",
+                    year,
+                    month,
+                    day,
+                    hours,
+                    minutes,
+                    secs % 60
+                ));
             }
         }
 
         // Get file extension
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("none");
         output.push_str(&format!("Extension: {}\n", extension));
+
+        // Compute hash if requested
+        let computed_hash = if hash.unwrap_or(false) && !is_dir && !is_symlink {
+            use md5::{Digest, Md5};
+            use std::io::Read;
+            let file = std::fs::File::open(&path)?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut hasher = Md5::new();
+            let mut buffer = [0u8; 8192];
+
+            loop {
+                let bytes_read = reader.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes_read]);
+            }
+
+            let hash_result = format!("{:x}", hasher.finalize());
+            output.push_str(&format!("MD5: {}\n", hash_result));
+            Some(hash_result)
+        } else {
+            None
+        };
 
         // MIME type hint
         let mime_hint = match extension {
@@ -537,7 +686,7 @@ impl TypedTool for FileInfoTool {
             "jpg" | "jpeg" => "image/jpeg",
             "gif" => "image/gif",
             "svg" => "image/svg+xml",
-            _ => "application/octet-stream"
+            _ => "application/octet-stream",
         };
         output.push_str(&format!("MIME type: {}\n", mime_hint));
 
@@ -550,9 +699,11 @@ impl TypedTool for FileInfoTool {
                 "is_dir": is_dir,
                 "is_symlink": is_symlink,
                 "extension": extension,
-                "mime_type": mime_hint
+                "mime_type": mime_hint,
+                "hash": computed_hash,
+                "permissions_octal": permissions_octal.unwrap_or(false)
             }))
-        )
+            .with_tool_category(super::ToolCategory::FileOps))
     }
 }
 
@@ -598,7 +749,11 @@ impl Tool for WriteTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -607,7 +762,12 @@ impl TypedTool for WriteTool {
     type Params = WriteParams;
 
     fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let WriteParams { file_path, content } = params;
+        let WriteParams {
+            file_path,
+            content,
+            append,
+        } = params;
+        let append_mode = append.unwrap_or(false);
         let content_len = content.len();
 
         // Validate file_path - prevent writing to root or system directories
@@ -622,9 +782,10 @@ impl TypedTool for WriteTool {
         let system_dirs = ["/boot", "/etc", "/sys", "/proc", "/dev", "/root", "/var"];
         for sys_dir in &system_dirs {
             if file_path.starts_with(sys_dir) || file_path.contains(&format!("{}/", sys_dir)) {
-                return Err(ToolError::ExecutionFailed(
-                    format!("Refusing to write to system directory: {}", file_path)
-                ));
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Refusing to write to system directory: {}",
+                    file_path
+                )));
             }
         }
 
@@ -637,18 +798,33 @@ impl TypedTool for WriteTool {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(&path, &content)?;
+        if append_mode && path.exists() {
+            let existing = fs::read_to_string(&path)?;
+            let combined = format!("{}{}", existing, content);
+            fs::write(&path, &combined)?;
+        } else {
+            fs::write(&path, &content)?;
+        }
 
-        let summary = format!("Wrote {} ({} bytes)", file_path, content_len);
+        let summary = format!(
+            "Wrote {} ({} bytes){}",
+            file_path,
+            content_len,
+            if append_mode { " (appended)" } else { "" }
+        );
         Ok(ToolOutput::text(format!(
-            "Successfully wrote {} ({} bytes)",
-            file_path, content_len
+            "Successfully wrote {}{} ({} bytes)",
+            file_path,
+            if append_mode { " (appended)" } else { "" },
+            content_len
         ))
         .with_summary_display(summary)
         .with_details(serde_json::json!({
             "file_path": file_path,
-            "bytes_written": content_len
-        })))
+            "bytes_written": content_len,
+            "append": append_mode
+        }))
+        .with_tool_category(super::ToolCategory::FileOps))
     }
 }
 
@@ -693,7 +869,11 @@ impl Tool for GrepTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -706,6 +886,10 @@ impl TypedTool for GrepTool {
             pattern,
             path,
             case_insensitive,
+            include,
+            exclude,
+            context,
+            count,
         } = params;
 
         // Validate pattern - reject template syntax
@@ -718,6 +902,8 @@ impl TypedTool for GrepTool {
 
         let search_path = path.unwrap_or_else(|| ".".to_string());
         let case_insensitive = case_insensitive.unwrap_or(false);
+        let context_lines = context.unwrap_or(0);
+        let only_count = count.unwrap_or(false);
 
         let regex = if case_insensitive {
             regex::RegexBuilder::new(&pattern)
@@ -727,46 +913,122 @@ impl TypedTool for GrepTool {
             regex::Regex::new(&pattern)?
         };
 
-        let mut matches = Vec::new();
+        // Build include/exclude patterns
+        let include_pattern = include
+            .as_ref()
+            .map(|p| glob::Pattern::new(p))
+            .transpose()?;
+        let exclude_pattern = exclude
+            .as_ref()
+            .map(|p| glob::Pattern::new(p))
+            .transpose()?;
+
+        let mut matches: Vec<String> = Vec::new();
+        let mut total_matches: usize = 0;
 
         for entry in build_walker(&ctx.cwd, &search_path) {
             let entry = entry?;
             let entry_path = entry.path();
 
-            if entry_path.is_file() && !is_binary_file(entry_path) {
+            // Skip directories
+            if !entry_path.is_file() {
+                continue;
+            }
+
+            // Check include/exclude patterns
+            let file_name = entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if let Some(ref inc) = include_pattern
+                && !inc.matches(file_name)
+            {
+                continue;
+            }
+            if let Some(ref exc) = exclude_pattern
+                && exc.matches(file_name)
+            {
+                continue;
+            }
+
+            if !is_binary_file(entry_path) {
                 let content = fs::read_to_string(entry_path)?;
-                let file_name = entry_path
+                let rel_path = entry_path
                     .strip_prefix(&ctx.cwd)
                     .unwrap_or(entry_path)
                     .to_string_lossy();
 
-                for (line_num, line) in content.lines().enumerate() {
+                let lines: Vec<&str> = content.lines().collect();
+
+                for (line_num, line) in lines.iter().enumerate() {
                     if regex.is_match(line) {
-                        matches.push(format!("{}:{}:{}", file_name, line_num + 1, line));
+                        total_matches += 1;
+
+                        if only_count {
+                            continue;
+                        }
+
+                        // Build context around match
+                        if context_lines > 0 {
+                            let start = line_num.saturating_sub(context_lines);
+                            let end = (line_num + context_lines + 1).min(lines.len());
+
+                            // Add separator if this isn't the first match
+                            if !matches.is_empty()
+                                && !matches
+                                    .last()
+                                    .map(|m| m.starts_with("==="))
+                                    .unwrap_or(false)
+                            {
+                                matches.push(format!("==={} ===", rel_path));
+                            }
+
+                            for (i, ctx_line) in lines[start..end].iter().enumerate() {
+                                let marker = if i + start == line_num { ">" } else { " " };
+                                matches.push(format!("{}{}:{}", marker, start + i + 1, ctx_line));
+                            }
+                        } else {
+                            matches.push(format!("{}:{}:{}", rel_path, line_num + 1, line));
+                        }
                     }
                 }
             }
         }
 
-        let match_count = matches.len();
-        Ok(ToolOutput::text(if matches.is_empty() {
+        let match_count = if only_count {
+            total_matches
+        } else {
+            matches.len()
+        };
+
+        let output_text = if only_count {
+            format!("{}", total_matches)
+        } else if matches.is_empty() {
             "No matches found".to_string()
         } else {
             matches.join("\n")
-        })
-        .with_metadata(super::OutputMetadata {
-            display_summary: Some(format!(
-                "Search found {} matches for '{}'",
-                match_count, pattern
-            )),
-            ..Default::default()
-        })
-        .with_details(serde_json::json!({
-            "pattern": pattern,
-            "path": search_path,
-            "case_insensitive": case_insensitive,
-            "match_count": match_count
-        })))
+        };
+
+        Ok(ToolOutput::text(output_text)
+            .with_metadata(super::OutputMetadata {
+                display_summary: Some(format!(
+                    "Search found {} matches for '{}'",
+                    match_count, pattern
+                )),
+                ..Default::default()
+            })
+            .with_details(serde_json::json!({
+                "pattern": pattern,
+                "path": search_path,
+                "case_insensitive": case_insensitive,
+                "include": include,
+                "exclude": exclude,
+                "context": context_lines,
+                "count": only_count,
+                "match_count": match_count
+            }))
+            .with_tool_category(super::ToolCategory::Search))
     }
 }
 
@@ -811,7 +1073,11 @@ impl Tool for FindTool {
         <Self as TypedTool>::parameters_schema(self)
     }
 
-    fn execute_json(&self, params: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    fn execute_json(
+        &self,
+        params: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         <Self as TypedTool>::execute_json(self, params, ctx)
     }
 }
@@ -820,7 +1086,12 @@ impl TypedTool for FindTool {
     type Params = FindParams;
 
     fn execute(&self, params: Self::Params, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let FindParams { pattern, path } = params;
+        let FindParams {
+            pattern,
+            path,
+            depth,
+            exclude,
+        } = params;
 
         // Validate pattern - reject template syntax or obviously malformed patterns
         if pattern.contains('{') || pattern.contains('}') || pattern.contains("$(") {
@@ -840,11 +1111,24 @@ impl TypedTool for FindTool {
 
         let search_path = path.unwrap_or_else(|| ".".to_string());
         let search_path_resolved = ctx.resolve_path(&search_path);
+        let max_depth = depth.unwrap_or(usize::MAX);
 
         // Try fd first (preferred), then find with gitignore, then glob fallback
-        let result = try_fd(&search_path_resolved, &pattern)
-            .or_else(|| try_find(&search_path_resolved, &pattern))
-            .or_else(|| try_glob(&search_path_resolved, &pattern, ctx));
+        let result = try_fd(
+            &search_path_resolved,
+            &pattern,
+            max_depth,
+            exclude.as_deref(),
+        )
+        .or_else(|| {
+            try_find(
+                &search_path_resolved,
+                &pattern,
+                max_depth,
+                exclude.as_deref(),
+            )
+        })
+        .or_else(|| try_glob(&search_path_resolved, &pattern, ctx));
 
         match result {
             Some(matches) if !matches.is_empty() => {
@@ -862,10 +1146,12 @@ impl TypedTool for FindTool {
                     .with_details(serde_json::json!({
                         "pattern": pattern,
                         "path": search_path,
+                        "depth": depth,
+                        "exclude": exclude,
                         "found_count": found_count,
                         "files": sorted
                     }))
-                )
+                    .with_tool_category(super::ToolCategory::Search))
             }
             _ => {
                 let summary = format!("glob '{}' (0 found)", pattern);
@@ -878,15 +1164,22 @@ impl TypedTool for FindTool {
                     .with_details(serde_json::json!({
                         "pattern": pattern,
                         "path": search_path,
+                        "depth": depth,
+                        "exclude": exclude,
                         "found_count": 0
                     }))
-                )
+                    .with_tool_category(super::ToolCategory::Search))
             }
         }
     }
 }
 
-fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
+fn try_fd(
+    search_path: &Path,
+    pattern: &str,
+    max_depth: usize,
+    exclude: Option<&str>,
+) -> Option<Vec<String>> {
     // Convert glob pattern to fd-compatible pattern
     // **/* -> empty (match all)
     // *.rs -> --glob *.rs
@@ -897,20 +1190,30 @@ fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
     } else {
         (false, pattern)
     };
-    
+
     let mut cmd = Command::new("fd");
     cmd.arg("--type").arg("f");
-    
+
     if use_glob {
         cmd.arg("--glob");
     }
-    
+
+    if max_depth != usize::MAX {
+        cmd.arg("-d").arg(max_depth.to_string());
+    }
+
+    if let Some(exc) = exclude {
+        for exc_pattern in exc.split(',') {
+            cmd.arg("-E").arg(exc_pattern.trim());
+        }
+    }
+
     if !fd_pattern.is_empty() {
         cmd.arg("--").arg(fd_pattern);
     }
-    
+
     cmd.current_dir(search_path);
-    
+
     let output = cmd.output().ok()?;
 
     if output.status.success() {
@@ -927,24 +1230,41 @@ fn try_fd(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
     None
 }
 
-fn try_find(search_path: &Path, pattern: &str) -> Option<Vec<String>> {
+fn try_find(
+    search_path: &Path,
+    pattern: &str,
+    max_depth: usize,
+    exclude: Option<&str>,
+) -> Option<Vec<String>> {
     // Convert glob pattern to find-compatible pattern
     let find_pattern = pattern.replace("**/", "").replace("**", "*");
 
-    let output = Command::new("find")
-        .args([
-            ".",
-            "-type",
-            "f",
-            "!",
-            "-path",
-            "*/.*",
-            "-name",
-            &find_pattern,
-        ])
-        .current_dir(search_path)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("find");
+    cmd.arg(".")
+        .arg("-type")
+        .arg("f")
+        .arg("!")
+        .arg("-path")
+        .arg("*/.*");
+
+    if max_depth != usize::MAX {
+        cmd.arg("-maxdepth").arg(max_depth.to_string());
+    }
+
+    if let Some(exc) = exclude {
+        for exc_pattern in exc.split(',') {
+            cmd.arg("!")
+                .arg("-path")
+                .arg(format!("*/{}/*", exc_pattern.trim()));
+            cmd.arg("!").arg("-name").arg(exc_pattern.trim());
+        }
+    }
+
+    cmd.arg("-name").arg(&find_pattern);
+
+    cmd.current_dir(search_path);
+
+    let output = cmd.output().ok()?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1017,7 +1337,7 @@ mod tests {
     #[test]
     fn test_read_tool_new() {
         let tool = ReadTool::new();
-        
+
         assert_eq!(tool.name(), "read");
         assert_eq!(tool.label(), "Read File");
         assert!(!tool.description().is_empty());
@@ -1026,9 +1346,14 @@ mod tests {
     #[test]
     fn test_read_tool_schema() {
         let tool = ReadTool::new();
-        let schema = tool.parameters();
-        
-        assert!(schema.properties.iter().any(|p| p.name == "file_path"));
+        let schema = Tool::parameters_schema(&tool);
+
+        assert!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("file_path")
+        );
     }
 
     #[test]
@@ -1036,15 +1361,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Hello, World!").unwrap();
-        
+
         let tool = ReadTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({ "file_path": "test.txt" }),
-            &ctx,
-        );
-        
+
+        let result =
+            Tool::execute_json(&tool, serde_json::json!({ "file_path": "test.txt" }), &ctx);
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("Hello, World!"));
@@ -1053,15 +1376,16 @@ mod tests {
     #[test]
     fn test_read_tool_execute_missing_file() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = ReadTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "file_path": "nonexistent.txt" }),
             &ctx,
         );
-        
+
         assert!(result.is_err());
     }
 
@@ -1070,15 +1394,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Line 1\nLine 2\nLine 3").unwrap();
-        
+
         let tool = ReadTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "file_path": "test.txt", "offset": 1 }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("Line 2"));
@@ -1089,15 +1414,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Line 1\nLine 2\nLine 3").unwrap();
-        
+
         let tool = ReadTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "file_path": "test.txt", "limit": 1 }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("Line 1"));
@@ -1110,7 +1436,7 @@ mod tests {
     #[test]
     fn test_bash_tool_new() {
         let tool = BashTool::new();
-        
+
         assert_eq!(tool.name(), "bash");
         assert_eq!(tool.label(), "Execute Bash");
     }
@@ -1118,15 +1444,13 @@ mod tests {
     #[test]
     fn test_bash_tool_execute_simple() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = BashTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({ "command": "echo hello" }),
-            &ctx,
-        );
-        
+
+        let result =
+            Tool::execute_json(&tool, serde_json::json!({ "command": "echo hello" }), &ctx);
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("hello"));
@@ -1135,30 +1459,24 @@ mod tests {
     #[test]
     fn test_bash_tool_execute_invalid_command() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = BashTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({ "command": "false" }),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({ "command": "false" }), &ctx);
+
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_bash_tool_missing_command_param() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = BashTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({}),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({}), &ctx);
+
         assert!(result.is_err());
     }
 
@@ -1169,7 +1487,7 @@ mod tests {
     #[test]
     fn test_write_tool_new() {
         let tool = WriteTool::new();
-        
+
         assert_eq!(tool.name(), "write");
         assert_eq!(tool.label(), "Write File");
     }
@@ -1177,24 +1495,25 @@ mod tests {
     #[test]
     fn test_write_tool_execute() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = WriteTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({
                 "file_path": "newfile.txt",
                 "content": "Hello, World!"
             }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
-        
+
         // Verify file was created
         let file_path = temp_dir.path().join("newfile.txt");
         assert!(file_path.exists());
-        
+
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "Hello, World!");
     }
@@ -1202,15 +1521,12 @@ mod tests {
     #[test]
     fn test_write_tool_execute_missing_path() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = WriteTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({ "content": "Hello" }),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({ "content": "Hello" }), &ctx);
+
         assert!(result.is_err());
     }
 
@@ -1221,7 +1537,7 @@ mod tests {
     #[test]
     fn test_grep_tool_new() {
         let tool = GrepTool::new();
-        
+
         assert_eq!(tool.name(), "grep");
         assert_eq!(tool.label(), "Search Contents");
     }
@@ -1231,15 +1547,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Hello World\nTest Line").unwrap();
-        
+
         let tool = GrepTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "pattern": "Hello", "file_path": "test.txt" }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("Hello"));
@@ -1250,15 +1567,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Hello World").unwrap();
-        
+
         let tool = GrepTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "pattern": "nonexistent", "file_path": "test.txt" }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("No matches found") || output.content.is_empty());
@@ -1267,15 +1585,12 @@ mod tests {
     #[test]
     fn test_grep_tool_missing_params() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = GrepTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({}),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({}), &ctx);
+
         assert!(result.is_err());
     }
 
@@ -1286,7 +1601,7 @@ mod tests {
     #[test]
     fn test_find_tool_new() {
         let tool = FindTool::new();
-        
+
         assert_eq!(tool.name(), "find");
         assert_eq!(tool.label(), "Find Files");
     }
@@ -1296,15 +1611,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         std::fs::write(temp_dir.path().join("test1.txt"), "content").unwrap();
         std::fs::write(temp_dir.path().join("test2.txt"), "content").unwrap();
-        
+
         let tool = FindTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({ "pattern": "*.txt" }),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({ "pattern": "*.txt" }), &ctx);
+
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.content.contains("test1.txt"));
@@ -1314,15 +1626,16 @@ mod tests {
     #[test]
     fn test_find_tool_no_matches() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = FindTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({ "pattern": "*.nonexistent" }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
     }
 
@@ -1333,7 +1646,7 @@ mod tests {
     #[test]
     fn test_edit_tool_new() {
         let tool = EditTool::new();
-        
+
         assert_eq!(tool.name(), "edit");
         assert_eq!(tool.label(), "Edit File");
     }
@@ -1343,11 +1656,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "Hello World").unwrap();
-        
+
         let tool = EditTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
+
+        let result = Tool::execute_json(
+            &tool,
             serde_json::json!({
                 "file_path": "test.txt",
                 "old_text": "World",
@@ -1355,9 +1669,9 @@ mod tests {
             }),
             &ctx,
         );
-        
+
         assert!(result.is_ok());
-        
+
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(content.contains("Rust"));
     }
@@ -1365,15 +1679,12 @@ mod tests {
     #[test]
     fn test_edit_tool_missing_params() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let tool = EditTool::new();
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
-        
-        let result = tool.execute(
-            serde_json::json!({}),
-            &ctx,
-        );
-        
+
+        let result = Tool::execute_json(&tool, serde_json::json!({}), &ctx);
+
         assert!(result.is_err());
     }
 

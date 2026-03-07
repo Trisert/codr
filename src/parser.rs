@@ -75,10 +75,10 @@ pub fn clean_message_content(content: &str, trim_whitespace: bool) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Response(Arc<String>),  // Shared response content
+    Response(Arc<String>), // Shared response content
     Bash {
         command: Arc<str>,
-        workdir: Option<Arc<str>>,  // Shared workdir
+        workdir: Option<Arc<str>>, // Shared workdir
         timeout_ms: Option<u64>,
         env: Option<Value>,
     },
@@ -91,7 +91,9 @@ pub enum Action {
 impl Action {
     pub fn is_read_only(&self) -> bool {
         match self {
-            Action::Tool { name, .. } => matches!(name.as_ref(), "read" | "grep" | "find" | "file_info"),
+            Action::Tool { name, .. } => {
+                matches!(name.as_ref(), "read" | "grep" | "find" | "file_info")
+            }
             Action::Bash { .. } => false,
             Action::Response(_) => false,
         }
@@ -113,22 +115,33 @@ fn parse_xml_tool_call(content: &str) -> Option<Action> {
     };
 
     if let Some(start) = content.find("<codr_tool")
-        && let Some(name_start) = content[start..].find("name=\"") {
-            let name_start = start + name_start + 6;
-            if let Some(name_end) = content[name_start..].find('"') {
-                let name = &content[name_start..name_start + name_end];
-                if let Some(body_start) = content.find('>') {
-                    let body_start = body_start + 1;
-                    if let Some(body_end) = content[body_start..].find("</codr_tool>") {
-                        let params_json = &content[body_start..body_start + body_end];
-                        match serde_json::from_str::<Value>(params_json) {
-                            Ok(params) => return Some(Action::Tool { name: name.into(), params }),
-                            Err(_) => return Some(Action::Tool { name: name.into(), params: serde_json::json!({ "input": params_json }) }),
+        && let Some(name_start) = content[start..].find("name=\"")
+    {
+        let name_start = start + name_start + 6;
+        if let Some(name_end) = content[name_start..].find('"') {
+            let name = &content[name_start..name_start + name_end];
+            if let Some(body_start) = content.find('>') {
+                let body_start = body_start + 1;
+                if let Some(body_end) = content[body_start..].find("</codr_tool>") {
+                    let params_json = &content[body_start..body_start + body_end];
+                    match serde_json::from_str::<Value>(params_json) {
+                        Ok(params) => {
+                            return Some(Action::Tool {
+                                name: name.into(),
+                                params,
+                            });
+                        }
+                        Err(_) => {
+                            return Some(Action::Tool {
+                                name: name.into(),
+                                params: serde_json::json!({ "input": params_json }),
+                            });
                         }
                     }
                 }
             }
         }
+    }
     None
 }
 
@@ -152,22 +165,27 @@ fn parse_json_tool_call(content: &str) -> Option<Action> {
 fn extract_from_json_value(value: &Value) -> Option<Action> {
     // Qwen format: {"input": "..."} - extract XML from input field
     if let Some(input_str) = value.get("input").and_then(|v| v.as_str())
-        && let Some(extracted) = extract_xml_tool_from_string(input_str) {
-            // Return the extracted tool call
-            return Some(Action::Tool {
-                name: extracted.get("name")?.as_str()?.into(),
-                params: extracted.get("arguments")?.clone(),
-            });
-        }
+        && let Some(extracted) = extract_xml_tool_from_string(input_str)
+    {
+        // Return the extracted tool call
+        return Some(Action::Tool {
+            name: extracted.get("name")?.as_str()?.into(),
+            params: extracted.get("arguments")?.clone(),
+        });
+    }
 
     // Standard format: {"name": "tool", "arguments": {...}}
     let name = value.get("name")?.as_str()?.into();
-    let arguments = value.get("arguments")
+    let arguments = value
+        .get("arguments")
         .or_else(|| value.get("parameters"))
         .cloned()
         .unwrap_or_default();
 
-    Some(Action::Tool { name, params: arguments })
+    Some(Action::Tool {
+        name,
+        params: arguments,
+    })
 }
 
 /// Extract XML tool call from a string (for models that embed tool calls in text)
@@ -200,7 +218,9 @@ fn extract_xml_tool_from_string(content: &str) -> Option<Value> {
                         match serde_json::from_str::<Value>(body) {
                             Ok(params) => {
                                 // Successfully parsed JSON
-                                return Some(serde_json::json!({ "name": name, "arguments": params }));
+                                return Some(
+                                    serde_json::json!({ "name": name, "arguments": params }),
+                                );
                             }
                             Err(_e) => {
                                 // JSON parse failed - might be malformed or escaped
@@ -209,10 +229,14 @@ fn extract_xml_tool_from_string(content: &str) -> Option<Value> {
                                 if body_clean.starts_with('{') && body_clean.ends_with('}') {
                                     // It looks like JSON but has escape issues
                                     // Try to use it as-is
-                                    return Some(serde_json::json!({ "name": name, "arguments": body_clean }));
+                                    return Some(
+                                        serde_json::json!({ "name": name, "arguments": body_clean }),
+                                    );
                                 }
                                 // Last resort: use as input field
-                                return Some(serde_json::json!({ "name": name, "arguments": serde_json::json!({ "input": body_clean }) }));
+                                return Some(
+                                    serde_json::json!({ "name": name, "arguments": serde_json::json!({ "input": body_clean }) }),
+                                );
                             }
                         }
                     }
@@ -242,30 +266,35 @@ fn parse_json_bash(content: &str) -> Option<Action> {
 
     // Try JSON format first
     if let Ok(value) = serde_json::from_str::<Value>(trimmed)
-        && let Some(command) = value.get("command").and_then(|v| v.as_str()) {
-            return Some(Action::Bash {
-                command: command.into(),
-                workdir: value.get("cwd")
-                    .or_else(|| value.get("workdir"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.into()),
-                timeout_ms: value.get("timeout_ms")
-                    .or_else(|| value.get("timeout"))
-                    .and_then(|v| v.as_u64()),
-                env: value.get("env").cloned(),
-            });
-        }
+        && let Some(command) = value.get("command").and_then(|v| v.as_str())
+    {
+        return Some(Action::Bash {
+            command: command.into(),
+            workdir: value
+                .get("cwd")
+                .or_else(|| value.get("workdir"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.into()),
+            timeout_ms: value
+                .get("timeout_ms")
+                .or_else(|| value.get("timeout"))
+                .and_then(|v| v.as_u64()),
+            env: value.get("env").cloned(),
+        });
+    }
 
     // If it's just a string (simple command)
-    if trimmed.starts_with('"') && trimmed.ends_with('"')
-        && let Ok(s) = serde_json::from_str::<String>(trimmed) {
-            return Some(Action::Bash {
-                command: s.into(),
-                workdir: None,
-                timeout_ms: None,
-                env: None,
-            });
-        }
+    if trimmed.starts_with('"')
+        && trimmed.ends_with('"')
+        && let Ok(s) = serde_json::from_str::<String>(trimmed)
+    {
+        return Some(Action::Bash {
+            command: s.into(),
+            workdir: None,
+            timeout_ms: None,
+            env: None,
+        });
+    }
 
     None
 }
@@ -273,7 +302,8 @@ fn parse_json_bash(content: &str) -> Option<Action> {
 /// Parse bash action from <codr_bash> XML format (legacy support)
 fn parse_xml_bash(content: &str) -> Option<Action> {
     if let Some(start) = content.find("<codr_bash>")
-        && let Some(end) = content.find("</codr_bash>") {
+        && let Some(end) = content.find("</codr_bash>")
+    {
         let command = &content[start + 11..end];
         return Some(Action::Bash {
             command: command.trim().into(),
@@ -434,7 +464,8 @@ pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
                     if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                         actions.push(Action::Tool {
                             name: name.into(),
-                            params: item.get("arguments")
+                            params: item
+                                .get("arguments")
                                 .or_else(|| item.get("parameters"))
                                 .or_else(|| item.get("input"))
                                 .cloned()
@@ -451,7 +482,8 @@ pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
             if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
                 actions.push(Action::Tool {
                     name: name.into(),
-                    params: value.get("arguments")
+                    params: value
+                        .get("arguments")
                         .or_else(|| value.get("parameters"))
                         .or_else(|| value.get("input"))
                         .cloned()
@@ -486,28 +518,33 @@ pub fn parse_actions(content: &str) -> Result<Vec<Action>, AgentError> {
 
     // Try parsing the whole thing as JSON (for pure JSON without thinking)
     if let Ok(value) = serde_json::from_str::<Value>(remaining)
-        && let Some(arr) = value.as_array() {
-            for item in arr {
-                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                    actions.push(Action::Tool {
-                        name: name.into(),
-                        params: item.get("arguments")
-                            .or_else(|| item.get("parameters"))
-                            .or_else(|| item.get("input"))
-                            .cloned()
-                            .unwrap_or_default(),
-                    });
-                }
-            }
-            if !actions.is_empty() {
-                return Ok(actions);
+        && let Some(arr) = value.as_array()
+    {
+        for item in arr {
+            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                actions.push(Action::Tool {
+                    name: name.into(),
+                    params: item
+                        .get("arguments")
+                        .or_else(|| item.get("parameters"))
+                        .or_else(|| item.get("input"))
+                        .cloned()
+                        .unwrap_or_default(),
+                });
             }
         }
+        if !actions.is_empty() {
+            return Ok(actions);
+        }
+    }
 
     // Single action
     match parse_action(remaining) {
         Some(action) => Ok(vec![action]),
-        None => Err(AgentError::Terminating(format!("Failed to parse action: {}", remaining))),
+        None => Err(AgentError::Terminating(format!(
+            "Failed to parse action: {}",
+            remaining
+        ))),
     }
 }
 

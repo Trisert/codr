@@ -1,3 +1,80 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (keep this in repo for dependency pinning)
+# Cargo.lock
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+
+# Environment files (keep .env.example as template)
 .env
+.env.local
+.env.*.local
+
+# Configuration files (keep codr.toml.example as template)
 codr.toml
+
+# Debug and profiling
+*.prof
+*.pprof
+*.flamegraph
+*.svg
+
+# Testing
+*.log
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts (additional)
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Documentation build artifacts
+/docs/book/
+/book/
+
+# Rust-specific
+Cargo.lock.bk
+

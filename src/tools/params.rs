@@ -51,6 +51,14 @@ pub struct BashParams {
     /// Working directory for the command (defaults to project root)
     #[serde(default)]
     pub cwd: Option<String>,
+
+    /// Timeout in seconds for the command (prevents hanging)
+    #[serde(default)]
+    pub timeout: Option<u64>,
+
+    /// Additional environment variables (key=value pairs)
+    #[serde(default)]
+    pub env: Option<Vec<String>>,
 }
 
 // ============================================================
@@ -100,6 +108,10 @@ pub struct WriteParams {
 
     /// Content to write to the file
     pub content: String,
+
+    /// If true, append to file instead of overwriting
+    #[serde(default)]
+    pub append: Option<bool>,
 }
 
 // ============================================================
@@ -119,6 +131,22 @@ pub struct GrepParams {
     /// Perform case-insensitive search
     #[serde(default)]
     pub case_insensitive: Option<bool>,
+
+    /// File patterns to include (e.g., "*.rs", "*.{js,ts}")
+    #[serde(default)]
+    pub include: Option<String>,
+
+    /// File patterns to exclude (e.g., "node_modules", "*.min.js")
+    #[serde(default)]
+    pub exclude: Option<String>,
+
+    /// Number of lines to show before and after each match
+    #[serde(default)]
+    pub context: Option<usize>,
+
+    /// If true, only return the count of matches instead of lines
+    #[serde(default)]
+    pub count: Option<bool>,
 }
 
 // ============================================================
@@ -134,6 +162,14 @@ pub struct FindParams {
     /// Path to search (defaults to current directory)
     #[serde(default)]
     pub path: Option<String>,
+
+    /// Maximum directory depth to search
+    #[serde(default)]
+    pub depth: Option<usize>,
+
+    /// File patterns to exclude (e.g., "node_modules", "target")
+    #[serde(default)]
+    pub exclude: Option<String>,
 }
 
 // ============================================================
@@ -145,6 +181,14 @@ pub struct FindParams {
 pub struct FileInfoParams {
     /// Path to the file to get metadata for
     pub file_path: String,
+
+    /// Compute and return MD5 hash of file contents
+    #[serde(default)]
+    pub hash: Option<bool>,
+
+    /// Include permissions in octal format (e.g., "755")
+    #[serde(default)]
+    pub permissions_octal: Option<bool>,
 }
 
 // ============================================================
@@ -190,6 +234,8 @@ mod tests {
         let params = BashParams {
             command: "ls -la".to_string(),
             cwd: Some("/tmp".to_string()),
+            timeout: Some(30),
+            env: Some(vec!["FOO=bar".to_string()]),
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -197,6 +243,8 @@ mod tests {
 
         assert_eq!(deserialized.command, "ls -la");
         assert_eq!(deserialized.cwd, Some("/tmp".to_string()));
+        assert_eq!(deserialized.timeout, Some(30));
+        assert_eq!(deserialized.env, Some(vec!["FOO=bar".to_string()]));
     }
 
     #[test]
@@ -249,8 +297,6 @@ mod tests {
     #[test]
     fn test_json_schema_generation() {
         // Test that JsonSchema derive works
-        use schemars::r#gen::SchemaGenerator;
-
         let schema = schemars::schema_for!(ReadParams);
         assert!(schema.schema.object.is_some());
 

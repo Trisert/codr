@@ -32,6 +32,26 @@ clipboard = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+md-5 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Coverage tooling
+# Install with: cargo install cargo-tarpaulin
+# Run coverage with: cargo tarpaulin --out Xml --fail-under 50
+
+# Test configuration
+[profile.dev]
+opt-level = 0  # Use opt-level 0 for faster compilation during development
+
+[profile.test]
+opt-level = 0  # Use opt-level 0 for faster test compilation
+# Tests run in parallel by default (threads = num_cpus)
+# To run tests serially, use: cargo test -- --test-threads=1
+
+# Environment variables for test performance tracking
+[env]
+CARGO_TERM_COLOR = "always"  # Enable colored output for better readability
+# Test execution time is displayed by Rust's test harness
+# To see detailed timing: cargo test -- --nocapture -- --test-threads=1

@@ -28,9 +28,9 @@ impl ModelCapabilities {
         let (provider_type, supports_thinking, supports_tools, max_tokens) = match model_type {
             ModelType::Anthropic => (
                 "anthropic".to_string(),
-                true,  // Anthropic Claude supports extended thinking
-                true,  // Anthropic Claude supports native tools
-                Some(200_000),  // Claude 3.5 Sonnet has 200k context
+                true,          // Anthropic Claude supports extended thinking
+                true,          // Anthropic Claude supports native tools
+                Some(200_000), // Claude 3.5 Sonnet has 200k context
             ),
             ModelType::OpenAI { model, .. } => {
                 // For OpenAI-compatible, we make educated guesses based on model name
@@ -46,10 +46,15 @@ impl ModelCapabilities {
                 } else if model_lower.contains("8k") {
                     Some(8_192)
                 } else {
-                    Some(128_000)  // Default to 128k for modern models
+                    Some(128_000) // Default to 128k for modern models
                 };
 
-                ("openai".to_string(), supports_thinking, supports_tools, max_tokens)
+                (
+                    "openai".to_string(),
+                    supports_thinking,
+                    supports_tools,
+                    max_tokens,
+                )
             }
         };
 
@@ -94,9 +99,9 @@ impl ModelCapabilities {
     pub fn estimate_max_tokens(model_name: &str) -> usize {
         let name_lower = model_name.to_lowercase();
         if name_lower.contains("claude") {
-            200_000  // Claude 3.5 Sonnet
+            200_000 // Claude 3.5 Sonnet
         } else if name_lower.contains("gpt-4") {
-            128_000  // GPT-4 Turbo
+            128_000 // GPT-4 Turbo
         } else if name_lower.contains("32k") {
             32_000
         } else if name_lower.contains("16k") {
@@ -104,7 +109,7 @@ impl ModelCapabilities {
         } else if name_lower.contains("8k") {
             8_192
         } else {
-            128_000  // Default for modern models
+            128_000 // Default for modern models
         }
     }
 }
@@ -120,9 +125,7 @@ impl Model {
     pub fn supports_thinking(&self) -> bool {
         match self.model_type() {
             ModelType::Anthropic => true,
-            ModelType::OpenAI { model, .. } => {
-                ModelCapabilities::estimate_thinking_support(model)
-            }
+            ModelType::OpenAI { model, .. } => ModelCapabilities::estimate_thinking_support(model),
         }
     }
 
@@ -130,9 +133,7 @@ impl Model {
     pub fn max_context_tokens(&self) -> usize {
         match self.model_type() {
             ModelType::Anthropic => 200_000,
-            ModelType::OpenAI { model, .. } => {
-                ModelCapabilities::estimate_max_tokens(model)
-            }
+            ModelType::OpenAI { model, .. } => ModelCapabilities::estimate_max_tokens(model),
         }
     }
 }

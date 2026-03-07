@@ -186,6 +186,7 @@ mod tests {
                 model,
                 api_key,
                 extra: _,
+                native_tools_override: _,
             } => {
                 // derived Default gives empty strings
                 assert_eq!(base_url, "");

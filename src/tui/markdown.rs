@@ -157,7 +157,7 @@ where
             Event::Html(html) => self.html(html),
             Event::FootnoteReference(_) => {}
             Event::TaskListMarker(_) => {}
-            Event::InlineMath(_) => {} // Skip math rendering
+            Event::InlineMath(_) => {}  // Skip math rendering
             Event::DisplayMath(_) => {} // Skip math rendering
         }
     }
@@ -179,7 +179,7 @@ where
             Tag::Emphasis => self.push_inline_style(self.styles.emphasis),
             Tag::Strong => self.push_inline_style(self.styles.strong),
             Tag::Strikethrough => self.push_inline_style(self.styles.strikethrough),
-            Tag::Link { .. } => {} // Skip link rendering for simplicity
+            Tag::Link { .. } => {}  // Skip link rendering for simplicity
             Tag::Image { .. } => {} // Skip image rendering
             _ => {}
         }
@@ -456,7 +456,9 @@ where
             let span_style = style.patch(span.style);
 
             // Check if we need to wrap
-            if current_width + span_width > self.wrap_width && current_width > self.current_indent_width() {
+            if current_width + span_width > self.wrap_width
+                && current_width > self.current_indent_width()
+            {
                 // Start new line
                 result.push(std::mem::take(&mut current_line));
                 current_width = 0;
@@ -475,7 +477,9 @@ where
 
                 if remaining > 0 {
                     let first_part: String = content_str.chars().take(remaining).collect();
-                    current_line.spans.push(Span::styled(first_part, span_style));
+                    current_line
+                        .spans
+                        .push(Span::styled(first_part, span_style));
                 }
 
                 // Start new line and continue
@@ -497,7 +501,9 @@ where
                     current_width += remaining_content.width();
                 }
             } else {
-                current_line.spans.push(Span::styled(content.to_string(), span_style));
+                current_line
+                    .spans
+                    .push(Span::styled(content.to_string(), span_style));
                 current_width += span_width;
             }
         }
@@ -564,7 +570,9 @@ where
 
         for (i, ctx) in self.indent_stack.iter().enumerate() {
             if pending_marker_line {
-                if Some(i) == last_marker_index && let Some(marker) = &ctx.marker {
+                if Some(i) == last_marker_index
+                    && let Some(marker) = &ctx.marker
+                {
                     prefix.extend(marker.iter().cloned());
                     continue;
                 }

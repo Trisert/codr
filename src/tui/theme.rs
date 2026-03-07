@@ -206,10 +206,16 @@ impl Theme {
     /// Get style for message type
     pub fn style_for_message_type(&self, role: &str) -> Style {
         match role {
-            "user" => Style::default().fg(self.user_message).add_modifier(Modifier::BOLD),
+            "user" => Style::default()
+                .fg(self.user_message)
+                .add_modifier(Modifier::BOLD),
             "assistant" => Style::default().fg(self.assistant_message),
-            "system" => Style::default().fg(self.system_message).add_modifier(Modifier::DIM),
-            "thinking" => Style::default().fg(self.thinking_message).add_modifier(Modifier::ITALIC),
+            "system" => Style::default()
+                .fg(self.system_message)
+                .add_modifier(Modifier::DIM),
+            "thinking" => Style::default()
+                .fg(self.thinking_message)
+                .add_modifier(Modifier::ITALIC),
             _ => Style::default().fg(self.dimmed),
         }
     }
@@ -244,12 +250,17 @@ impl Theme {
 
     /// Get cursor style
     pub fn cursor_style(&self) -> Style {
-        Style::default().fg(self.background).bg(self.primary).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.background)
+            .bg(self.primary)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Get banner/title style
     pub fn banner_style(&self) -> Style {
-        Style::default().fg(self.primary).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.primary)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Get dimmed text style
@@ -264,12 +275,16 @@ impl Theme {
 
     /// Get output message style
     pub fn output_style(&self) -> Style {
-        Style::default().fg(self.output_message).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(self.output_message)
+            .add_modifier(Modifier::DIM)
     }
 
     /// Get thinking style
     pub fn thinking_style(&self) -> Style {
-        Style::default().fg(self.thinking_message).add_modifier(Modifier::ITALIC)
+        Style::default()
+            .fg(self.thinking_message)
+            .add_modifier(Modifier::ITALIC)
     }
 
     /// Get code block border style
@@ -279,11 +294,17 @@ impl Theme {
 
     /// Get selection style
     pub fn selection_style(&self) -> Style {
-        Style::default().bg(self.secondary).fg(self.background).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(self.secondary)
+            .fg(self.background)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Get highlight style
     pub fn highlight_style(&self) -> Style {
-        Style::default().bg(self.tertiary).fg(self.background).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(self.tertiary)
+            .fg(self.background)
+            .add_modifier(Modifier::BOLD)
     }
 }

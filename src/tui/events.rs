@@ -70,6 +70,9 @@ pub enum EventResult {
 
     /// User scrolled to bottom
     ScrollToBottom,
+
+    /// Toggle output collapse (o key)
+    ToggleOutputCollapse,
 }
 
 /// Convert crossterm key event to event result
@@ -87,17 +90,29 @@ pub fn handle_key_event(event: KeyEvent) -> EventResult {
         KeyCode::Esc => EventResult::Cancel,
 
         // Ctrl+S - Submit (alternative to Enter)
-        KeyCode::Char('s') if event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('s')
+            if event
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             EventResult::NoOp // Handled by input widget
         }
 
         // Ctrl+C - Interrupt agent (first press) or exit (second press within 2s)
-        KeyCode::Char('c') if event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('c')
+            if event
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             EventResult::InterruptAgent
         }
 
         // Ctrl+D - Exit
-        KeyCode::Char('d') if event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('d')
+            if event
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             EventResult::Exit
         }
 
@@ -105,12 +120,20 @@ pub fn handle_key_event(event: KeyEvent) -> EventResult {
         KeyCode::Tab | KeyCode::BackTab => EventResult::SwitchRole,
 
         // Ctrl+L - Clear screen
-        KeyCode::Char('l') if event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('l')
+            if event
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             EventResult::NoOp // Handled by main loop
         }
 
         // Ctrl+U - Clear input
-        KeyCode::Char('u') if event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('u')
+            if event
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             EventResult::Cancel // Clear input
         }
 
@@ -131,6 +154,9 @@ pub fn handle_key_event(event: KeyEvent) -> EventResult {
 
         // Delete - Delete character after cursor
         KeyCode::Delete => EventResult::Delete,
+
+        // o - Toggle output collapse
+        KeyCode::Char('o') => EventResult::ToggleOutputCollapse,
 
         // Regular characters - Input (handled by input widget)
         KeyCode::Char(c) => EventResult::Input(c),
@@ -175,9 +201,9 @@ pub fn should_exit(event: &KeyEvent) -> bool {
 
     match event.code {
         // Only Ctrl+D directly exits now (Ctrl+C is handled via InterruptAgent)
-        KeyCode::Char('d') => {
-            event.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
-        }
+        KeyCode::Char('d') => event
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL),
         _ => false,
     }
 }

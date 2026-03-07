@@ -19,9 +19,60 @@ cargo run -- -d "your task here"
 
 # Run with YOLO mode (auto-approve bash commands)
 cargo run -- --yolo
+
+# Run tests
+cargo test
+
+# Run tests with output
+cargo test -- --nocapture
+
+# Run specific test module
+cargo test --lib config::tests
+
+# Run tests and show test output
+cargo test -- --nocapture --test-threads=1
 ```
 
-**Note:** The project currently has no automated tests.
+## Linting and Code Quality
+
+```bash
+# Run Clippy linter (configured with sensible defaults)
+cargo clippy
+
+# Run Clippy with all lints enabled
+cargo clippy -- -W clippy::all -W clippy::pedantic
+
+# Automatically apply Clippy suggestions (use with caution)
+cargo clippy --fix --allow-dirty
+
+# Format code with rustfmt
+cargo fmt
+
+# Check if code is formatted (fails if not)
+cargo fmt -- --check
+
+# Install pre-commit hooks (run once per clone)
+./scripts/install-hooks.sh
+```
+
+The project uses **pre-commit hooks** that automatically run before each commit:
+- Checks code formatting with rustfmt (auto-formats if needed)
+- Runs Clippy linter to catch code quality issues
+- Prevents commits with formatting or linting issues
+
+The project uses **Clippy** (Rust linter) with configuration in `clippy.toml`:
+- Complexity thresholds: max 7 function arguments, complexity 250, cognitive complexity 20
+- Allows common test patterns (expect, unwrap, dbg, print in tests)
+- Enforces code quality through additional lint categories (all, pedantic)
+
+The project uses **rustfmt** (Rust formatter) with configuration in `rustfmt.toml`:
+- Max line width: 100 characters
+- 4 spaces for indentation (no hard tabs)
+- Unix line endings (LF)
+- Field init shorthand and try shorthand enabled
+- Reordered imports and modules for better organization
+
+**Note**: To skip pre-commit hooks temporarily, use `git commit --no-verify`.
 
 ## Architecture Overview
 

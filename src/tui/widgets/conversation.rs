@@ -4,19 +4,26 @@
 //! code blocks, and thinking sections.
 //! Codex-style with cleaner layout and proper spacing.
 
+use crate::model::Message;
+use crate::tui::markdown::render_markdown;
+use crate::tui::theme::Theme;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
+use std::collections::HashSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use crate::tui::markdown::render_markdown;
-use crate::tui::theme::Theme;
-use crate::model::Message;
 
 /// Padding for conversation widget
 const PADDING: u16 = 2;
+
+/// Number of lines to show when output is collapsed
+const COLLAPSED_LINES: usize = 4;
+
+/// Number of lines to show when output is expanded
+const EXPANDED_LINES: usize = 15;
 
 /// Conversation widget displaying message history
 pub struct ConversationWidget<'a> {
@@ -28,6 +35,8 @@ pub struct ConversationWidget<'a> {
     scroll_offset: usize,
     /// Pending action (for approve/reject workflow)
     pending_action: Option<PendingAction>,
+    /// Collapsed output indices
+    collapsed_outputs: HashSet<usize>,
 }
 
 /// Pending action for approve/reject workflow
@@ -47,6 +56,7 @@ impl<'a> ConversationWidget<'a> {
             theme,
             scroll_offset: 0,
             pending_action: None,
+            collapsed_outputs: HashSet::new(),
         }
     }
 
@@ -60,6 +70,26 @@ impl<'a> ConversationWidget<'a> {
     pub fn pending_action(mut self, action: Option<PendingAction>) -> Self {
         self.pending_action = action;
         self
+    }
+
+    /// Set collapsed outputs state
+    pub fn collapsed_outputs(mut self, indices: HashSet<usize>) -> Self {
+        self.collapsed_outputs = indices;
+        self
+    }
+
+    /// Check if an output is collapsed
+    pub fn is_collapsed(&self, index: usize) -> bool {
+        self.collapsed_outputs.contains(&index)
+    }
+
+    /// Toggle collapse state for an output
+    pub fn toggle_collapse(&mut self, index: usize) {
+        if self.collapsed_outputs.contains(&index) {
+            self.collapsed_outputs.remove(&index);
+        } else {
+            self.collapsed_outputs.insert(index);
+        }
     }
 
     /// Scroll up by n lines (hide newest messages)
@@ -176,22 +206,37 @@ impl<'a> Widget for ConversationWidget<'a> {
         if self.scroll_offset > 0 {
             let scroll_text = "↑ more";
             let scroll_style = Style::default().fg(self.theme.dimmed);
-            buf.set_string(area.right() - scroll_text.len() as u16, area.y, scroll_text, scroll_style);
+            buf.set_string(
+                area.right() - scroll_text.len() as u16,
+                area.y,
+                scroll_text,
+                scroll_style,
+            );
         }
     }
 }
 
 impl<'a> ConversationWidget<'a> {
     /// Render a single message
-    fn render_message(&self, message: &Message, x: u16, mut y: u16, area: Rect, buf: &mut Buffer, add_bottom: bool) -> u16 {
+    fn render_message(
+        &self,
+        message: &Message,
+        x: u16,
+        mut y: u16,
+        area: Rect,
+        buf: &mut Buffer,
+        add_bottom: bool,
+    ) -> u16 {
         let max_width = (area.width - 4) as usize; // pad * 2
-        let max_width_u16 = area.width - 4; // For calculations that need u16
+        let _max_width_u16 = area.width - 4; // For calculations that need u16
 
         match &*message.role {
             "user" => {
                 // User message: ❯ prefix, no extra spacing
                 let prefix = "❯ ";
-                let prefix_style = Style::default().fg(self.theme.primary).add_modifier(Modifier::BOLD);
+                let prefix_style = Style::default()
+                    .fg(self.theme.primary)
+                    .add_modifier(Modifier::BOLD);
                 let content_style = Style::default().fg(self.theme.foreground);
 
                 buf.set_string(x, y, prefix, prefix_style);
@@ -202,7 +247,8 @@ impl<'a> ConversationWidget<'a> {
                         break;
                     }
 
-                    let (wrapped_text, _line_count) = self.wrap_text(line, content_x, area, max_width);
+                    let (wrapped_text, _line_count) =
+                        self.wrap_text(line, content_x, area, max_width);
                     for wrapped_line in wrapped_text.lines() {
                         if y >= area.bottom() - 2 {
                             break;
@@ -250,7 +296,9 @@ impl<'a> ConversationWidget<'a> {
                 // Action message: with ↳ indicator
                 let prefix = "↳ ";
                 let prefix_style = Style::default().fg(self.theme.dimmed);
-                let content_style = Style::default().fg(self.theme.dimmed).add_modifier(Modifier::ITALIC);
+                let content_style = Style::default()
+                    .fg(self.theme.dimmed)
+                    .add_modifier(Modifier::ITALIC);
 
                 buf.set_string(x, y, prefix, prefix_style);
 
@@ -261,7 +309,8 @@ impl<'a> ConversationWidget<'a> {
                         break;
                     }
 
-                    let (wrapped_text, _line_count) = self.wrap_text(line, content_x, area, max_width);
+                    let (wrapped_text, _line_count) =
+                        self.wrap_text(line, content_x, area, max_width);
                     for wrapped_line in wrapped_text.lines() {
                         if y >= area.bottom() - 2 {
                             break;
@@ -273,35 +322,75 @@ impl<'a> ConversationWidget<'a> {
             }
 
             "output" => {
-                // Output: subtle background with border
-                let output_bg = Color::Rgb(25, 25, 30);
-                let border_style = Style::default().fg(Color::Rgb(58, 58, 66));
-                let content_style = Style::default().fg(Color::Rgb(180, 180, 180)).bg(output_bg);
+                // Get tool category from metadata for styling
+                let tool_category = message
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.tool_category.as_ref())
+                    .map(|s| s.as_str());
 
-                // Calculate content lines
-                let content_lines: Vec<&str> = message.content.lines().take(4).collect();
+                // Tool-specific colors: FileOps=blue, Search=purple, System=red
+                let (border_color, bg_color) = match tool_category {
+                    Some("FileOps") => (Color::Rgb(88, 166, 255), Color::Rgb(20, 25, 35)),
+                    Some("Search") => (Color::Rgb(189, 147, 249), Color::Rgb(25, 20, 35)),
+                    Some("System") => (Color::Rgb(255, 100, 100), Color::Rgb(35, 20, 20)),
+                    _ => (self.theme.border, Color::Rgb(25, 25, 30)),
+                };
 
-                // Indent output for visual separation
-                let x = x + 1;
+                let border_style = Style::default().fg(border_color);
+                let content_style = Style::default().fg(Color::Rgb(180, 180, 180)).bg(bg_color);
 
-                // Top border
-                let top_border = format!("┌─{}┐", "─".repeat(max_width_u16.saturating_sub(2) as usize));
-                buf.set_string(x, y, &top_border, border_style);
-                y += 1;
+                // Get message index for collapse toggle
+                let msg_index = self
+                    .messages
+                    .iter()
+                    .position(|m| std::ptr::eq(m, message))
+                    .unwrap_or(0);
+                let is_collapsed = self.is_collapsed(msg_index);
 
-                // Content with borders
-                for line in content_lines {
-                    let line_text = self.truncate_line(line, max_width.saturating_sub(4));
-                    let padding = max_width_u16.saturating_sub(4).saturating_sub(line_text.len() as u16) as usize;
-                    let border_line = format!("│ {}{}│", line_text, " ".repeat(padding));
-                    buf.set_string(x, y, &border_line, content_style);
+                // Determine number of lines to show
+                let total_lines = message.content.lines().count();
+                let max_lines = if is_collapsed {
+                    COLLAPSED_LINES
+                } else {
+                    EXPANDED_LINES.min(total_lines)
+                };
+
+                // Calculate content lines based on collapse state
+                let content_lines: Vec<&str> = message.content.lines().take(max_lines).collect();
+
+                // Left border indicator
+                for (i, line) in content_lines.iter().enumerate() {
+                    let marker = if i == 0 { "│" } else { " " };
+                    buf.set_string(x, y, marker, border_style);
+                    buf.set_string(
+                        x + 1,
+                        y,
+                        self.truncate_line(line, max_width.saturating_sub(2)),
+                        content_style,
+                    );
                     y += 1;
                 }
 
-                // Bottom border
-                let bottom_border = format!("└─{}┘", "─".repeat(max_width_u16.saturating_sub(2) as usize));
-                buf.set_string(x, y, &bottom_border, border_style);
-                y += 1;
+                // Show expand/collapse hint
+                if total_lines > COLLAPSED_LINES {
+                    let hint = if is_collapsed {
+                        format!("  ... {} lines total (click to expand)", total_lines)
+                    } else if total_lines > EXPANDED_LINES {
+                        "  ... (click to collapse)".to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !hint.is_empty() {
+                        let hint_style = Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::DIM);
+                        buf.set_string(x, y, &hint, hint_style);
+                        y += 1;
+                    }
+                }
+
+                y += 1; // Extra spacing after output
             }
 
             "thinking" => {
@@ -357,11 +446,20 @@ impl<'a> ConversationWidget<'a> {
     }
 
     /// Render pending action (approve/reject workflow)
-    fn render_pending_action(&self, action: &PendingAction, x: u16, y: u16, _area: Rect, buf: &mut Buffer) -> u16 {
+    fn render_pending_action(
+        &self,
+        action: &PendingAction,
+        x: u16,
+        y: u16,
+        _area: Rect,
+        buf: &mut Buffer,
+    ) -> u16 {
         let max_width = (_area.width - PADDING * 2) as usize;
 
         // Draw action box
-        let box_style = Style::default().fg(self.theme.warning).bg(Color::Rgb(40, 35, 30));
+        let box_style = Style::default()
+            .fg(self.theme.warning)
+            .bg(Color::Rgb(40, 35, 30));
 
         // Border
         let border = format!("┌{}┐", "─".repeat(max_width.saturating_sub(2)));
@@ -373,16 +471,30 @@ impl<'a> ConversationWidget<'a> {
 
         // Content (truncated)
         let content_preview = self.truncate_line(&action.content, max_width.saturating_sub(4));
-        buf.set_string(x + 2, y + 2, &content_preview, Style::default().fg(self.theme.foreground));
+        buf.set_string(
+            x + 2,
+            y + 2,
+            &content_preview,
+            Style::default().fg(self.theme.foreground),
+        );
 
         // Buttons
         let approve_text = "[a] Approve";
         let reject_text = "[r] Reject";
-        let button_style = Style::default().fg(self.theme.success).add_modifier(Modifier::BOLD);
-        let reject_style = Style::default().fg(self.theme.error).add_modifier(Modifier::BOLD);
+        let button_style = Style::default()
+            .fg(self.theme.success)
+            .add_modifier(Modifier::BOLD);
+        let reject_style = Style::default()
+            .fg(self.theme.error)
+            .add_modifier(Modifier::BOLD);
 
         buf.set_string(x + 1, y + 3, approve_text, button_style);
-        buf.set_string(x + approve_text.len() as u16 + 3, y + 3, reject_text, reject_style);
+        buf.set_string(
+            x + approve_text.len() as u16 + 3,
+            y + 3,
+            reject_text,
+            reject_style,
+        );
 
         // Bottom border
         let bottom_border = format!("└{}┘", "─".repeat(max_width.saturating_sub(2)));

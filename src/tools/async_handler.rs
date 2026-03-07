@@ -92,10 +92,7 @@ pub trait AsyncToolHandler: Send + Sync {
     }
 
     /// Execute the tool with the given invocation
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<ToolOutput, ToolError>;
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, ToolError>;
 
     /// Validate parameters before execution (optional override)
     #[allow(clippy::result_large_err)]
@@ -131,9 +128,7 @@ impl AsyncToolRegistry {
 
     #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&std::sync::Arc<dyn AsyncToolHandler>> {
-        self.handlers
-            .iter()
-            .find(|h| h.name() == name)
+        self.handlers.iter().find(|h| h.name() == name)
     }
 
     #[allow(dead_code)]
@@ -274,7 +269,6 @@ impl Default for AsyncToolRegistry {
 pub fn create_async_coding_tools(cwd: PathBuf) -> AsyncToolRegistry {
     // Note: You'll need to implement AsyncToolHandler for your existing tools
     // This is a placeholder - the actual implementations would go in r#impl
-    
 
     // Register async handlers (to be implemented)
     // registry.register(std::sync::Arc::new(r#impl::AsyncReadTool::new()));

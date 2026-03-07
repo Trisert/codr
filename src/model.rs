@@ -32,7 +32,7 @@ pub struct Model {
     client: Client,
     config: ModelConfig,
     usage: Arc<Mutex<Usage>>,
-    base_url: Option<String>,  // Store base_url for interrupt requests
+    base_url: Option<String>, // Store base_url for interrupt requests
     /// Cached result of runtime tool support probe (None = not yet probed)
     tool_support_probed: Arc<Mutex<Option<bool>>>,
 }
@@ -87,10 +87,19 @@ impl Serialize for ImageAttachment {
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub role: Arc<str>,  // Shared, immutable
-    pub content: Arc<String>,  // Shared, potentially large
+    pub role: Arc<str>,       // Shared, immutable
+    pub content: Arc<String>, // Shared, potentially large
     /// Optional image attachments for vision support
     pub images: Vec<ImageAttachment>,
+    /// Optional metadata for UI (e.g., tool category for output styling)
+    pub metadata: Option<MessageMetadata>,
+}
+
+/// Optional metadata for message styling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageMetadata {
+    /// Tool category for output styling (FileOps, Search, System)
+    pub tool_category: Option<String>,
 }
 
 // Custom Serialize for Message that converts Arc to owned strings
@@ -100,10 +109,11 @@ impl Serialize for Message {
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Message", 3)?;
+        let mut state = serializer.serialize_struct("Message", 4)?;
         state.serialize_field("role", &self.role.to_string())?;
         state.serialize_field("content", &self.content.as_str())?;
         state.serialize_field("images", &self.images)?;
+        state.serialize_field("metadata", &self.metadata)?;
         state.end()
     }
 }
@@ -131,10 +141,14 @@ impl From<&Message> for SerializableMessage {
         Self {
             role: msg.role.to_string(),
             content: msg.content.to_string(),
-            images: msg.images.iter().map(|img| SerializableImageAttachment {
-                data: img.data.to_string(),
-                media_type: img.media_type.to_string(),
-            }).collect(),
+            images: msg
+                .images
+                .iter()
+                .map(|img| SerializableImageAttachment {
+                    data: img.data.to_string(),
+                    media_type: img.media_type.to_string(),
+                })
+                .collect(),
         }
     }
 }
@@ -144,10 +158,15 @@ impl From<SerializableMessage> for Message {
         Self {
             role: msg.role.into(),
             content: Arc::new(msg.content),
-            images: msg.images.into_iter().map(|img| ImageAttachment {
-                data: Arc::new(img.data),
-                media_type: img.media_type.into(),
-            }).collect(),
+            images: msg
+                .images
+                .into_iter()
+                .map(|img| ImageAttachment {
+                    data: Arc::new(img.data),
+                    media_type: img.media_type.into(),
+                })
+                .collect(),
+            metadata: None,
         }
     }
 }
@@ -195,8 +214,7 @@ impl Model {
     ) -> Result<(Vec<Message>, Option<String>), Box<dyn std::error::Error>> {
         let state: ConversationState = serde_json::from_str(json)?;
 
-        let messages: Vec<Message> =
-            state.messages.into_iter().map(|m| m.into()).collect();
+        let messages: Vec<Message> = state.messages.into_iter().map(|m| m.into()).collect();
 
         Ok((messages, state.system_prompt))
     }
@@ -399,6 +417,7 @@ impl Model {
                 role: role.into(),
                 content: Arc::new(content.to_string()),
                 images: Vec::new(),
+                metadata: None,
             })
             .collect()
     }
@@ -408,6 +427,7 @@ impl Model {
             role: "user".into(),
             content: Arc::new(content.to_string()),
             images: Vec::new(),
+            metadata: None,
         });
         messages
     }
@@ -417,6 +437,7 @@ impl Model {
             role: "assistant".into(),
             content: Arc::new(content.to_string()),
             images: Vec::new(),
+            metadata: None,
         });
         messages
     }
@@ -429,16 +450,16 @@ impl Model {
     pub fn supports_native_tools(&self) -> bool {
         match &self.config.model_type {
             ModelType::Anthropic => true,
-            ModelType::OpenAI { native_tools_override, .. } => {
+            ModelType::OpenAI {
+                native_tools_override,
+                ..
+            } => {
                 // Use manual override if specified
                 if let Some(override_val) = native_tools_override {
                     return *override_val;
                 }
                 // Otherwise check cached probe result; default to false if not yet probed
-                self.tool_support_probed
-                    .lock()
-                    .unwrap()
-                    .unwrap_or(false)
+                self.tool_support_probed.lock().unwrap().unwrap_or(false)
             }
         }
     }
@@ -448,7 +469,13 @@ impl Model {
     /// the response contains structured `tool_calls`.
     /// Returns `true` if the server supports native tool calling, `false` otherwise.
     pub async fn probe_tool_support(&self) -> bool {
-        let ModelType::OpenAI { base_url, model, api_key, .. } = &self.config.model_type else {
+        let ModelType::OpenAI {
+            base_url,
+            model,
+            api_key,
+            ..
+        } = &self.config.model_type
+        else {
             return true; // Anthropic always supports tools
         };
 
@@ -487,14 +514,20 @@ impl Model {
         let response = match req.json(&probe_request).send().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Tool probe: request failed ({}), assuming no native tool support", e);
+                eprintln!(
+                    "Tool probe: request failed ({}), assuming no native tool support",
+                    e
+                );
                 return false;
             }
         };
 
         if !response.status().is_success() {
             let status = response.status();
-            eprintln!("Tool probe: server returned {} , assuming no native tool support", status);
+            eprintln!(
+                "Tool probe: server returned {} , assuming no native tool support",
+                status
+            );
             return false;
         }
 
@@ -530,24 +563,28 @@ impl Model {
         match response.json::<ProbeResponse>().await {
             Ok(probe_resp) => {
                 if let Some(choice) = probe_resp.choices.first()
-                    && let Some(tool_calls) = &choice.message.tool_calls {
-                        let has_valid_tool_call = tool_calls.iter().any(|tc| {
-                            tc.function
-                                .as_ref()
-                                .and_then(|f| f.name.as_ref())
-                                .map(|n| !n.is_empty())
-                                .unwrap_or(false)
-                        });
-                        if has_valid_tool_call {
-                            eprintln!("Tool probe: server supports native tool calling ✓");
-                            return true;
-                        }
+                    && let Some(tool_calls) = &choice.message.tool_calls
+                {
+                    let has_valid_tool_call = tool_calls.iter().any(|tc| {
+                        tc.function
+                            .as_ref()
+                            .and_then(|f| f.name.as_ref())
+                            .map(|n| !n.is_empty())
+                            .unwrap_or(false)
+                    });
+                    if has_valid_tool_call {
+                        eprintln!("Tool probe: server supports native tool calling ✓");
+                        return true;
                     }
+                }
                 eprintln!("Tool probe: no tool_calls in response, using prompt-based tool calling");
                 false
             }
             Err(e) => {
-                eprintln!("Tool probe: failed to parse response ({}), assuming no native tool support", e);
+                eprintln!(
+                    "Tool probe: failed to parse response ({}), assuming no native tool support",
+                    e
+                );
                 false
             }
         }
@@ -564,7 +601,11 @@ impl Model {
         }
 
         // Check if manual override is set
-        if let ModelType::OpenAI { native_tools_override: Some(_), .. } = &self.config.model_type {
+        if let ModelType::OpenAI {
+            native_tools_override: Some(_),
+            ..
+        } = &self.config.model_type
+        {
             // Override is set, no need to probe - supports_native_tools() will use the override
             *self.tool_support_probed.lock().unwrap() = None;
             return;
@@ -625,9 +666,21 @@ impl Model {
 
         match &self.config.model_type {
             ModelType::Anthropic => self.query_anthropic(&messages_with_reminder, None).await,
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
-                self.query_openai_compat(&messages_with_reminder, base_url, model, api_key.as_deref(), extra)
-                    .await
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra,
+                ..
+            } => {
+                self.query_openai_compat(
+                    &messages_with_reminder,
+                    base_url,
+                    model,
+                    api_key.as_deref(),
+                    extra,
+                )
+                .await
             }
         }
     }
@@ -643,10 +696,23 @@ impl Model {
                 let tool_defs = self.create_anthropic_tools(tools);
                 self.query_anthropic(messages, Some(&tool_defs)).await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra,
+                ..
+            } => {
                 let tool_defs = self.create_openai_tools(tools);
-                self.query_openai_compat_with_tools(messages, base_url, model, api_key.as_deref(), extra, Some(&tool_defs))
-                    .await
+                self.query_openai_compat_with_tools(
+                    messages,
+                    base_url,
+                    model,
+                    api_key.as_deref(),
+                    extra,
+                    Some(&tool_defs),
+                )
+                .await
             }
         }
     }
@@ -666,10 +732,22 @@ impl Model {
 
         match &self.config.model_type {
             ModelType::Anthropic => {
-                self.query_anthropic_streaming(&messages_with_reminder, None, on_text, on_thinking, cancel_token)
-                    .await
+                self.query_anthropic_streaming(
+                    &messages_with_reminder,
+                    None,
+                    on_text,
+                    on_thinking,
+                    cancel_token,
+                )
+                .await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra,
+                ..
+            } => {
                 self.query_openai_compat_streaming(
                     &messages_with_reminder,
                     OpenAICompatParams {
@@ -703,10 +781,22 @@ impl Model {
         match &self.config.model_type {
             ModelType::Anthropic => {
                 let tool_defs = self.create_anthropic_tools(tools);
-                self.query_anthropic_streaming(messages, Some(&tool_defs), on_text, on_thinking, cancel_token)
-                    .await
+                self.query_anthropic_streaming(
+                    messages,
+                    Some(&tool_defs),
+                    on_text,
+                    on_thinking,
+                    cancel_token,
+                )
+                .await
             }
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra,
+                ..
+            } => {
                 let tool_defs = self.create_openai_tools(tools);
                 self.query_openai_compat_streaming_with_tools(
                     messages,
@@ -746,6 +836,7 @@ impl Model {
                         role: msg.role.clone(),
                         content: Arc::new(new_content),
                         images: Vec::new(),
+                        metadata: msg.metadata.clone(),
                     });
                     reminder_added = true;
                 } else {
@@ -908,14 +999,14 @@ impl Model {
         // Combine reasoning + content if reasoning is present
         if let Some(choice) = openai_response.choices.first() {
             let message = &choice.message;
-            let reasoning = message.reasoning.clone().or_else(|| message.reasoning_content.clone());
+            let reasoning = message
+                .reasoning
+                .clone()
+                .or_else(|| message.reasoning_content.clone());
             let content = message.content.as_deref().unwrap_or("");
             if let Some(ref reasoning) = reasoning {
                 // Wrap reasoning in <thinking> tags for consistent extraction
-                Ok(format!(
-                    "<thinking>{}</thinking>\n\n{}",
-                    reasoning, content
-                ))
+                Ok(format!("<thinking>{}</thinking>\n\n{}", reasoning, content))
             } else {
                 Ok(content.to_string())
             }
@@ -947,7 +1038,11 @@ impl Model {
             model: model.to_string(),
             messages: openai_messages,
             max_tokens: Some(4096),
-            extra: if extra.is_empty() { None } else { Some(extra.clone()) },
+            extra: if extra.is_empty() {
+                None
+            } else {
+                Some(extra.clone())
+            },
             tools: tools.map(|t| t.to_vec()),
             tool_choice: None,
         };
@@ -981,16 +1076,16 @@ impl Model {
         // Handle tool calls in response
         if let Some(choice) = openai_response.choices.first() {
             let message = &choice.message;
-            let reasoning = message.reasoning.clone().or_else(|| message.reasoning_content.clone());
+            let reasoning = message
+                .reasoning
+                .clone()
+                .or_else(|| message.reasoning_content.clone());
             let content = message.content.as_deref().unwrap_or("");
 
-            // TODO: Parse tool_calls from response when available
+            // TODO(Trisert/codr#42): Parse tool_calls from response when available
             // For now, just return content + reasoning
             if let Some(ref reasoning) = reasoning {
-                Ok(format!(
-                    "<thinking>{}</thinking>\n\n{}",
-                    reasoning, content
-                ))
+                Ok(format!("<thinking>{}</thinking>\n\n{}", reasoning, content))
             } else {
                 Ok(content.to_string())
             }
@@ -1108,8 +1203,12 @@ impl Model {
                                 }
                                 ContentBlock::ToolUse { id: _, name, input } => {
                                     // Convert native tool use to XML format for parser compatibility
-                                    let input_json = serde_json::to_string(&input).unwrap_or_default();
-                                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, input_json);
+                                    let input_json =
+                                        serde_json::to_string(&input).unwrap_or_default();
+                                    let tool_xml = format!(
+                                        "<codr_tool name=\"{}\">{}</codr_tool>",
+                                        name, input_json
+                                    );
                                     full_content.push_str(&tool_xml);
                                     on_text(tool_xml);
                                 }
@@ -1210,7 +1309,8 @@ impl Model {
         let mut thinking_content = String::new();
         let mut buffer = String::new();
         // Accumulate tool call chunks: index -> (name, arguments_so_far)
-        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> = std::collections::HashMap::new();
+        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> =
+            std::collections::HashMap::new();
 
         loop {
             // Check for cancellation before each chunk
@@ -1295,7 +1395,11 @@ impl Model {
 
                     if let Ok(response) = serde_json::from_str::<StreamResponse>(data) {
                         for choice in response.choices {
-                            let reasoning = choice.delta.reasoning.clone().or_else(|| choice.delta.reasoning_content.clone());
+                            let reasoning = choice
+                                .delta
+                                .reasoning
+                                .clone()
+                                .or_else(|| choice.delta.reasoning_content.clone());
                             if let Some(reasoning) = reasoning {
                                 thinking_content.push_str(&reasoning);
                                 on_thinking(reasoning);
@@ -1309,14 +1413,17 @@ impl Model {
                                 for tool_call in tool_calls {
                                     let idx = tool_call.index.unwrap_or(0);
                                     if let Some(function) = tool_call.function {
-                                        let entry = tool_call_accumulators.entry(idx)
+                                        let entry = tool_call_accumulators
+                                            .entry(idx)
                                             .or_insert_with(|| (String::new(), String::new(), 0));
                                         if let Some(name) = function.name
-                                            && !name.is_empty() && entry.0.is_empty() {
-                                                entry.0 = name.clone();
-                                                // Stream tool name when first detected
-                                                on_text(format!("\n⚙ Calling {}...", name));
-                                            }
+                                            && !name.is_empty()
+                                            && entry.0.is_empty()
+                                        {
+                                            entry.0 = name.clone();
+                                            // Stream tool name when first detected
+                                            on_text(format!("\n⚙ Calling {}...", name));
+                                        }
                                         if let Some(arguments) = function.arguments {
                                             entry.1.push_str(&arguments);
                                             let new_len = entry.1.len();
@@ -1324,7 +1431,10 @@ impl Model {
                                             let last_reported = entry.2;
                                             if new_len >= last_reported + 1024 {
                                                 let size_kb = new_len as f64 / 1024.0;
-                                                on_text(format!("⚙ {}: generating ({:.1}KB)...", entry.0, size_kb));
+                                                on_text(format!(
+                                                    "⚙ {}: generating ({:.1}KB)...",
+                                                    entry.0, size_kb
+                                                ));
                                                 entry.2 = new_len;
                                             }
                                         }
@@ -1352,18 +1462,20 @@ impl Model {
         sorted_indices.sort();
         for idx in sorted_indices {
             if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx)
-                && !name.is_empty() {
-                    // Try to parse the accumulated arguments as JSON for validation
-                    let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
+                && !name.is_empty()
+            {
+                // Try to parse the accumulated arguments as JSON for validation
+                let args_str =
+                    if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
                         serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
                     } else {
                         // Use raw arguments even if not valid JSON - parser can handle it
                         arguments.clone()
                     };
-                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
-                    full_content.push_str(&tool_xml);
-                    on_text(tool_xml);
-                }
+                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
+                full_content.push_str(&tool_xml);
+                on_text(tool_xml);
+            }
         }
 
         if !thinking_content.is_empty() {
@@ -1446,7 +1558,8 @@ impl Model {
         let mut thinking_content = String::new();
         let mut buffer = String::new();
         // Accumulate tool call chunks: index -> (name, arguments_so_far)
-        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> = std::collections::HashMap::new();
+        let mut tool_call_accumulators: std::collections::HashMap<usize, (String, String, usize)> =
+            std::collections::HashMap::new();
 
         loop {
             if cancel_token.is_cancelled() {
@@ -1530,7 +1643,11 @@ impl Model {
 
                     if let Ok(response) = serde_json::from_str::<StreamResponse>(data) {
                         for choice in response.choices {
-                            let reasoning = choice.delta.reasoning.clone().or_else(|| choice.delta.reasoning_content.clone());
+                            let reasoning = choice
+                                .delta
+                                .reasoning
+                                .clone()
+                                .or_else(|| choice.delta.reasoning_content.clone());
                             if let Some(reasoning) = reasoning {
                                 thinking_content.push_str(&reasoning);
                                 on_thinking(reasoning);
@@ -1544,14 +1661,17 @@ impl Model {
                                 for tool_call in tool_calls {
                                     let idx = tool_call.index.unwrap_or(0);
                                     if let Some(function) = tool_call.function {
-                                        let entry = tool_call_accumulators.entry(idx)
+                                        let entry = tool_call_accumulators
+                                            .entry(idx)
                                             .or_insert_with(|| (String::new(), String::new(), 0));
                                         if let Some(name) = function.name
-                                            && !name.is_empty() && entry.0.is_empty() {
-                                                entry.0 = name.clone();
-                                                // Stream tool name when first detected
-                                                on_text(format!("\n⚙ Calling {}...\n", name));
-                                            }
+                                            && !name.is_empty()
+                                            && entry.0.is_empty()
+                                        {
+                                            entry.0 = name.clone();
+                                            // Stream tool name when first detected
+                                            on_text(format!("\n⚙ Calling {}...\n", name));
+                                        }
                                         if let Some(arguments) = function.arguments {
                                             entry.1.push_str(&arguments);
                                             let new_len = entry.1.len();
@@ -1559,7 +1679,10 @@ impl Model {
                                             let last_reported = entry.2;
                                             if new_len >= last_reported + 1024 {
                                                 let size_kb = new_len as f64 / 1024.0;
-                                                on_text(format!("⚙ {}: generating ({:.1}KB)...\n", entry.0, size_kb));
+                                                on_text(format!(
+                                                    "⚙ {}: generating ({:.1}KB)...\n",
+                                                    entry.0, size_kb
+                                                ));
                                                 entry.2 = new_len;
                                             }
                                         }
@@ -1587,16 +1710,18 @@ impl Model {
         sorted_indices.sort();
         for idx in sorted_indices {
             if let Some((name, arguments, _line_count)) = tool_call_accumulators.get(&idx)
-                && !name.is_empty() {
-                    let args_str = if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
+                && !name.is_empty()
+            {
+                let args_str =
+                    if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(arguments) {
                         serde_json::to_string(&args_json).unwrap_or_else(|_| arguments.clone())
                     } else {
                         arguments.clone()
                     };
-                    let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
-                    full_content.push_str(&tool_xml);
-                    on_text(tool_xml);
-                }
+                let tool_xml = format!("<codr_tool name=\"{}\">{}</codr_tool>", name, args_str);
+                full_content.push_str(&tool_xml);
+                on_text(tool_xml);
+            }
         }
 
         if !thinking_content.is_empty() {
@@ -1623,7 +1748,9 @@ impl CacheKey for Model {
     fn get_cache_key(&self) -> String {
         match &self.config.model_type {
             ModelType::Anthropic => "anthropic:claude".to_string(),
-            ModelType::OpenAI { base_url, model, .. } => {
+            ModelType::OpenAI {
+                base_url, model, ..
+            } => {
                 format!("openai:{}:{}", base_url, model)
             }
         }
@@ -1649,7 +1776,7 @@ mod tests {
             completion_tokens: Some(50),
             cost_in_currency: Some(0.001),
         };
-        
+
         assert_eq!(usage.prompt_tokens, Some(100));
         assert_eq!(usage.completion_tokens, Some(50));
         assert_eq!(usage.cost_in_currency, Some(0.001));
@@ -1662,9 +1789,9 @@ mod tests {
             completion_tokens: Some(50),
             cost_in_currency: Some(0.001),
         };
-        
+
         let cloned = usage.clone();
-        
+
         assert_eq!(cloned.prompt_tokens, Some(100));
         assert_eq!(cloned.completion_tokens, Some(50));
         assert_eq!(cloned.cost_in_currency, Some(0.001));
@@ -1677,9 +1804,9 @@ mod tests {
     #[test]
     fn test_model_type_anthropic() {
         let mt = ModelType::Anthropic;
-        
+
         match mt {
-            ModelType::Anthropic => {},
+            ModelType::Anthropic => {}
             _ => panic!("Expected Anthropic"),
         }
     }
@@ -1695,7 +1822,13 @@ mod tests {
         };
 
         match mt {
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra: _,
+                ..
+            } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -1710,13 +1843,20 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: Some("test-key".to_string()),
+            native_tools_override: None,
             extra: std::collections::HashMap::new(),
         };
 
         let mt2 = mt1.clone();
 
         match mt2 {
-            ModelType::OpenAI { base_url, model, api_key, extra, .. } => {
+            ModelType::OpenAI {
+                base_url,
+                model,
+                api_key,
+                extra: _,
+                ..
+            } => {
                 assert_eq!(base_url, "http://localhost:8080");
                 assert_eq!(model, "test-model");
                 assert_eq!(api_key, Some("test-key".to_string()));
@@ -1735,6 +1875,7 @@ mod tests {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
             images: Vec::new(),
+            metadata: None,
         };
 
         assert_eq!(&*msg.role, "user");
@@ -1747,6 +1888,7 @@ mod tests {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
             images: Vec::new(),
+            metadata: None,
         };
 
         let cloned = msg.clone();
@@ -1762,6 +1904,7 @@ mod tests {
             role: "assistant".into(),
             content: Arc::new("Hi there".to_string()),
             images: Vec::new(),
+            metadata: None,
         };
 
         assert_eq!(&*msg.role, "user");
@@ -1774,6 +1917,7 @@ mod tests {
             role: "user".into(),
             content: Arc::new("Hello".to_string()),
             images: Vec::new(),
+            metadata: None,
         };
 
         let debug_str = format!("{:?}", msg);
@@ -1791,7 +1935,7 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         };
-        
+
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "Hello");
     }
@@ -1802,7 +1946,7 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         };
-        
+
         let cloned = msg.clone();
         assert_eq!(cloned.role, "user");
         assert_eq!(cloned.content, "Hello");
@@ -1817,7 +1961,7 @@ mod tests {
         let thinking = AnthropicThinking {
             thinking_type: "enabled".to_string(),
         };
-        
+
         assert_eq!(thinking.thinking_type, "enabled");
     }
 
@@ -1830,21 +1974,19 @@ mod tests {
         let request = AnthropicRequest {
             model: "claude-3".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: "Hello".to_string(),
-                }
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
             system: Some("You are helpful".to_string()),
             thinking: AnthropicThinking {
                 thinking_type: "enabled".to_string(),
             },
             tools: None,
         };
-        
+
         let json = serde_json::to_string(&request).unwrap();
-        
+
         assert!(json.contains("claude-3"));
         assert!(json.contains("user"));
         assert!(json.contains("Hello"));
@@ -1860,7 +2002,7 @@ mod tests {
     fn test_content_block_text_deserialization() {
         let json = r#"{"type": "text", "text": "Hello world"}"#;
         let block: ContentBlock = serde_json::from_str(json).unwrap();
-        
+
         match block {
             ContentBlock::Text { text } => {
                 assert_eq!(text, "Hello world");
@@ -1873,7 +2015,7 @@ mod tests {
     fn test_content_block_thinking_deserialization() {
         let json = r#"{"type": "thinking", "thinking": "Let me think...", "id": "abc123"}"#;
         let block: ContentBlock = serde_json::from_str(json).unwrap();
-        
+
         match block {
             ContentBlock::Thinking { thinking, id } => {
                 assert_eq!(thinking, "Let me think...");
@@ -1900,12 +2042,12 @@ mod tests {
             }
         }
         "#;
-        
+
         let response: AnthropicResponse = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(response.content.len(), 1);
         assert!(response.usage.is_some());
-        
+
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
@@ -1919,7 +2061,7 @@ mod tests {
     fn test_anthropic_usage_deserialization() {
         let json = r#"{"input_tokens": 100, "output_tokens": 50}"#;
         let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
     }
@@ -1932,20 +2074,18 @@ mod tests {
     fn test_openai_request_serialization() {
         let request = OpenAIRequest {
             model: "gpt-4".to_string(),
-            messages: vec![
-                OpenAIMessage {
-                    role: "user".to_string(),
-                    content: "Hello".to_string(),
-                }
-            ],
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
             max_tokens: Some(2048),
             extra: None,
             tools: None,
             tool_choice: None,
         };
-        
+
         let json = serde_json::to_string(&request).unwrap();
-        
+
         assert!(json.contains("gpt-4"));
         assert!(json.contains("user"));
         assert!(json.contains("Hello"));
@@ -1976,9 +2116,9 @@ mod tests {
             }
         }
         "#;
-        
+
         let response: OpenAIResponse = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(response.choices.len(), 1);
         assert!(response.usage.is_some());
     }
@@ -2006,24 +2146,24 @@ mod tests {
             ]
         }
         "#;
-        
+
         #[derive(Deserialize)]
         struct StreamResponse {
             choices: Vec<StreamChoice>,
         }
-        
+
         #[derive(Deserialize)]
         struct StreamChoice {
             delta: Delta,
         }
-        
+
         #[derive(Deserialize)]
         struct Delta {
             content: Option<String>,
         }
-        
+
         let response: StreamResponse = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(response.choices.len(), 1);
         assert_eq!(response.choices[0].delta.content, Some("Hello".to_string()));
     }
@@ -2038,7 +2178,7 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         };
-        
+
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "Hello");
     }
@@ -2052,11 +2192,11 @@ mod tests {
         let config = ModelConfig {
             model_type: ModelType::Anthropic,
         };
-        
+
         let cloned = config.clone();
-        
+
         match cloned.model_type {
-            ModelType::Anthropic => {},
+            ModelType::Anthropic => {}
             _ => panic!("Expected Anthropic"),
         }
     }
@@ -2087,6 +2227,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: None,
+            native_tools_override: None,
             extra: std::collections::HashMap::new(),
         });
         // Before probing, OpenAI should default to false (safe fallback)
@@ -2099,6 +2240,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: None,
+            native_tools_override: None,
             extra: std::collections::HashMap::new(),
         });
         // Simulate a successful probe
@@ -2112,6 +2254,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             model: "test-model".to_string(),
             api_key: None,
+            native_tools_override: None,
             extra: std::collections::HashMap::new(),
         });
         // Simulate a failed probe

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::async_handler::{AsyncToolHandler, ToolInvocation, ToolKind};
 use super::{Tool, ToolContext, ToolError, ToolOutput};
 // Import tools from the impl module (r#impl is a raw identifier for the 'impl' keyword)
-use super::r#impl::{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool};
+use super::r#impl::{BashTool, EditTool, FindTool, GrepTool, ReadTool, WriteTool};
 
 // ============================================================
 // Async Tool Wrapper
@@ -64,13 +64,13 @@ impl AsyncToolHandler for AsyncToolWrapper {
     }
 
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
-        matches!(self.kind, ToolKind::Write | ToolKind::Execute | ToolKind::System)
+        matches!(
+            self.kind,
+            ToolKind::Write | ToolKind::Execute | ToolKind::System
+        )
     }
 
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<ToolOutput, ToolError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, ToolError> {
         // Execute the sync tool directly
         // Note: This will block the async task briefly, which is acceptable for most tools
         // For long-running operations, the tool itself should be async
@@ -85,11 +85,8 @@ impl AsyncToolHandler for AsyncToolWrapper {
 
         // Use tokio::task::block_in_place to bridge sync/async
         // This is safe because we're in an async context and the operation is short-lived
-        
 
-        tokio::task::block_in_place(|| {
-            tool_ref.execute_json(params, &ctx)
-        })
+        tokio::task::block_in_place(|| tool_ref.execute_json(params, &ctx))
     }
 }
 
@@ -141,7 +138,11 @@ impl IntegratedAsyncToolRegistry {
     }
 
     /// Execute a single tool asynchronously
-    pub async fn execute(&self, name: &str, params: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    pub async fn execute(
+        &self,
+        name: &str,
+        params: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
         let handler = self
             .get(name)
             .ok_or_else(|| ToolError::Custom(format!("Tool '{}' not found", name)))?;
@@ -266,8 +267,8 @@ impl IntegratedAsyncToolRegistry {
     where
         F: FnMut(String) + Send + 'static,
     {
-        use tokio::process::Command;
         use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
@@ -281,12 +282,17 @@ impl IntegratedAsyncToolRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn bash: {}", e)))?;
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| ToolError::ExecutionFailed("Failed to capture stdout".to_string()))?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| ToolError::ExecutionFailed("Failed to capture stderr".to_string()))?;
 
         let mut stdout_lines = BufReader::new(stdout).lines();
@@ -345,14 +351,15 @@ impl IntegratedAsyncToolRegistry {
         let line_count = output.lines().count();
         let byte_count = output.len();
 
-        Ok(ToolOutput::text(output)
-            .with_metadata(super::OutputMetadata {
+        Ok(
+            ToolOutput::text(output).with_metadata(super::OutputMetadata {
                 file_path: None,
                 line_count: Some(line_count),
                 byte_count: Some(byte_count),
                 truncated: false,
                 display_summary: None,
-            }))
+            }),
+        )
     }
 }
 

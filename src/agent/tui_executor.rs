@@ -42,34 +42,32 @@ impl TUIExecutor {
     fn get_action_display_name(&self, action: &Action) -> String {
         match action {
             Action::Bash { command, .. } => format!("bash: {}", command),
-            Action::Tool { name, params } => {
-                match name.as_ref() {
-                    "bash" => {
-                        if let Some(command) = params.get("command").and_then(|v| v.as_str()) {
-                            format!("bash: {}", command)
-                        } else {
-                            format!("{}: {}", name, params)
-                        }
+            Action::Tool { name, params } => match name.as_ref() {
+                "bash" => {
+                    if let Some(command) = params.get("command").and_then(|v| v.as_str()) {
+                        format!("bash: {}", command)
+                    } else {
+                        format!("{}: {}", name, params)
                     }
-                    "write" => {
-                        if let Some(file_path) = params.get("file_path").and_then(|v| v.as_str()) {
-                            let display_path = file_path.strip_prefix('/').unwrap_or(file_path);
-                            format!("Writing {}", display_path)
-                        } else {
-                            format!("{}: {}", name, params)
-                        }
-                    }
-                    "edit" => {
-                        if let Some(file_path) = params.get("file_path").and_then(|v| v.as_str()) {
-                            let display_path = file_path.strip_prefix('/').unwrap_or(file_path);
-                            format!("Editing {}", display_path)
-                        } else {
-                            format!("{}: {}", name, params)
-                        }
-                    }
-                    _ => format!("{}: {}", name, params),
                 }
-            }
+                "write" => {
+                    if let Some(file_path) = params.get("file_path").and_then(|v| v.as_str()) {
+                        let display_path = file_path.strip_prefix('/').unwrap_or(file_path);
+                        format!("Writing {}", display_path)
+                    } else {
+                        format!("{}: {}", name, params)
+                    }
+                }
+                "edit" => {
+                    if let Some(file_path) = params.get("file_path").and_then(|v| v.as_str()) {
+                        let display_path = file_path.strip_prefix('/').unwrap_or(file_path);
+                        format!("Editing {}", display_path)
+                    } else {
+                        format!("{}: {}", name, params)
+                    }
+                }
+                _ => format!("{}: {}", name, params),
+            },
             Action::Response(_) => "response".to_string(),
         }
     }
@@ -78,33 +76,39 @@ impl TUIExecutor {
     fn get_progress_message(&self, action: &Action) -> String {
         match action {
             Action::Bash { command, .. } => {
-                format!("⚙ Running bash: {}...", command.chars().take(60).collect::<String>())
+                format!(
+                    "⚙ Running bash: {}...",
+                    command.chars().take(60).collect::<String>()
+                )
             }
-            Action::Tool { name, params } => {
-                match name.as_ref() {
-                    "bash" => params
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .map(|c| format!("⚙ Running bash: {}...", c.chars().take(40).collect::<String>()))
-                        .unwrap_or_else(|| format!("⚙ Running {}...", name)),
-                    "read" => params
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| format!("⚙ Reading {}...", p))
-                        .unwrap_or_else(|| format!("⚙ Running {}...", name)),
-                    "write" => params
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| format!("⚙ Writing {}...", p))
-                        .unwrap_or_else(|| format!("⚙ Running {}...", name)),
-                    "edit" => params
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| format!("⚙ Editing {}...", p))
-                        .unwrap_or_else(|| format!("⚙ Running {}...", name)),
-                    _ => format!("⚙ Running {}...", name),
-                }
-            }
+            Action::Tool { name, params } => match name.as_ref() {
+                "bash" => params
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|c| {
+                        format!(
+                            "⚙ Running bash: {}...",
+                            c.chars().take(40).collect::<String>()
+                        )
+                    })
+                    .unwrap_or_else(|| format!("⚙ Running {}...", name)),
+                "read" => params
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| format!("⚙ Reading {}...", p))
+                    .unwrap_or_else(|| format!("⚙ Running {}...", name)),
+                "write" => params
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| format!("⚙ Writing {}...", p))
+                    .unwrap_or_else(|| format!("⚙ Running {}...", name)),
+                "edit" => params
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| format!("⚙ Editing {}...", p))
+                    .unwrap_or_else(|| format!("⚙ Running {}...", name)),
+                _ => format!("⚙ Running {}...", name),
+            },
             Action::Response(_) => "⚙ Processing...".to_string(),
         }
     }
@@ -129,12 +133,17 @@ impl ActionExecutor for TUIExecutor {
                 }
 
                 let progress = self.get_progress_message(action);
-                self.send_update(TuiUpdate::ActionMessage(format!("bash: {}", command).into()));
+                self.send_update(TuiUpdate::ActionMessage(
+                    format!("bash: {}", command).into(),
+                ));
                 self.send_update(TuiUpdate::ToolProgress(progress.into()));
 
                 execute_bash(command.as_ref())
                     .map(|output| {
-                        self.send_update(TuiUpdate::OutputMessage(Arc::new(output.clone())));
+                        self.send_update(TuiUpdate::OutputMessage {
+                            content: Arc::new(output.clone()),
+                            tool_category: Some("System".to_string()),
+                        });
                         ActionOutput::visible(output)
                     })
                     .map_err(ExecutionError::from_agent_error)
@@ -187,25 +196,36 @@ impl ActionExecutor for TUIExecutor {
                 tool.execute_json(params.clone(), &ctx)
                     .map_err(|e| ExecutionError::retryable(e.to_string()))
                     .map(|output| {
+                        // Get tool category for UI styling
+                        let tool_category = output.tool_category.map(|c| format!("{:?}", c));
+
                         // Use cleaner display for read tool (file path instead of full content)
                         if name.as_ref() == "read" {
                             // Use display_summary from metadata if available (e.g., "Reading src/main.rs:10-20")
-                            let summary = output.metadata.display_summary.clone().unwrap_or_else(|| {
-                                // Fallback to file path from params
-                                params.get("file_path")
-                                    .and_then(|v| v.as_str())
-                                    .map(|p| format!("Reading {}", p))
-                                    .unwrap_or_else(|| "Reading file...".to_string())
-                            });
+                            let summary =
+                                output.metadata.display_summary.clone().unwrap_or_else(|| {
+                                    // Fallback to file path from params
+                                    params
+                                        .get("file_path")
+                                        .and_then(|v| v.as_str())
+                                        .map(|p| format!("Reading {}", p))
+                                        .unwrap_or_else(|| "Reading file...".to_string())
+                                });
 
                             // Show as progress message (no border box)
                             self.send_update(TuiUpdate::ToolProgress(summary.into()));
 
                             // Empty output (don't show file content in terminal)
-                            self.send_update(TuiUpdate::OutputMessage(Arc::new(String::new())));
+                            self.send_update(TuiUpdate::OutputMessage {
+                                content: Arc::new(String::new()),
+                                tool_category,
+                            });
                         } else {
                             // For other tools, show full output
-                            self.send_update(TuiUpdate::OutputMessage(Arc::new(output.content.to_string())));
+                            self.send_update(TuiUpdate::OutputMessage {
+                                content: Arc::new(output.content.to_string()),
+                                tool_category,
+                            });
                         }
 
                         // Convert ToolOutput to ActionOutput

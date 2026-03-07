@@ -6,7 +6,7 @@
 use crate::agent::executor::{ActionExecutor, ExecutionError, MAX_RETRIES};
 use crate::error::AgentError;
 use crate::model::{Message, Model};
-use crate::parser::{Action, parse_actions, clean_message_content};
+use crate::parser::{Action, clean_message_content, parse_actions};
 use crate::tools::ToolRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +41,6 @@ pub struct LoopConfig {
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
-
 impl LoopConfig {
     /// Create a new non-streaming config
     pub fn new() -> Self {
@@ -49,10 +48,7 @@ impl LoopConfig {
     }
 
     /// Create a new streaming config
-    pub fn streaming(
-        on_streaming: StreamingCallback,
-        on_thinking: ThinkingCallback,
-    ) -> Self {
+    pub fn streaming(on_streaming: StreamingCallback, on_thinking: ThinkingCallback) -> Self {
         Self {
             streaming: true,
             on_streaming: Some(on_streaming),
@@ -172,7 +168,9 @@ pub async fn run_agent_loop<E: ActionExecutor>(
         };
 
         // Check for plain text response (loop exit condition)
-        if let Some(Action::Response(response)) = actions.iter().find(|a| matches!(a, Action::Response(_))) {
+        if let Some(Action::Response(response)) =
+            actions.iter().find(|a| matches!(a, Action::Response(_)))
+        {
             return Ok(LoopResult {
                 final_response: Some((*response).to_string()),
                 conversation,
@@ -234,20 +232,19 @@ fn execute_actions_with_retry<E: ActionExecutor>(
 
         // Check if tool is available in current role
         if let Action::Tool { name, .. } = action
-            && !role.tool_available(name.as_ref()) {
-                let error_msg = format!(
-                    "Tool '{}' is not available in {} mode. Use Shift+Tab to change roles.",
-                    name,
-                    role.name()
-                );
-                let cleaned_output = clean_message_content(lm_output, true);
-                *conversation = model.add_assistant_message(
-                    conversation.clone(),
-                    cleaned_output.as_str(),
-                );
-                *conversation = model.add_user_message(conversation.clone(), &error_msg);
-                return Err(ExecutionError::retryable(error_msg));
-            }
+            && !role.tool_available(name.as_ref())
+        {
+            let error_msg = format!(
+                "Tool '{}' is not available in {} mode. Use Shift+Tab to change roles.",
+                name,
+                role.name()
+            );
+            let cleaned_output = clean_message_content(lm_output, true);
+            *conversation =
+                model.add_assistant_message(conversation.clone(), cleaned_output.as_str());
+            *conversation = model.add_user_message(conversation.clone(), &error_msg);
+            return Err(ExecutionError::retryable(error_msg));
+        }
 
         // Get the action key for tracking retries
         let action_key = get_action_key(action);
@@ -263,10 +260,14 @@ fn execute_actions_with_retry<E: ActionExecutor>(
 
                 // Add messages to conversation
                 let cleaned_output = clean_message_content(lm_output, true);
-                *conversation = model.add_assistant_message(conversation.clone(), cleaned_output.as_str());
+                *conversation =
+                    model.add_assistant_message(conversation.clone(), cleaned_output.as_str());
                 *conversation = model.add_user_message(
                     conversation.clone(),
-                    &format!("Tool result:\n{}", truncate_tool_result(&output.llm_content)),
+                    &format!(
+                        "Tool result:\n{}",
+                        truncate_tool_result(&output.llm_content)
+                    ),
                 );
 
                 // Reset retry count on success
@@ -291,16 +292,14 @@ fn execute_actions_with_retry<E: ActionExecutor>(
 
                     let feedback = format!(
                         "Error: {}\n\n{}",
-                        error_json,
-                        "Please fix the parameters and try again."
+                        error_json, "Please fix the parameters and try again."
                     );
 
                     let cleaned_output = clean_message_content(lm_output, true);
-                    *conversation = model.add_assistant_message(
-                        conversation.clone(),
-                        &cleaned_output,
-                    );
-                    *conversation = model.add_user_message(conversation.clone(), &truncate_tool_result(&feedback));
+                    *conversation =
+                        model.add_assistant_message(conversation.clone(), &cleaned_output);
+                    *conversation = model
+                        .add_user_message(conversation.clone(), &truncate_tool_result(&feedback));
                 } else {
                     // Max retries exceeded
                     let error_msg = format!(
@@ -332,7 +331,15 @@ pub async fn run_agent_loop_streaming<E: ActionExecutor>(
     on_thinking: ThinkingCallback,
 ) -> Result<LoopResult, String> {
     let config = LoopConfig::streaming(on_streaming, on_thinking);
-    run_agent_loop(model, initial_conversation, tool_registry, executor, role, config).await
+    run_agent_loop(
+        model,
+        initial_conversation,
+        tool_registry,
+        executor,
+        role,
+        config,
+    )
+    .await
 }
 
 /// Get a unique key for an action (for tracking retries)

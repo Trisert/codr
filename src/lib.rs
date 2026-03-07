@@ -1,4 +1,3 @@
-pub mod tui;
 pub mod agent;
 pub mod commands;
 pub mod config;
@@ -13,3 +12,11 @@ pub mod model_registry;
 pub mod parser;
 pub mod prompt;
 pub mod tools;
+pub mod tui;
+
+// ============================================================
+// Test modules
+// ============================================================
+
+#[cfg(test)]
+mod tests;

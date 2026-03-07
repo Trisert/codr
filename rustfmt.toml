@@ -1,0 +1,34 @@
+# Rustfmt configuration for codr
+# See https://rust-lang.github.io/rustfmt/
+
+# Edition
+edition = "2024"
+
+# Maximum line width
+max_width = 100
+
+# Hard tabs or spaces
+hard_tabs = false
+tab_spaces = 4
+
+# Newline style (Unix = LF)
+newline_style = "Unix"
+
+# Use field init shorthand if possible
+use_field_init_shorthand = true
+
+# Use try shorthand
+use_try_shorthand = true
+
+# Reorder import statements
+reorder_imports = true
+reorder_modules = true
+
+# Remove nested parens
+remove_nested_parens = true
+
+# Merge derives
+merge_derives = true
+
+# Use small heuristics
+use_small_heuristics = "Default"

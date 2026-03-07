@@ -1,0 +1,88 @@
+# Clippy configuration for codr
+# Enforces code quality, naming conventions, and best practices
+
+# ============================================================
+# Complexity Thresholds
+# ============================================================
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+cognitive-complexity-threshold = 20
+
+# ============================================================
+# Test Configuration
+# ============================================================
+# Allow common test patterns
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+
+# ============================================================
+# Documentation
+# ============================================================
+missing-docs-in-crate-items = false
+
+# ============================================================
+# Naming Convention Enforcement
+# ============================================================
+# Disallow non-descriptive names that don't convey meaning
+# This enforces naming consistency across the codebase
+#
+# NOTE: Some generic names like "result", "data", "value", "item" are
+# allowed in certain contexts (e.g., Result types, JSON parsing, iterators)
+# where they are conventional and clear. The focus is on preventing
+# truly ambiguous names in broader scopes.
+disallowed-names = [
+    # Avoid foo/bar/baz as they don't convey meaning
+    "foo",
+    "bar",
+    "baz",
+
+    # Avoid single-letter names except in specific contexts
+    "q",
+    "z",
+
+    # Avoid overly generic names in top-level function/module scope
+    "temp",
+    "stuff",
+    "things",
+]
+
+# ============================================================
+# Additional Lint Configuration
+# ============================================================
+disallowed-methods = []
+disallowed-types = []
+allowed-duplicate-crates = []
+
+# Valid identifiers in documentation
+doc-valid-idents = [
+    "AIMessage",
+    "OpenAI",
+    "Anthropic",
+    "TUI",
+    "YOLO",
+    "LSP",
+    "JSON",
+    "TOML",
+    "CLI",
+    "TODO",
+    "FIXME",
+    "XML",
+    "HTML",
+    "HTTP",
+    "HTTPS",
+    "API",
+    "URL",
+    "LLM",
+    "RUST",
+    "CODECS",
+]
+
+# ============================================================
+# Technical Debt Tracking
+# ============================================================
+# Require TODO/FIXME comments to reference issues
+# Example: TODO(#123) - Fix this bug
+# Example: FIXME(@username) - Implement this feature
+# This can be enhanced with custom lints in the future

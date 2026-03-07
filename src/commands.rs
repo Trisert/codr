@@ -103,7 +103,7 @@ impl Command for CopyChatCommand {
                     markdown.push_str("\n\n");
                 }
                 "assistant" => {
-                    // TODO: Add thinking support (message struct doesn't have thinking field yet)
+                    // TODO(Trisert/codr#43): Add thinking support (message struct doesn't have thinking field yet)
                     // if let Some(ref thinking) = msg.thinking {
                     //     markdown.push_str("**Thinking:** ");
                     //     markdown.push_str(thinking);
@@ -120,7 +120,10 @@ impl Command for CopyChatCommand {
                         markdown.push_str("```bash\n");
                         markdown.push_str(content.strip_prefix("bash: ").unwrap_or(content));
                         markdown.push_str("\n```\n\n");
-                    } else if content.starts_with("read ") || content.starts_with("edit ") || content.starts_with("write ") {
+                    } else if content.starts_with("read ")
+                        || content.starts_with("edit ")
+                        || content.starts_with("write ")
+                    {
                         markdown.push_str("```\n");
                         markdown.push_str(content);
                         markdown.push_str("\n```\n\n");
@@ -177,7 +180,10 @@ impl Command for CopyChatCommand {
         if success {
             let char_count = markdown.chars().count();
             let line_count = markdown.lines().count();
-            Ok(format!("Copied {} chars ({} lines) to clipboard", char_count, line_count))
+            Ok(format!(
+                "Copied {} chars ({} lines) to clipboard",
+                char_count, line_count
+            ))
         } else {
             Err("Copy failed - install xclip (Linux) or use mouse selection".to_string())
         }

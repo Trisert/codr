@@ -90,17 +90,14 @@ impl ConversationStorage {
         // Ensure directory exists
         fs::create_dir_all(&conversations_dir)?;
 
-        Ok(Self {
-            conversations_dir,
-        })
+        Ok(Self { conversations_dir })
     }
 
     /// Get the conversations directory (XDG data directory)
     fn get_conversations_dir() -> Result<PathBuf, ConversationError> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| ConversationError::InvalidData(
-                "Could not determine XDG data directory".to_string()
-            ))?;
+        let data_dir = dirs::data_dir().ok_or_else(|| {
+            ConversationError::InvalidData("Could not determine XDG data directory".to_string())
+        })?;
 
         Ok(data_dir.join("codr").join("conversations"))
     }
@@ -112,7 +109,6 @@ impl ConversationStorage {
 
     /// Generate a new conversation ID based on current timestamp
     pub fn generate_id() -> String {
-        
         let now = Utc::now();
         now.format("%Y-%m-%d_%H%M%S").to_string()
     }
@@ -128,10 +124,8 @@ impl ConversationStorage {
         let now = Utc::now();
 
         // Convert messages to serializable format
-        let serializable_messages: Vec<SerializableMessage> = messages
-            .iter()
-            .map(|m| m.into())
-            .collect();
+        let serializable_messages: Vec<SerializableMessage> =
+            messages.iter().map(|m| m.into()).collect();
 
         // Create metadata
         let metadata = ConversationMetadata {
@@ -191,19 +185,23 @@ impl ConversationStorage {
 
             // Read and parse the file
             match fs::read_to_string(&path) {
-                Ok(json) => {
-                    match serde_json::from_str::<SavedConversation>(&json) {
-                        Ok(mut saved) => {
-                            saved.metadata.file_path = path.clone();
-                            conversations.push(saved.metadata);
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to parse conversation file {:?}: {}", path, e);
-                        }
+                Ok(json) => match serde_json::from_str::<SavedConversation>(&json) {
+                    Ok(mut saved) => {
+                        saved.metadata.file_path = path.clone();
+                        conversations.push(saved.metadata);
                     }
-                }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to parse conversation file {:?}: {}",
+                            path, e
+                        );
+                    }
+                },
                 Err(e) => {
-                    eprintln!("Warning: Failed to read conversation file {:?}: {}", path, e);
+                    eprintln!(
+                        "Warning: Failed to read conversation file {:?}: {}",
+                        path, e
+                    );
                 }
             }
         }
@@ -227,7 +225,11 @@ impl ConversationStorage {
     }
 
     /// Rename a conversation
-    pub fn rename_conversation(&self, id: &str, new_title: String) -> Result<ConversationMetadata, ConversationError> {
+    pub fn rename_conversation(
+        &self,
+        id: &str,
+        new_title: String,
+    ) -> Result<ConversationMetadata, ConversationError> {
         let mut saved = self.load_conversation(id)?;
         saved.metadata.title = Some(new_title);
 
@@ -280,27 +282,24 @@ impl ConversationStorage {
 
     /// Generate a title from the first user message
     fn generate_title(messages: &[Message]) -> Option<String> {
-        messages
-            .iter()
-            .find(|m| &*m.role == "user")
-            .and_then(|m| {
-                let content = m.content.trim();
-                if content.is_empty() {
-                    None
+        messages.iter().find(|m| &*m.role == "user").and_then(|m| {
+            let content = m.content.trim();
+            if content.is_empty() {
+                None
+            } else {
+                // Take first ~50 chars, truncate at word boundary
+                let truncated = if content.len() > 50 {
+                    let mut end = 50;
+                    while end > 0 && !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &content[..end])
                 } else {
-                    // Take first ~50 chars, truncate at word boundary
-                    let truncated = if content.len() > 50 {
-                        let mut end = 50;
-                        while end > 0 && !content.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &content[..end])
-                    } else {
-                        content.to_string()
-                    };
-                    Some(truncated)
-                }
-            })
+                    content.to_string()
+                };
+                Some(truncated)
+            }
+        })
     }
 
     /// Convert conversation to markdown format
@@ -313,10 +312,19 @@ impl ConversationStorage {
             output.push_str(&format!("**Title:** {}\n", title));
         }
         output.push_str(&format!("**ID:** {}\n", saved.metadata.id));
-        output.push_str(&format!("**Created:** {}\n", saved.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC")));
-        output.push_str(&format!("**Updated:** {}\n", saved.metadata.updated_at.format("%Y-%m-%d %H:%M:%S UTC")));
+        output.push_str(&format!(
+            "**Created:** {}\n",
+            saved.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+        output.push_str(&format!(
+            "**Updated:** {}\n",
+            saved.metadata.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
         output.push_str(&format!("**Model:** {}\n", saved.model_type));
-        output.push_str(&format!("**Messages:** {}\n\n", saved.metadata.message_count));
+        output.push_str(&format!(
+            "**Messages:** {}\n\n",
+            saved.metadata.message_count
+        ));
         output.push_str("---\n\n");
 
         // Messages
@@ -348,7 +356,10 @@ impl ConversationStorage {
         if let Some(ref title) = saved.metadata.title {
             output.push_str(&format!("Title: {}\n", title));
         }
-        output.push_str(&format!("Created: {}\n", saved.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC")));
+        output.push_str(&format!(
+            "Created: {}\n",
+            saved.metadata.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
         output.push_str(&format!("Model: {}\n", saved.model_type));
         output.push_str(&format!("Messages: {}\n", saved.metadata.message_count));
         output.push_str(&format!("\n{}\n\n", "=".repeat(60)));
@@ -407,10 +418,7 @@ impl ExportFormat {
 impl SavedConversation {
     /// Convert saved conversation back to Message list
     pub fn to_messages(&self) -> Vec<Message> {
-        self.messages
-            .iter()
-            .map(|m| m.clone().into())
-            .collect()
+        self.messages.iter().map(|m| m.clone().into()).collect()
     }
 }
 
@@ -421,6 +429,7 @@ impl SavedConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -429,6 +438,7 @@ mod tests {
             role: role.into(),
             content: Arc::new(content.to_string()),
             images: Vec::new(),
+            metadata: None,
         }
     }
 
@@ -444,7 +454,10 @@ mod tests {
     #[test]
     fn test_generate_title() {
         let messages = vec![
-            create_test_message("user", "Hello, how are you today? This is a longer message that should be truncated."),
+            create_test_message(
+                "user",
+                "Hello, how are you today? This is a longer message that should be truncated.",
+            ),
             create_test_message("assistant", "I'm doing well, thank you!"),
         ];
 
@@ -459,7 +472,10 @@ mod tests {
     fn test_export_format_from_str() {
         assert_eq!(ExportFormat::from_str("json"), Ok(ExportFormat::Json));
         assert_eq!(ExportFormat::from_str("JSON"), Ok(ExportFormat::Json));
-        assert_eq!(ExportFormat::from_str("markdown"), Ok(ExportFormat::Markdown));
+        assert_eq!(
+            ExportFormat::from_str("markdown"),
+            Ok(ExportFormat::Markdown)
+        );
         assert_eq!(ExportFormat::from_str("md"), Ok(ExportFormat::Markdown));
         assert_eq!(ExportFormat::from_str("txt"), Ok(ExportFormat::Txt));
         assert_eq!(ExportFormat::from_str("text"), Ok(ExportFormat::Txt));
@@ -526,7 +542,8 @@ mod tests {
 
         impl MockStorage {
             fn save_test(&self, id: &str, messages: &[Message]) -> Result<(), ConversationError> {
-                let serializable: Vec<SerializableMessage> = messages.iter().map(|m| m.into()).collect();
+                let serializable: Vec<SerializableMessage> =
+                    messages.iter().map(|m| m.into()).collect();
                 let path = self.conversations_dir.join(format!("{}.json", id));
                 let saved = SavedConversation {
                     metadata: ConversationMetadata {

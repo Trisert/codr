@@ -199,13 +199,16 @@ impl ToolSchema {
                     })
                 }
                 PropertyType::OneOf(types) => {
-                    let type_list: Vec<&str> = types.iter().map(|t| match t {
-                        PropertyType::String => "string",
-                        PropertyType::Number => "number",
-                        PropertyType::Integer => "integer",
-                        PropertyType::Boolean => "boolean",
-                        _ => "string",
-                    }).collect();
+                    let type_list: Vec<&str> = types
+                        .iter()
+                        .map(|t| match t {
+                            PropertyType::String => "string",
+                            PropertyType::Number => "number",
+                            PropertyType::Integer => "integer",
+                            PropertyType::Boolean => "boolean",
+                            _ => "string",
+                        })
+                        .collect();
                     serde_json::json!({
                         "description": prop.description,
                         "oneOf": type_list.iter().map(|t| serde_json::json!({"type": t})).collect::<Vec<_>>()

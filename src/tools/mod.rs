@@ -5,8 +5,8 @@
 pub mod async_handler;
 pub mod async_wrapper;
 pub mod context;
-pub mod params;
 pub mod r#impl;
+pub mod params;
 pub mod schema;
 
 pub use params::*;
@@ -44,8 +44,8 @@ impl Role {
 
     pub fn color(&self) -> (u8, u8, u8) {
         match self {
-            Self::Yolo => (255, 100, 100),   // Red
-            Self::Safe => (100, 255, 100),   // Green
+            Self::Yolo => (255, 100, 100),     // Red
+            Self::Safe => (100, 255, 100),     // Green
             Self::Planning => (100, 200, 255), // Blue
         }
     }
@@ -63,7 +63,7 @@ impl Role {
     pub fn tool_available(&self, tool_name: &str) -> bool {
         match self {
             Self::Yolo => true,
-            Self::Safe => true,  // All tools available, some require approval
+            Self::Safe => true, // All tools available, some require approval
             Self::Planning => matches!(tool_name, "read" | "bash" | "grep" | "find" | "file_info"),
         }
     }
@@ -75,9 +75,9 @@ impl Role {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolCategory {
-    FileOps,    // read, write, edit, file_info
-    Search,     // grep, find
-    System,     // bash
+    FileOps, // read, write, edit, file_info
+    Search,  // grep, find
+    System,  // bash
 }
 
 impl ToolCategory {
@@ -140,15 +140,14 @@ pub trait TypedTool: Tool {
     /// Default implementation bridges JSON to typed
     fn execute_json(&self, params: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         // Deserialize Value to typed params with detailed error reporting
-        let typed_params: Self::Params = serde_json::from_value(params.clone())
-            .map_err(|e| {
-                ToolError::InvalidParameters(format!(
-                    "Invalid parameters for tool '{}': {}\nReceived: {}",
-                    self.name(),
-                    e,
-                    params
-                ))
-            })?;
+        let typed_params: Self::Params = serde_json::from_value(params.clone()).map_err(|e| {
+            ToolError::InvalidParameters(format!(
+                "Invalid parameters for tool '{}': {}\nReceived: {}",
+                self.name(),
+                e,
+                params
+            ))
+        })?;
 
         self.execute(typed_params, ctx)
     }
@@ -162,11 +161,13 @@ pub trait TypedTool: Tool {
 /// Helper function to generate JSON schema for a type
 fn schema_for<T: JsonSchema>() -> Value {
     let schema = schemars::schema_for!(T);
-    serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({
-        "type": "object",
-        "properties": {},
-        "required": []
-    }))
+    serde_json::to_value(schema).unwrap_or_else(|_| {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    })
 }
 
 // ============================================================
@@ -242,7 +243,10 @@ pub struct ToolOutput {
     pub metadata: OutputMetadata,
 
     /// Alternative content for TUI display (if set, this is shown instead of content)
-    pub content_for_display: Option<Arc<String>>,  // Shared display content
+    pub content_for_display: Option<Arc<String>>, // Shared display content
+
+    /// Tool category for UI styling (FileOps, Search, System)
+    pub tool_category: Option<ToolCategory>,
 }
 
 #[allow(dead_code)]
@@ -272,6 +276,7 @@ impl ToolOutput {
             attachments: Vec::new(),
             metadata: OutputMetadata::default(),
             content_for_display: None,
+            tool_category: None,
         }
     }
 
@@ -297,6 +302,12 @@ impl ToolOutput {
     /// Add structured details for UI display (following pi's design)
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
+        self
+    }
+
+    /// Set tool category for UI styling
+    pub fn with_tool_category(mut self, category: ToolCategory) -> Self {
+        self.tool_category = Some(category);
         self
     }
 }
@@ -452,7 +463,9 @@ impl ToolRegistry {
     /// Execute a tool by name with JSON parameters
     #[allow(clippy::result_large_err)]
     pub fn execute(&self, name: &str, params: Value) -> Result<ToolOutput, ToolError> {
-        let tool = self.get(name).ok_or_else(|| ToolError::Custom(format!("Tool '{}' not found", name)))?;
+        let tool = self
+            .get(name)
+            .ok_or_else(|| ToolError::Custom(format!("Tool '{}' not found", name)))?;
         let ctx = ToolContext::new(self.cwd.clone());
         tool.execute_json(params, &ctx)
     }
@@ -526,11 +539,11 @@ impl ToolRegistry {
         }
 
         let result = self.build_descriptions(None);
-        
+
         if let Ok(mut cache) = self.descriptions_cache.write() {
             *cache = Some(result.clone());
         }
-        
+
         result
     }
 
@@ -543,11 +556,11 @@ impl ToolRegistry {
         }
 
         let result = self.build_descriptions(Some(role));
-        
+
         if let Ok(mut cache) = self.descriptions_for_role_cache.write() {
             cache.insert(role, result.clone());
         }
-        
+
         result
     }
 
@@ -619,11 +632,13 @@ impl ToolRegistry {
     /// Suggest tool based on keywords
     #[allow(dead_code)]
     pub fn suggest_tool(&self, query: &str) -> Option<&dyn Tool> {
-        let q = query.to_lowercase();
+        let query_lower = query.to_lowercase();
 
         // Direct match first
         for tool in &self.tools {
-            if tool.name().to_lowercase().contains(&q) || q.contains(tool.name()) {
+            if tool.name().to_lowercase().contains(&query_lower)
+                || query_lower.contains(tool.name())
+            {
                 return Some(tool.as_ref());
             }
         }
@@ -643,10 +658,11 @@ impl ToolRegistry {
 
         for (kws, tool_name) in keywords {
             for kw in kws {
-                if q.contains(kw)
-                    && let Some(tool) = self.get(tool_name) {
-                        return Some(tool);
-                    }
+                if query_lower.contains(kw)
+                    && let Some(tool) = self.get(tool_name)
+                {
+                    return Some(tool);
+                }
             }
         }
 
@@ -694,7 +710,7 @@ pub fn create_read_only_tools(cwd: std::path::PathBuf) -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::r#impl::{ReadTool, BashTool};
+    use crate::tools::r#impl::{BashTool, ReadTool};
 
     // ============================================================
     // ToolContext Tests
@@ -703,7 +719,7 @@ mod tests {
     #[test]
     fn test_tool_context_default() {
         let ctx = ToolContext::default();
-        
+
         assert!(ctx.cwd.exists() || ctx.cwd == std::path::PathBuf::from("."));
         assert!(!ctx.env.is_empty());
         assert_eq!(ctx.token_limit, 500_000);
@@ -714,16 +730,15 @@ mod tests {
     #[test]
     fn test_tool_context_new() {
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
-        
+
         assert_eq!(ctx.cwd, std::path::PathBuf::from("/tmp"));
         assert!(!ctx.env.is_empty());
     }
 
     #[test]
     fn test_tool_context_with_limits() {
-        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"))
-            .with_limits(1000, 100);
-        
+        let ctx = ToolContext::new(std::path::PathBuf::from("/tmp")).with_limits(1000, 100);
+
         assert_eq!(ctx.token_limit, 1000);
         assert_eq!(ctx.line_limit, 100);
     }
@@ -731,7 +746,7 @@ mod tests {
     #[test]
     fn test_tool_context_resolve_path_absolute() {
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
-        
+
         let resolved = ctx.resolve_path("/etc/passwd");
         assert_eq!(resolved, std::path::PathBuf::from("/etc/passwd"));
     }
@@ -739,7 +754,7 @@ mod tests {
     #[test]
     fn test_tool_context_resolve_path_relative() {
         let ctx = ToolContext::new(std::path::PathBuf::from("/tmp"));
-        
+
         let resolved = ctx.resolve_path("test.txt");
         assert_eq!(resolved, std::path::PathBuf::from("/tmp/test.txt"));
     }
@@ -751,7 +766,7 @@ mod tests {
     #[test]
     fn test_tool_output_text() {
         let output = ToolOutput::text("Hello world".to_string());
-        
+
         assert_eq!(&*output.content, "Hello world");
         assert!(output.attachments.is_empty());
         assert!(output.content_for_display.is_none());
@@ -759,9 +774,12 @@ mod tests {
 
     #[test]
     fn test_tool_output_with_attachment() {
-        let output = ToolOutput::text("Image content".to_string())
-            .with_attachment("test.png".to_string(), "image/png".to_string(), vec![1, 2, 3]);
-        
+        let output = ToolOutput::text("Image content".to_string()).with_attachment(
+            "test.png".to_string(),
+            "image/png".to_string(),
+            vec![1, 2, 3],
+        );
+
         assert_eq!(output.attachments.len(), 1);
         assert_eq!(output.attachments[0].name, "test.png");
         assert_eq!(output.attachments[0].content_type, "image/png");
@@ -770,15 +788,14 @@ mod tests {
 
     #[test]
     fn test_tool_output_with_metadata() {
-        let output = ToolOutput::text("Content".to_string())
-            .with_metadata(OutputMetadata {
-                file_path: Some("test.txt".to_string()),
-                line_count: Some(10),
-                byte_count: Some(100),
-                truncated: false,
-                display_summary: None,
-            });
-        
+        let output = ToolOutput::text("Content".to_string()).with_metadata(OutputMetadata {
+            file_path: Some("test.txt".to_string()),
+            line_count: Some(10),
+            byte_count: Some(100),
+            truncated: false,
+            display_summary: None,
+        });
+
         assert_eq!(output.metadata.file_path, Some("test.txt".to_string()));
         assert_eq!(output.metadata.line_count, Some(10));
     }
@@ -787,21 +804,20 @@ mod tests {
     fn test_tool_output_with_summary_display() {
         let output = ToolOutput::text("Full content...".to_string())
             .with_summary_display("Short summary".to_string());
-        
+
         assert!(output.content_for_display.is_some());
         assert_eq!(&*output.content_for_display.unwrap(), "Short summary");
     }
 
     #[test]
     fn test_tool_output_clone() {
-        let output = ToolOutput::text("Hello".to_string())
-            .with_metadata(OutputMetadata {
-                file_path: Some("test.txt".to_string()),
-                ..Default::default()
-            });
-        
+        let output = ToolOutput::text("Hello".to_string()).with_metadata(OutputMetadata {
+            file_path: Some("test.txt".to_string()),
+            ..Default::default()
+        });
+
         let cloned = output.clone();
-        
+
         assert_eq!(&*cloned.content, "Hello");
         assert_eq!(cloned.metadata.file_path, Some("test.txt".to_string()));
     }
@@ -813,7 +829,7 @@ mod tests {
     #[test]
     fn test_output_metadata_default() {
         let meta = OutputMetadata::default();
-        
+
         assert!(meta.file_path.is_none());
         assert!(meta.line_count.is_none());
         assert!(meta.byte_count.is_none());
@@ -832,7 +848,7 @@ mod tests {
             content_type: "image/png".to_string(),
             data: vec![1, 2, 3],
         };
-        
+
         assert_eq!(attachment.name, "test.png");
         assert_eq!(attachment.content_type, "image/png");
         assert_eq!(attachment.data, vec![1, 2, 3]);
@@ -844,7 +860,10 @@ mod tests {
 
     #[test]
     fn test_tool_error_io() {
-        let err = ToolError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        let err = ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
         assert!(err.to_string().contains("file not found"));
     }
 
@@ -873,7 +892,7 @@ mod tests {
     #[test]
     fn test_tool_registry_new() {
         let registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
-        
+
         assert_eq!(registry.tools.len(), 0);
     }
 
@@ -881,7 +900,7 @@ mod tests {
     fn test_tool_registry_register() {
         let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
         registry.register(Box::new(ReadTool::new()));
-        
+
         assert_eq!(registry.tools.len(), 1);
     }
 
@@ -889,10 +908,10 @@ mod tests {
     fn test_tool_registry_get() {
         let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
         registry.register(Box::new(ReadTool::new()));
-        
+
         let tool = registry.get("read");
         assert!(tool.is_some());
-        
+
         let tool = registry.get("nonexistent");
         assert!(tool.is_none());
     }
@@ -902,7 +921,7 @@ mod tests {
         let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
         registry.register(Box::new(ReadTool::new()));
         registry.register(Box::new(BashTool::new()));
-        
+
         let tools = registry.list();
         assert_eq!(tools.len(), 2);
     }
@@ -911,7 +930,7 @@ mod tests {
     fn test_tool_registry_descriptions() {
         let mut registry = ToolRegistry::new(std::path::PathBuf::from("/tmp"));
         registry.register(Box::new(ReadTool::new()));
-        
+
         let descriptions = registry.descriptions();
         assert!(descriptions.contains("read"));
     }
@@ -919,7 +938,7 @@ mod tests {
     #[test]
     fn test_tool_registry_suggest_tool_direct_match() {
         let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
-        
+
         let suggestion = registry.suggest_tool("read");
         assert!(suggestion.is_some());
     }
@@ -927,7 +946,7 @@ mod tests {
     #[test]
     fn test_tool_registry_suggest_tool_keyword() {
         let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
-        
+
         let suggestion = registry.suggest_tool("view a file");
         assert!(suggestion.is_some());
     }
@@ -935,7 +954,7 @@ mod tests {
     #[test]
     fn test_tool_registry_suggest_tool_no_match() {
         let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
-        
+
         let suggestion = registry.suggest_tool("xyznonexistent");
         assert!(suggestion.is_none());
     }
@@ -943,11 +962,14 @@ mod tests {
     #[test]
     fn test_tool_registry_execute() {
         let registry = create_coding_tools(std::path::PathBuf::from("/tmp"));
-        
-        let result = registry.execute("read", serde_json::json!({
-            "file_path": "/nonexistent/file.txt"
-        }));
-        
+
+        let result = registry.execute(
+            "read",
+            serde_json::json!({
+                "file_path": "/nonexistent/file.txt"
+            }),
+        );
+
         // Should fail because file doesn't exist, but should not panic
         assert!(result.is_err());
     }
@@ -973,7 +995,7 @@ mod tests {
     #[test]
     fn test_create_read_only_tools() {
         let registry = create_read_only_tools(std::path::PathBuf::from("/tmp"));
-        
+
         assert_eq!(registry.tools.len(), 3);
         assert!(registry.get("read").is_some());
         assert!(registry.get("grep").is_some());

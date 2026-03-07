@@ -1,0 +1,17 @@
+# Duplicate code detection configuration for codr
+# See https://github.com/bircni/cargo-duplicated for details
+
+# Minimum number of tokens in a duplicate block
+threshold = 50
+
+# Paths to exclude from duplicate detection
+excludes = [
+    "target/",
+    "*.lock",
+]
+
+# Include test files in duplicate detection
+include_tests = true
+
+# JSON output for CI integration
+output_format = "json"

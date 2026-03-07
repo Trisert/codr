@@ -1,0 +1,91 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  code-quality:
+    name: Check code quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + nightly)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --component clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-udeps
+        run: cargo +nightly install cargo-udeps --locked
+
+      - name: Install cargo-duplicated
+        run: cargo install cargo-duplicated --locked
+
+      - name: Check code formatting
+        run: cargo fmt -- --check
+
+      - name: Run Clippy linter
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check for unused dependencies
+        run: cargo +nightly udeps --all-targets
+
+      - name: Check for duplicate code
+        run: cargo duplicated --threshold 50 --json > duplication-report.json || true
+
+      - name: Check tech debt tracking
+        run: ./scripts/check-tech-debt.sh
+
+      - name: Display duplication summary
+        run: |
+          if [ -s duplication-report.json ]; then
+            DUPLICATES=$(cat duplication-report.json | jq '.totalDuplicates // 0')
+            echo "## Duplicate Code Detection" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "$DUPLICATES" -gt 0 ]; then
+              echo "⚠️  Found $DUPLICATES duplicate code blocks" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Review the full report for details and consider refactoring duplicated code." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "This is a warning, not a blocker. Duplicates should be addressed to maintain code quality." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ No duplicate code found (threshold: 50 tokens)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Generate summary
+        run: |
+          echo "## Code Quality Checks ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All checks passed:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Code formatting (rustfmt)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Linting (Clippy)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Unused dependencies (cargo-udeps)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Duplicate code detection (cargo-duplicated)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Tech debt tracking (TODO/FIXME validation)" >> $GITHUB_STEP_SUMMARY

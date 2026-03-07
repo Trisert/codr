@@ -22,10 +22,10 @@ use crate::agent::updates::TuiUpdate;
 use crate::parser::clean_message_content;
 
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     widgets::Widget,
-    Terminal,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -50,7 +50,9 @@ fn looks_like_tool_call(content: &str) -> bool {
         return true;
     }
     // Check for common tool call patterns
-    if trimmed.contains("\"name\"") && (trimmed.contains("\"arguments\"") || trimmed.contains("\"parameters\"")) {
+    if trimmed.contains("\"name\"")
+        && (trimmed.contains("\"arguments\"") || trimmed.contains("\"parameters\""))
+    {
         return true;
     }
     false
@@ -140,6 +142,9 @@ pub struct App {
 
     /// Whether to auto-save conversations
     auto_save: bool,
+
+    /// Collapsed output message indices
+    collapsed_outputs: std::collections::HashSet<usize>,
 }
 
 impl App {
@@ -185,7 +190,22 @@ impl App {
             current_conversation_id: None,
             model_type_name,
             auto_save: true,
+            collapsed_outputs: std::collections::HashSet::new(),
         })
+    }
+
+    /// Toggle collapse state for an output message
+    pub fn toggle_output_collapse(&mut self, index: usize) {
+        if self.collapsed_outputs.contains(&index) {
+            self.collapsed_outputs.remove(&index);
+        } else {
+            self.collapsed_outputs.insert(index);
+        }
+    }
+
+    /// Get collapsed outputs set
+    pub fn collapsed_outputs(&self) -> &std::collections::HashSet<usize> {
+        &self.collapsed_outputs
     }
 
     /// Set the current conversation ID
@@ -205,13 +225,15 @@ impl App {
         }
 
         // Create or use existing conversation ID
-        let id = self.current_conversation_id.get_or_insert_with(|| {
-            crate::conversation::ConversationStorage::generate_id()
-        });
+        let id = self
+            .current_conversation_id
+            .get_or_insert_with(crate::conversation::ConversationStorage::generate_id);
 
         match crate::conversation::ConversationStorage::new() {
             Ok(storage) => {
-                let title = self.messages.iter()
+                let title = self
+                    .messages
+                    .iter()
                     .find(|m| &*m.role == "user")
                     .and_then(|m| {
                         let content = m.content.trim();
@@ -224,12 +246,7 @@ impl App {
                         }
                     });
 
-                match storage.save_conversation(
-                    id,
-                    &self.messages,
-                    &self.model_type_name,
-                    title,
-                ) {
+                match storage.save_conversation(id, &self.messages, &self.model_type_name, title) {
                     Ok(metadata) => {
                         // Only show toast on first save (new conversation)
                         if self.current_conversation_id.is_none() || self.messages.len() <= 2 {
@@ -271,27 +288,25 @@ impl App {
     /// Load a conversation by ID
     fn load_conversation(&mut self, id: &str) {
         match crate::conversation::ConversationStorage::new() {
-            Ok(storage) => {
-                match storage.load_conversation(id) {
-                    Ok(saved) => {
-                        self.messages = saved.to_messages();
-                        self.current_conversation_id = Some(saved.metadata.id.clone());
-                        self.conv_scroll_offset = 0;
+            Ok(storage) => match storage.load_conversation(id) {
+                Ok(saved) => {
+                    self.messages = saved.to_messages();
+                    self.current_conversation_id = Some(saved.metadata.id.clone());
+                    self.conv_scroll_offset = 0;
 
-                        let title = saved.metadata.title.as_deref().unwrap_or("(untitled)");
-                        self.toasts.push(ToastMessage::new(
-                            format!("Loaded: {} - {}", id, title),
-                            MessageLevel::Success,
-                        ));
-                    }
-                    Err(e) => {
-                        self.toasts.push(ToastMessage::new(
-                            format!("Failed to load conversation: {}", e),
-                            MessageLevel::Error,
-                        ));
-                    }
+                    let title = saved.metadata.title.as_deref().unwrap_or("(untitled)");
+                    self.toasts.push(ToastMessage::new(
+                        format!("Loaded: {} - {}", id, title),
+                        MessageLevel::Success,
+                    ));
                 }
-            }
+                Err(e) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Failed to load conversation: {}", e),
+                        MessageLevel::Error,
+                    ));
+                }
+            },
             Err(e) => {
                 self.toasts.push(ToastMessage::new(
                     format!("Failed to access conversation storage: {}", e),
@@ -304,34 +319,35 @@ impl App {
     /// List conversations and show as toast
     fn list_conversations(&mut self) {
         match crate::conversation::ConversationStorage::new() {
-            Ok(storage) => {
-                match storage.list_conversations() {
-                    Ok(conversations) => {
-                        if conversations.is_empty() {
-                            self.toasts.push(ToastMessage::new(
-                                "No saved conversations".to_string(),
-                                MessageLevel::Info,
-                            ));
-                        } else {
-                            let count = conversations.len();
-                            let most_recent = conversations.first();
-                            let msg = if let Some(meta) = most_recent {
-                                let title = meta.title.as_deref().unwrap_or("(untitled)");
-                                format!("{} conversations. Most recent: {} - {}", count, meta.id, title)
-                            } else {
-                                format!("{} conversations", count)
-                            };
-                            self.toasts.push(ToastMessage::new(msg, MessageLevel::Info));
-                        }
-                    }
-                    Err(e) => {
+            Ok(storage) => match storage.list_conversations() {
+                Ok(conversations) => {
+                    if conversations.is_empty() {
                         self.toasts.push(ToastMessage::new(
-                            format!("Failed to list conversations: {}", e),
-                            MessageLevel::Error,
+                            "No saved conversations".to_string(),
+                            MessageLevel::Info,
                         ));
+                    } else {
+                        let count = conversations.len();
+                        let most_recent = conversations.first();
+                        let msg = if let Some(meta) = most_recent {
+                            let title = meta.title.as_deref().unwrap_or("(untitled)");
+                            format!(
+                                "{} conversations. Most recent: {} - {}",
+                                count, meta.id, title
+                            )
+                        } else {
+                            format!("{} conversations", count)
+                        };
+                        self.toasts.push(ToastMessage::new(msg, MessageLevel::Info));
                     }
                 }
-            }
+                Err(e) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Failed to list conversations: {}", e),
+                        MessageLevel::Error,
+                    ));
+                }
+            },
             Err(e) => {
                 self.toasts.push(ToastMessage::new(
                     format!("Failed to access conversation storage: {}", e),
@@ -344,22 +360,20 @@ impl App {
     /// Delete a conversation by ID
     fn delete_conversation(&mut self, id: &str) {
         match crate::conversation::ConversationStorage::new() {
-            Ok(storage) => {
-                match storage.delete_conversation(id) {
-                    Ok(_) => {
-                        self.toasts.push(ToastMessage::new(
-                            format!("Deleted conversation: {}", id),
-                            MessageLevel::Success,
-                        ));
-                    }
-                    Err(e) => {
-                        self.toasts.push(ToastMessage::new(
-                            format!("Failed to delete conversation: {}", e),
-                            MessageLevel::Error,
-                        ));
-                    }
+            Ok(storage) => match storage.delete_conversation(id) {
+                Ok(_) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Deleted conversation: {}", id),
+                        MessageLevel::Success,
+                    ));
                 }
-            }
+                Err(e) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Failed to delete conversation: {}", e),
+                        MessageLevel::Error,
+                    ));
+                }
+            },
             Err(e) => {
                 self.toasts.push(ToastMessage::new(
                     format!("Failed to access conversation storage: {}", e),
@@ -372,22 +386,20 @@ impl App {
     /// Rename a conversation
     fn rename_conversation(&mut self, id: &str, new_title: String) {
         match crate::conversation::ConversationStorage::new() {
-            Ok(storage) => {
-                match storage.rename_conversation(id, new_title.clone()) {
-                    Ok(_) => {
-                        self.toasts.push(ToastMessage::new(
-                            format!("Renamed conversation: {} -> \"{}\"", id, new_title),
-                            MessageLevel::Success,
-                        ));
-                    }
-                    Err(e) => {
-                        self.toasts.push(ToastMessage::new(
-                            format!("Failed to rename conversation: {}", e),
-                            MessageLevel::Error,
-                        ));
-                    }
+            Ok(storage) => match storage.rename_conversation(id, new_title.clone()) {
+                Ok(_) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Renamed conversation: {} -> \"{}\"", id, new_title),
+                        MessageLevel::Success,
+                    ));
                 }
-            }
+                Err(e) => {
+                    self.toasts.push(ToastMessage::new(
+                        format!("Failed to rename conversation: {}", e),
+                        MessageLevel::Error,
+                    ));
+                }
+            },
             Err(e) => {
                 self.toasts.push(ToastMessage::new(
                     format!("Failed to access conversation storage: {}", e),
@@ -416,9 +428,10 @@ impl App {
 
             // Reset Ctrl+C timer if more than 2 seconds have passed
             if let Some(last_press) = self.last_ctrl_c_press
-                && last_press.elapsed().as_secs() >= 2 {
-                    self.last_ctrl_c_press = None;
-                }
+                && last_press.elapsed().as_secs() >= 2
+            {
+                self.last_ctrl_c_press = None;
+            }
 
             // Process updates
             while let Ok(update) = self.rx.try_recv() {
@@ -478,6 +491,7 @@ impl App {
                     agent_status: self.agent_status,
                     session_tokens: self.session_tokens,
                     session_cost: self.session_cost,
+                    collapsed_outputs: &self.collapsed_outputs,
                 });
             })?;
 
@@ -504,6 +518,7 @@ impl App {
                     role: "action".into(),
                     content: Arc::new(cleaned),
                     images: Vec::new(),
+                    metadata: None,
                 });
                 // Auto-scroll to bottom
                 self.conv_scroll_offset = 0;
@@ -518,16 +533,22 @@ impl App {
                 self.agent_status = widgets::banner::AgentStatus::Running;
             }
 
-            TuiUpdate::OutputMessage(output) => {
+            TuiUpdate::OutputMessage {
+                content: output,
+                tool_category,
+            } => {
                 // Skip empty output messages (e.g., from read tool)
                 if output.trim().is_empty() {
                     return;
                 }
-                // Show tool output
+                // Show tool output with category metadata
                 self.messages.push(Message {
                     role: "output".into(),
                     content: output,
                     images: Vec::new(),
+                    metadata: tool_category.map(|cat| crate::model::MessageMetadata {
+                        tool_category: Some(cat),
+                    }),
                 });
                 // Auto-scroll to bottom
                 self.conv_scroll_offset = 0;
@@ -537,14 +558,16 @@ impl App {
 
             TuiUpdate::ErrorMessage(error) => {
                 // Show error toast and set status
-                self.toasts.push(ToastMessage::new(
-                    error.to_string(),
-                    MessageLevel::Error,
-                ));
+                self.toasts
+                    .push(ToastMessage::new(error.to_string(), MessageLevel::Error));
                 self.agent_status = widgets::banner::AgentStatus::Error;
             }
 
-            TuiUpdate::NeedsApproval { action_type, content, is_tool } => {
+            TuiUpdate::NeedsApproval {
+                action_type,
+                content,
+                is_tool,
+            } => {
                 // Set pending action for approve/reject workflow
                 let _ = is_tool; // Not currently used
                 self.pending_action = Some(widgets::conversation::PendingAction {
@@ -597,6 +620,7 @@ impl App {
                                 role: role.to_string().into(),
                                 content: Arc::new(filtered_content),
                                 images: Vec::new(),
+                                metadata: None,
                             });
                             true
                         }
@@ -608,6 +632,7 @@ impl App {
                             role: role.to_string().into(),
                             content: Arc::new(filtered_content),
                             images: Vec::new(),
+                            metadata: None,
                         });
                         true
                     } else {
@@ -629,15 +654,17 @@ impl App {
                 if self.thinking_buffer.contains('\n') {
                     let parts: Vec<&str> = self.thinking_buffer.splitn(2, '\n').collect();
                     if let Some(first_line) = parts.first()
-                        && !first_line.is_empty() {
-                            self.messages.push(Message {
-                                role: "thinking".into(),
-                                content: Arc::new(first_line.to_string()),
-                                images: Vec::new(),
-                            });
-                            // Auto-scroll to bottom
-                            self.conv_scroll_offset = 0;
-                        }
+                        && !first_line.is_empty()
+                    {
+                        self.messages.push(Message {
+                            role: "thinking".into(),
+                            content: Arc::new(first_line.to_string()),
+                            images: Vec::new(),
+                            metadata: None,
+                        });
+                        // Auto-scroll to bottom
+                        self.conv_scroll_offset = 0;
+                    }
                     // Keep the remainder (after the newline) in the buffer
                     self.thinking_buffer = parts.get(1).unwrap_or(&"").to_string();
                 }
@@ -650,6 +677,7 @@ impl App {
                         role: "thinking".into(),
                         content: Arc::new(std::mem::take(&mut self.thinking_buffer)),
                         images: Vec::new(),
+                        metadata: None,
                     });
                     // Auto-scroll to bottom
                     self.conv_scroll_offset = 0;
@@ -666,7 +694,10 @@ impl App {
                 let _ = content;
             }
 
-            TuiUpdate::ActionApproved { action_type, content } => {
+            TuiUpdate::ActionApproved {
+                action_type,
+                content,
+            } => {
                 // Action approved (forward to agent)
                 // This is handled by the agent loop, not here
                 let _ = (action_type, content);
@@ -682,7 +713,11 @@ impl App {
                 // Ignore here
             }
 
-            TuiUpdate::UsageUpdate { input_tokens, output_tokens, cost } => {
+            TuiUpdate::UsageUpdate {
+                input_tokens,
+                output_tokens,
+                cost,
+            } => {
                 // Update token usage and cost
                 self.session_tokens = input_tokens + output_tokens;
                 self.session_cost = cost;
@@ -740,7 +775,8 @@ impl App {
                 drop(role); // Release lock before formatting
 
                 // Remove any existing role switch toasts
-                self.toasts.retain(|t| !t.text.contains("Switched to") && !t.text.contains("mode"));
+                self.toasts
+                    .retain(|t| !t.text.contains("Switched to") && !t.text.contains("mode"));
 
                 // Show toast
                 let role_name = self.role.lock().unwrap().name();
@@ -912,15 +948,28 @@ impl App {
                                         None
                                     };
 
-                                    let format = format.unwrap_or(crate::conversation::ExportFormat::Markdown);
-                                    let output_path = std::path::PathBuf::from(format!("{}.{}", id, format.extension()));
+                                    let format = format
+                                        .unwrap_or(crate::conversation::ExportFormat::Markdown);
+                                    let output_path = std::path::PathBuf::from(format!(
+                                        "{}.{}",
+                                        id,
+                                        format.extension()
+                                    ));
 
                                     match crate::conversation::ConversationStorage::new() {
                                         Ok(storage) => {
-                                            match storage.export_conversation(id, format, &output_path) {
+                                            match storage.export_conversation(
+                                                id,
+                                                format,
+                                                &output_path,
+                                            ) {
                                                 Ok(_) => {
                                                     self.toasts.push(ToastMessage::new(
-                                                        format!("Exported: {} ({:?})", output_path.display(), format),
+                                                        format!(
+                                                            "Exported: {} ({:?})",
+                                                            output_path.display(),
+                                                            format
+                                                        ),
                                                         MessageLevel::Success,
                                                     ));
                                                 }
@@ -954,7 +1003,10 @@ impl App {
                             }
                             _ => {
                                 self.toasts.push(ToastMessage::new(
-                                    format!("Unknown command: /{}. Use /help for available commands", command),
+                                    format!(
+                                        "Unknown command: /{}. Use /help for available commands",
+                                        command
+                                    ),
                                     MessageLevel::Warning,
                                 ));
                             }
@@ -965,6 +1017,7 @@ impl App {
                             role: "user".into(),
                             content: Arc::new(text.to_string()),
                             images: Vec::new(),
+                            metadata: None,
                         });
 
                         // Auto-save after user message
@@ -974,12 +1027,13 @@ impl App {
                         if let Some(ref agent_tx) = self.agent_tx
                             && let Err(e) = agent_tx.send(TuiUpdate::UserMessage {
                                 content: Arc::new(text.to_string()),
-                            }) {
-                                self.toasts.push(ToastMessage::new(
-                                    format!("Failed to send message: {}", e),
-                                    MessageLevel::Error,
-                                ));
-                            }
+                            })
+                        {
+                            self.toasts.push(ToastMessage::new(
+                                format!("Failed to send message: {}", e),
+                                MessageLevel::Error,
+                            ));
+                        }
 
                         // Show a toast to confirm submission
                         self.toasts.push(ToastMessage::new(
@@ -996,6 +1050,24 @@ impl App {
 
             EventResult::RejectAction => {
                 // Not used anymore - handled in Input case
+            }
+
+            EventResult::ToggleOutputCollapse => {
+                // Toggle collapse for the last output message
+                if let Some(last_output_idx) =
+                    self.messages.iter().rposition(|m| &*m.role == "output")
+                {
+                    self.toggle_output_collapse(last_output_idx);
+                    let is_collapsed = self.collapsed_outputs().contains(&last_output_idx);
+                    self.toasts.push(ToastMessage::new(
+                        if is_collapsed {
+                            "Output collapsed".to_string()
+                        } else {
+                            "Output expanded".to_string()
+                        },
+                        MessageLevel::Info,
+                    ));
+                }
             }
 
             EventResult::NoOp => {}
@@ -1020,6 +1092,7 @@ impl App {
             agent_status: self.agent_status,
             session_tokens: self.session_tokens,
             session_cost: self.session_cost,
+            collapsed_outputs: &self.collapsed_outputs,
         });
     }
 
@@ -1040,15 +1113,16 @@ impl App {
             agent_status,
             session_tokens,
             session_cost,
+            collapsed_outputs,
         } = params;
 
         // Create layout - Codex style: banner (2 lines), conversation, input (2 lines)
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // Banner (2 lines + separator)
-                Constraint::Min(0),   // Conversation
-                Constraint::Length(3),  // Input
+                Constraint::Length(3), // Banner (2 lines + separator)
+                Constraint::Min(0),    // Conversation
+                Constraint::Length(3), // Input
             ])
             .split(size);
 
@@ -1065,13 +1139,12 @@ impl App {
         // Render conversation
         let conv_widget = ConversationWidget::new(messages, theme)
             .scroll_offset(scroll_offset)
-            .pending_action(pending_action.cloned());
+            .pending_action(pending_action.cloned())
+            .collapsed_outputs(collapsed_outputs.clone());
         conv_widget.render(chunks[1], buf);
 
         // Render input
-        let mut input_widget = InputWidget::new()
-            .with_theme(*theme)
-            .focused(true);
+        let mut input_widget = InputWidget::new().with_theme(*theme).focused(true);
         input_widget.set_input(input_text);
         input_widget.render(chunks[2], buf);
 
@@ -1107,6 +1180,7 @@ impl App {
                 role: "thinking".into(),
                 content: Arc::new(std::mem::take(&mut self.thinking_buffer)),
                 images: Vec::new(),
+                metadata: None,
             });
         }
 
@@ -1117,6 +1191,7 @@ impl App {
             role: "action".into(),
             content: Arc::new("Agent operation interrupted".to_string()),
             images: Vec::new(),
+            metadata: None,
         });
     }
 
@@ -1165,6 +1240,7 @@ struct RenderParams<'a> {
     agent_status: widgets::banner::AgentStatus,
     session_tokens: u32,
     session_cost: f64,
+    collapsed_outputs: &'a std::collections::HashSet<usize>,
 }
 
 /// Run TUI with integrated agent loop
@@ -1184,24 +1260,22 @@ pub async fn run_tui_agent(
     // Load most recent conversation if resume flag is set and no initial messages provided
     let (initial_messages, initial_conversation_id) = if resume && initial_messages.is_empty() {
         match crate::conversation::ConversationStorage::new() {
-            Ok(storage) => {
-                match storage.get_most_recent() {
-                    Ok(Some(saved)) => {
-                        let messages = saved.to_messages();
-                        let conversation_id = saved.metadata.id.clone();
-                        eprintln!("Resumed conversation: {}", conversation_id);
-                        (messages, Some(conversation_id))
-                    }
-                    Ok(None) => {
-                        eprintln!("No saved conversation found, starting fresh");
-                        (Vec::new(), None)
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to load recent conversation: {}", e);
-                        (Vec::new(), None)
-                    }
+            Ok(storage) => match storage.get_most_recent() {
+                Ok(Some(saved)) => {
+                    let messages = saved.to_messages();
+                    let conversation_id = saved.metadata.id.clone();
+                    eprintln!("Resumed conversation: {}", conversation_id);
+                    (messages, Some(conversation_id))
                 }
-            }
+                Ok(None) => {
+                    eprintln!("No saved conversation found, starting fresh");
+                    (Vec::new(), None)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load recent conversation: {}", e);
+                    (Vec::new(), None)
+                }
+            },
             Err(e) => {
                 eprintln!("Warning: Failed to access conversation storage: {}", e);
                 (Vec::new(), None)
@@ -1256,7 +1330,7 @@ pub async fn run_tui_agent(
 
     // Run agent loop in background task
     let tx_ui = tx.clone();
-    use crate::agent::{run_agent_loop, LoopConfig, TUIExecutor};
+    use crate::agent::{LoopConfig, TUIExecutor, run_agent_loop};
 
     tokio::spawn(async move {
         // Track conversation history
@@ -1280,15 +1354,16 @@ pub async fn run_tui_agent(
         loop {
             // Wait for user message
             let user_message = match agent_rx.recv().await {
-                Some(TuiUpdate::UserMessage { content }) => {
-                    content
-                }
-                Some(TuiUpdate::ActionApproved { action_type, content }) => {
+                Some(TuiUpdate::UserMessage { content }) => content,
+                Some(TuiUpdate::ActionApproved {
+                    action_type,
+                    content,
+                }) => {
                     // Handle action approval
-                    let _ = tx_ui.send(TuiUpdate::OutputMessage(Arc::new(format!(
-                        "✓ Approved: {} - {}",
-                        action_type, content
-                    ))));
+                    let _ = tx_ui.send(TuiUpdate::OutputMessage {
+                        content: Arc::new(format!("✓ Approved: {} - {}", action_type, content)),
+                        tool_category: None,
+                    });
 
                     // Continue agent processing after approval
                     // For now, just acknowledge - real implementation would resume agent loop
@@ -1296,9 +1371,10 @@ pub async fn run_tui_agent(
                 }
                 Some(TuiUpdate::ActionRejected) => {
                     // Handle action rejection
-                    let _ = tx_ui.send(TuiUpdate::OutputMessage(Arc::new(
-                        "✗ Action rejected".to_string(),
-                    )));
+                    let _ = tx_ui.send(TuiUpdate::OutputMessage {
+                        content: Arc::new("✗ Action rejected".to_string()),
+                        tool_category: None,
+                    });
                     // Stop current operation
                     continue;
                 }
@@ -1321,6 +1397,7 @@ pub async fn run_tui_agent(
                 role: "user".into(),
                 content: user_message.clone(),
                 images: Vec::new(),
+                metadata: None,
             });
 
             // Run agent loop with streaming support

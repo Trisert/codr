@@ -18,8 +18,8 @@ use clap::Parser;
 use config::Config;
 use context_manager::ContextManager;
 use model::{Model, ModelType};
-use prompt::{build_system_prompt, get_model_type_identifier, get_recommended_style, PromptStyle};
-use tools::{ToolRegistry, create_coding_tools, Role};
+use prompt::{PromptStyle, build_system_prompt, get_model_type_identifier, get_recommended_style};
+use tools::{Role, ToolRegistry, create_coding_tools};
 
 /// codr - AI coding agent harness
 #[derive(Parser, Debug)]
@@ -67,9 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools_description = tool_registry.descriptions();
 
     // Create async tool registry for parallel execution and streaming
-    let _async_tool_registry = std::sync::Arc::new(
-        crate::tools::async_wrapper::create_async_coding_tools(cwd)
-    );
+    let _async_tool_registry =
+        std::sync::Arc::new(crate::tools::async_wrapper::create_async_coding_tools(cwd));
 
     // Direct mode is only used when explicitly requested with --direct/-d
     // Otherwise, TUI (chat) mode is the default
@@ -80,11 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let initial_messages = Vec::new(); // Will be loaded if --resume is set
 
         // Create role from cli flags
-        let role = if cli.yolo {
-            Role::Yolo
-        } else {
-            Role::Safe
-        };
+        let role = if cli.yolo { Role::Yolo } else { Role::Safe };
 
         // Run TUI with integrated agent
         tui::run_tui_agent(model, tool_registry, initial_messages, role, cli.resume).await?;
@@ -129,10 +124,8 @@ async fn run_direct(
 
     // Initialize messages with system prompt and user task
     let system_prompt = build_system_prompt(tools_description, project_context, prompt_style);
-    let initial_messages = model.create_messages(vec![
-        ("system", &system_prompt),
-        ("user", initial_task),
-    ]);
+    let initial_messages =
+        model.create_messages(vec![("system", &system_prompt), ("user", initial_task)]);
 
     // Create context manager for token-aware message pruning (128k token limit)
     let mut context_manager = ContextManager::new(128_000, &system_prompt);
@@ -161,7 +154,7 @@ async fn run_direct(
 
     // Run the shared agent loop with the same registry reference
     // Direct mode doesn't need streaming, so use default config
-    let result = run_agent_loop(
+    let loop_result = run_agent_loop(
         &model,
         messages,
         tool_registry,
@@ -173,13 +166,13 @@ async fn run_direct(
     .map_err(|e| format!("Agent loop error: {}", e))?;
 
     // Print final response if any
-    if let Some(response) = result.final_response {
+    if let Some(response) = loop_result.final_response {
         println!("{}", response);
         println!("\n{}", "═".repeat(60));
         println!();
     }
 
-    println!("Executed {} actions", result.actions_executed);
+    println!("Executed {} actions", loop_result.actions_executed);
     Ok(())
 }
 
@@ -210,10 +203,10 @@ fn load_project_context() -> Option<String> {
         .skip_while(|line| {
             let trimmed = line.trim();
             // Skip until we find a real content section (after title/description)
-            trimmed.starts_with("#") ||
-            trimmed.starts_with("This file provides") ||
-            trimmed.is_empty() ||
-            trimmed.starts_with("---")
+            trimmed.starts_with("#")
+                || trimmed.starts_with("This file provides")
+                || trimmed.is_empty()
+                || trimmed.starts_with("---")
         })
         .collect::<Vec<_>>()
         .join("\n");

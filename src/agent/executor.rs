@@ -143,40 +143,33 @@ impl DirectExecutor {
 impl ActionExecutor for DirectExecutor {
     fn execute_action(&self, action: &Action) -> Result<ActionOutput, ExecutionError> {
         match action {
-            Action::Bash { command, .. } => {
-                execute_bash(command.as_ref()).map(ActionOutput::visible)
-                    .map_err(ExecutionError::from_agent_error)
-            }
-            Action::Tool { name, params } => {
-                self.tool_registry
-                    .execute(name.as_ref(), params.clone())
-                    .map(|o| {
-                        let content = (*o.content).to_string();
-                        let mut result = ActionOutput::new(content);
-                        if !o.attachments.is_empty() {
-                            result = ActionOutput::visible(format!(
-                                "{}\n[{} attachment(s)]",
-                                result.llm_content,
-                                o.attachments.len()
-                            ));
-                        }
-                        if let Some(line_count) = o.metadata.line_count {
-                            result.llm_content = Arc::new(format!(
-                                "{}\n[Lines: {}]",
-                                result.llm_content,
-                                line_count
-                            ));
-                        }
-                        if o.metadata.truncated {
-                            result.llm_content = Arc::new(format!(
-                                "{} [truncated]",
-                                result.llm_content
-                            ));
-                        }
-                        result
-                    })
-                    .map_err(|e| ExecutionError::retryable(format!("Tool error: {}", e)))
-            }
+            Action::Bash { command, .. } => execute_bash(command.as_ref())
+                .map(ActionOutput::visible)
+                .map_err(ExecutionError::from_agent_error),
+            Action::Tool { name, params } => self
+                .tool_registry
+                .execute(name.as_ref(), params.clone())
+                .map(|o| {
+                    let content = (*o.content).to_string();
+                    let mut result = ActionOutput::new(content);
+                    if !o.attachments.is_empty() {
+                        result = ActionOutput::visible(format!(
+                            "{}\n[{} attachment(s)]",
+                            result.llm_content,
+                            o.attachments.len()
+                        ));
+                    }
+                    if let Some(line_count) = o.metadata.line_count {
+                        result.llm_content =
+                            Arc::new(format!("{}\n[Lines: {}]", result.llm_content, line_count));
+                    }
+                    if o.metadata.truncated {
+                        result.llm_content =
+                            Arc::new(format!("{} [truncated]", result.llm_content));
+                    }
+                    result
+                })
+                .map_err(|e| ExecutionError::retryable(format!("Tool error: {}", e))),
             Action::Response(_) => {
                 // Response actions shouldn't be executed, they're handled separately
                 Err(ExecutionError::fatal(
@@ -242,10 +235,8 @@ mod tests {
 
     #[test]
     fn test_action_output_with_summary() {
-        let output = ActionOutput::with_summary(
-            "llm content".to_string(),
-            Some("ui summary".to_string()),
-        );
+        let output =
+            ActionOutput::with_summary("llm content".to_string(), Some("ui summary".to_string()));
         assert_eq!(*output.llm_content, "llm content");
         assert_eq!(*output.ui_summary.unwrap(), "ui summary");
         assert!(!output.show_to_user);
